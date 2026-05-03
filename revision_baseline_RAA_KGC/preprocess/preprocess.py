@@ -1,24 +1,32 @@
-import os
-import json
 import argparse
+import json
 import multiprocessing as mp
+import os
+import sys
 from multiprocessing import Pool
+from pathlib import Path
 from typing import List
+
+# Get the script's directory (works everywhere)
+SCRIPT_DIR = Path(__file__).parent.parent.parent.absolute()
 
 parser = argparse.ArgumentParser(description='preprocess')
 parser.add_argument('--task', default='FB15k237', type=str, metavar='N',
                     help='dataset name')
 parser.add_argument('--workers', default=2, type=int, metavar='N',
                     help='number of workers')
-parser.add_argument('--train-path', default='/home/horanchen/ydy/study/code/4transductive/data/FB15k237/train.txt', type=str, metavar='N',
+parser.add_argument('--train-path', default=str(SCRIPT_DIR / 'data' / 'FB15k237' / 'train.txt'), type=str, metavar='N',
                     help='path to training data')
-parser.add_argument('--valid-path', default='/home/horanchen/ydy/study/code/4transductive/data/FB15k237/valid.txt', type=str, metavar='N',
+parser.add_argument('--valid-path', default=str(SCRIPT_DIR / 'data' / 'FB15k237' / 'valid.txt'), type=str, metavar='N',
                     help='path to valid data')
-parser.add_argument('--test-path', default='/home/horanchen/ydy/study/code/4transductive/data/FB15k237/test.txt', type=str, metavar='N',
+parser.add_argument('--test-path', default=str(SCRIPT_DIR / 'data' / 'FB15k237' / 'test.txt'), type=str, metavar='N',
                     help='path to valid data')
 
 args = parser.parse_args()
-mp.set_start_method('fork')
+if sys.platform != 'win32':
+    mp.set_start_method('fork', force=True)
+else:
+    mp.set_start_method('spawn', force=True)
 
 
 def _check_sanity(relation_id_to_str: dict):
@@ -31,7 +39,7 @@ def _check_sanity(relation_id_to_str: dict):
         if rel_str not in relation_str_to_id:
             relation_str_to_id[rel_str] = rel_id
         elif relation_str_to_id[rel_str] != rel_id:
-            assert False, 'ERROR: {} and {} are both normalized to {}'\
+            assert False, 'ERROR: {} and {} are both normalized to {}' \
                 .format(relation_str_to_id[rel_str], rel_id, rel_str)
     return
 
@@ -46,7 +54,7 @@ def _normalize_relations(examples: List[dict], normalize_fn, is_train: bool):
     _check_sanity(relation_id_to_str)
 
     if is_train:
-        out_path = '{}/relations.json'.format(os.path.dirname(args.train_path))
+        out_path = os.path.join(os.path.dirname(args.train_path), 'relations.json')
         with open(out_path, 'w', encoding='utf-8') as writer:
             json.dump(relation_id_to_str, writer, ensure_ascii=False, indent=4)
             print('Save {} relations to {}'.format(len(relation_id_to_str), out_path))
@@ -82,7 +90,7 @@ def _process_line_wn18rr(line: str) -> dict:
 
 def preprocess_wn18rr(path):
     if not wn18rr_id2ent:
-        _load_wn18rr_texts('{}/wordnet-mlj12-definitions.txt'.format(os.path.dirname(path)))
+        _load_wn18rr_texts(os.path.join(os.path.dirname(path), 'wordnet-mlj12-definitions.txt'))
     lines = open(path, 'r', encoding='utf-8').readlines()
     pool = Pool(processes=args.workers)
     examples = pool.map(_process_line_wn18rr, lines)
@@ -140,13 +148,13 @@ def _normalize_fb15k237_relation(relation: str) -> str:
     return relation
 
 
-def _process_line_fb15k237(line: str) -> dict:
+def _process_line_fb15k237(line: str, id2ent: dict) -> dict:
     fs = line.strip().split('\t')
     assert len(fs) == 3, 'Expect 3 fields for {}'.format(line)
     head_id, relation, tail_id = fs[0], fs[1], fs[2]
 
-    _, head, _ = fb15k_id2ent[head_id]
-    _, tail, _ = fb15k_id2ent[tail_id]
+    _, head, _ = id2ent[head_id]
+    _, tail, _ = id2ent[tail_id]
     example = {'head_id': head_id,
                'head': head,
                'relation': relation,
@@ -157,13 +165,17 @@ def _process_line_fb15k237(line: str) -> dict:
 
 def preprocess_fb15k237(path):
     if not fb15k_id2desc:
-        _load_fb15k237_desc('{}/FB15k_mid2description.txt'.format(os.path.dirname(path)))
+        _load_fb15k237_desc(os.path.join(os.path.dirname(path), 'FB15k_mid2description.txt'))
     if not fb15k_id2ent:
-        _load_fb15k237_wikidata('{}/FB15k_mid2name.txt'.format(os.path.dirname(path)))
+        _load_fb15k237_wikidata(os.path.join(os.path.dirname(path), 'FB15k_mid2name.txt'))
 
     lines = open(path, 'r', encoding='utf-8').readlines()
+
+    # Create a partial function with the dictionaries
+    from functools import partial
+    process_func = partial(_process_line_fb15k237, id2ent=fb15k_id2ent)
     pool = Pool(processes=args.workers)
-    examples = pool.map(_process_line_fb15k237, lines)
+    examples = pool.map(process_func, lines)
     pool.close()
     pool.join()
 
@@ -237,11 +249,11 @@ def _process_line_wiki5m(line: str) -> dict:
 
 def preprocess_wiki5m(path: str, is_train: bool) -> List[dict]:
     if not wiki5m_id2rel:
-        _load_wiki5m_id2rel(path='{}/wikidata5m_relation.txt'.format(os.path.dirname(path)))
+        _load_wiki5m_id2rel(path=os.path.join(os.path.dirname(path), 'wikidata5m_relation.txt'))
     if not wiki5m_id2ent:
-        _load_wiki5m_id2ent(path='{}/wikidata5m_entity.txt'.format(os.path.dirname(path)))
+        _load_wiki5m_id2ent(path=os.path.join(os.path.dirname(path), 'wikidata5m_entity.txt'))
     if not wiki5m_id2text:
-        _load_wiki5m_id2text(path='{}/wikidata5m_text.txt'.format(os.path.dirname(path)))
+        _load_wiki5m_id2text(path=os.path.join(os.path.dirname(path), 'wikidata5m_text.txt'))
 
     lines = open(path, 'r', encoding='utf-8').readlines()
     pool = Pool(processes=args.workers)
@@ -290,7 +302,7 @@ def dump_all_entities(examples, out_path, id2text: dict):
 def main():
     all_examples = []
     for path in [args.train_path, args.valid_path, args.test_path]:
-        assert os.path.exists(path)
+        assert os.path.exists(path), f"file with path '{path}' does not exist..."
         print('Process {}...'.format(path))
         if args.task.lower() == 'wn18rr':
             all_examples += preprocess_wn18rr(path)
@@ -311,7 +323,7 @@ def main():
         assert False, 'Unknown task: {}'.format(args.task)
 
     dump_all_entities(all_examples,
-                      out_path='{}/zhou_train_sub1_entities.json'.format(os.path.dirname(args.train_path)),
+                      out_path=os.path.join(os.path.dirname(path), 'zhou_train_sub1_entities.json'),
                       id2text=id2text)
     print('Done')
 
