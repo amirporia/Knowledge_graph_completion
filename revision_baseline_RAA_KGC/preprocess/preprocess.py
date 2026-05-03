@@ -2,7 +2,6 @@ import os
 import json
 import argparse
 import multiprocessing as mp
-
 from multiprocessing import Pool
 from typing import List
 
