@@ -3,9 +3,9 @@ import glob
 
 from transformers import AutoTokenizer
 
-from setting.config import args
+from ..setting.config import args
 from triplet import TripletDict, EntityDict, LinkGraph
-from setting.logger_config import logger
+from ..setting.logger_config import logger
 
 train_triplet_dict: TripletDict = None
 all_triplet_dict: TripletDict = None

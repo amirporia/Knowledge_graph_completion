@@ -5,14 +5,14 @@ import torch
 from time import time
 from typing import List, Tuple
 from dataclasses import dataclass, asdict
-from setting.config import args
-from utils.doc import load_data, Example
+from ..setting.config import args
+from ..utils.doc import load_data, Example
 # from doc_norela import load_data, Example
 from predict import BertPredictor
-from utils.dict_hub import get_entity_dict, get_all_triplet_dict
-from utils.triplet import EntityDict
-from utils.rerank import rerank_by_graph
-from setting.logger_config import logger
+from ..utils.dict_hub import get_entity_dict, get_all_triplet_dict
+from ..utils.triplet import EntityDict
+from ..utils.rerank import rerank_by_graph
+from ..setting.logger_config import logger
 
 # get all entities dictionary
 def _setup_entity_dict() -> EntityDict:

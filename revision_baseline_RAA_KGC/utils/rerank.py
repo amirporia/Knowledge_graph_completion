@@ -1,6 +1,6 @@
 import torch
 from typing import List
-from setting.config import args
+from ..setting.config import args
 from triplet import EntityDict
 from dict_hub import get_link_graph
 from doc import Example

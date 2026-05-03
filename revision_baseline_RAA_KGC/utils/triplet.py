@@ -3,7 +3,7 @@ import json
 from typing import List
 from dataclasses import dataclass
 from collections import deque
-from setting.logger_config import logger
+from ..setting.logger_config import logger
 
 
 @dataclass

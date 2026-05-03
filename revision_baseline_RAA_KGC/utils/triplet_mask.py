@@ -2,7 +2,7 @@ import torch
 
 from typing import List
 
-from setting.config import args
+from ..setting.config import args
 from dict_hub import get_train_triplet_dict, get_entity_dict, EntityDict, TripletDict
 
 entity_dict: EntityDict = get_entity_dict()

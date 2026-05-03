@@ -7,13 +7,13 @@ import torch.utils.data
 from typing import List
 from collections import OrderedDict
 
-from utils.doc import collate, Example, Dataset, collate_test
+from ..utils.doc import collate, Example, Dataset, collate_test
 # from doc_norela import collate, Example, Dataset, collate_test
-from setting.config import args
-from model.models import build_model
-from utils.utils import AttrDict, move_to_cuda
-from utils.dict_hub import build_tokenizer
-from setting.logger_config import logger
+from ..setting.config import args
+from ..model.models import build_model
+from ..utils.utils import AttrDict, move_to_cuda
+from ..utils.dict_hub import build_tokenizer
+from ..setting.logger_config import logger
 
 
 class BertPredictor:

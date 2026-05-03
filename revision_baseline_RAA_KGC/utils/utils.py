@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from setting.logger_config import logger
+from ..setting.logger_config import logger
 
 
 class AttrDict:

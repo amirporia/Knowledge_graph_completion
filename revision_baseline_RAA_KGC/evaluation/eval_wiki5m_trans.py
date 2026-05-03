@@ -2,11 +2,11 @@ import os
 import json
 import torch
 
-from setting.config import args
-from evaluation.predict import BertPredictor
-from utils.dict_hub import get_entity_dict
-from evaluation.evaluate import eval_single_direction
-from setting.logger_config import logger
+from ..setting.config import args
+from ..evaluation.predict import BertPredictor
+from ..utils.dict_hub import get_entity_dict
+from ..evaluation.evaluate import eval_single_direction
+from ..setting.logger_config import logger
 
 assert args.task == 'wiki5m_trans', 'This script is only used for wiki5m transductive setting'
 

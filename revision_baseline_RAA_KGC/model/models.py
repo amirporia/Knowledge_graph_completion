@@ -7,7 +7,7 @@ import torch.nn as nn
 from dataclasses import dataclass
 from transformers import AutoModel, AutoConfig
 
-from utils.triplet_mask import construct_mask
+from ..utils.triplet_mask import construct_mask
 
 
 def build_model(args) -> nn.Module:
