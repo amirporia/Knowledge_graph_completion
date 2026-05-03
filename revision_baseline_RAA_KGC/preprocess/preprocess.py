@@ -11,15 +11,15 @@ from typing import List
 SCRIPT_DIR = Path(__file__).parent.parent.parent.absolute()
 
 parser = argparse.ArgumentParser(description='preprocess')
-parser.add_argument('--task', default='FB15k237', type=str, metavar='N',
+parser.add_argument('--task', default='WN18RR', type=str, metavar='N',
                     help='dataset name')
 parser.add_argument('--workers', default=2, type=int, metavar='N',
                     help='number of workers')
-parser.add_argument('--train-path', default=str(SCRIPT_DIR / 'data' / 'FB15k237' / 'train.txt'), type=str, metavar='N',
+parser.add_argument('--train-path', default=str(SCRIPT_DIR / 'data' / 'WN18RR' / 'train.txt'), type=str, metavar='N',
                     help='path to training data')
-parser.add_argument('--valid-path', default=str(SCRIPT_DIR / 'data' / 'FB15k237' / 'valid.txt'), type=str, metavar='N',
+parser.add_argument('--valid-path', default=str(SCRIPT_DIR / 'data' / 'WN18RR' / 'valid.txt'), type=str, metavar='N',
                     help='path to valid data')
-parser.add_argument('--test-path', default=str(SCRIPT_DIR / 'data' / 'FB15k237' / 'test.txt'), type=str, metavar='N',
+parser.add_argument('--test-path', default=str(SCRIPT_DIR / 'data' / 'WN18RR' / 'test.txt'), type=str, metavar='N',
                     help='path to valid data')
 
 args = parser.parse_args()
@@ -74,12 +74,12 @@ def _load_wn18rr_texts(path: str):
     print('Load {} entities from {}'.format(len(wn18rr_id2ent), path))
 
 
-def _process_line_wn18rr(line: str) -> dict:
+def _process_line_wn18rr(line: str, id2ent: dict) -> dict:
     fs = line.strip().split('\t')
     assert len(fs) == 3, 'Expect 3 fields for {}'.format(line)
     head_id, relation, tail_id = fs[0], fs[1], fs[2]
-    _, head, _ = wn18rr_id2ent[head_id]
-    _, tail, _ = wn18rr_id2ent[tail_id]
+    _, head, _ = id2ent[head_id]
+    _, tail, _ = id2ent[tail_id]
     example = {'head_id': head_id,
                'head': head,
                'relation': relation,
@@ -91,9 +91,16 @@ def _process_line_wn18rr(line: str) -> dict:
 def preprocess_wn18rr(path):
     if not wn18rr_id2ent:
         _load_wn18rr_texts(os.path.join(os.path.dirname(path), 'wordnet-mlj12-definitions.txt'))
+
     lines = open(path, 'r', encoding='utf-8').readlines()
+
+    # Create a partial function with the dictionaries
+    from functools import partial
+    process_func = partial(_process_line_wn18rr,
+                           id2ent=wn18rr_id2ent)
+
     pool = Pool(processes=args.workers)
-    examples = pool.map(_process_line_wn18rr, lines)
+    examples = pool.map(process_func, lines)
     pool.close()
     pool.join()
 
@@ -235,15 +242,15 @@ def _has_none_value(ex: dict) -> bool:
     return any(v is None for v in ex.values())
 
 
-def _process_line_wiki5m(line: str) -> dict:
+def _process_line_wiki5m(line: str, id2ent: dict) -> dict:
     fs = line.strip().split('\t')
     assert len(fs) == 3, 'Invalid line: {}'.format(line.strip())
     head_id, relation_id, tail_id = fs[0], fs[1], fs[2]
     example = {'head_id': head_id,
-               'head': wiki5m_id2ent.get(head_id, None),
+               'head': id2ent.get(head_id, None),
                'relation': relation_id,
                'tail_id': tail_id,
-               'tail': wiki5m_id2ent.get(tail_id, None)}
+               'tail': id2ent.get(tail_id, None)}
     return example
 
 
@@ -256,8 +263,13 @@ def preprocess_wiki5m(path: str, is_train: bool) -> List[dict]:
         _load_wiki5m_id2text(path=os.path.join(os.path.dirname(path), 'wikidata5m_text.txt'))
 
     lines = open(path, 'r', encoding='utf-8').readlines()
+
+    from functools import partial
+    process_func = partial(_process_line_wiki5m,
+                           id2ent=_load_wiki5m_id2ent)
+
     pool = Pool(processes=args.workers)
-    examples = pool.map(_process_line_wiki5m, lines)
+    examples = pool.map(process_func, lines)
     pool.close()
     pool.join()
 
