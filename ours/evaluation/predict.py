@@ -78,7 +78,8 @@ class BertPredictor:
             logger.info('Using CPU for inference')
 
     def _setup_args(self) -> None:
-        """Configure arguments with defaults and logging."""
+        """Configure arguments with defaults and update global config."""
+        # Add missing default arguments from global config
         for key, value in args.__dict__.items():
             if key not in self.train_args.__dict__:
                 logger.info(f'Setting default attribute: {key}={value}')
@@ -89,8 +90,14 @@ class BertPredictor:
             json.dumps(self.train_args.__dict__, ensure_ascii=False, indent=4)
         )
 
-        args.use_link_graph = self.train_args.use_link_graph
-        args.is_test = True
+        # Update global config attributes for test mode
+        # Instead of direct assignment, modify the __dict__ directly
+        # Instead of this code:
+        # args.use_link_graph = self.train_args.use_link_graph
+        # args.is_test = True
+        if hasattr(self.train_args, 'use_link_graph'):
+            args.__dict__['use_link_graph'] = self.train_args.use_link_graph
+        args.__dict__['is_test'] = True
 
     @torch.no_grad()
     def predict_by_examples(self, examples: List[Example]) -> tuple:
