@@ -492,7 +492,7 @@ def dump_all_entities(examples, out_path, id2text: dict):
 
 
 # Task-specific entity mappings
-def get_entity_mapping(task: str, task_data: Dict) -> Dict:
+def get_entity_mapping(task: str) -> Dict:
     """Get the entity to text mapping for the given task."""
     mappings = {
         'wn18rr': lambda: {k: v[2] for k, v in wn18rr_id2ent.items()},
@@ -570,7 +570,7 @@ def main():
     all_examples, task_name = load_and_preprocess_data(args)
 
     # Get entity mapping
-    id2text = get_entity_mapping(task_name, args)
+    id2text = get_entity_mapping(task_name)
 
     # Dump entities
     output_dir = os.path.dirname(args.test_path)

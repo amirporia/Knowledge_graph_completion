@@ -59,11 +59,11 @@ def get_link_graph():
     return link_graph
 
 
-def build_tokenizer(args):
+def build_tokenizer(arguments):
     global tokenizer
     if tokenizer is None:
-        tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model)
-        logger.info('Build tokenizer from {}'.format(args.pretrained_model))
+        tokenizer = AutoTokenizer.from_pretrained(arguments.pretrained_model)
+        logger.info('Build tokenizer from {}'.format(arguments.pretrained_model))
 
 
 def get_tokenizer():
