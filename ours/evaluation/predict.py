@@ -10,7 +10,7 @@ import tqdm
 from ..model.models import build_model
 from ..setting.config import args
 from ..setting.logger_config import logger
-from ..utils.dict_hub import _init_tokenizer
+from ..utils.dict_hub import init_tokenizer
 from ..utils.doc import collate, Example, Dataset, collate_test
 from ..utils.utils import AttrDict, move_to_cuda
 
@@ -47,7 +47,7 @@ class BertPredictor:
         ckt_dict = torch.load(ckt_path, map_location='cpu')
         self.train_args.__dict__ = ckt_dict['args']
         self._setup_args()
-        _init_tokenizer(self.train_args)
+        init_tokenizer(self.train_args)
         self.model = build_model(self.train_args)
 
         # Handle DataParallel state dict prefix
@@ -161,7 +161,7 @@ class BertPredictor:
             is_test: bool
     ) -> torch.utils.data.DataLoader:
         """Create a DataLoader from examples."""
-        dataset = Dataset(path='', examples=examples, teset_set=is_test)
+        dataset = Dataset(path='', examples=examples, test_set=is_test)
         collate_fn = collate_test if is_test else collate
 
         return torch.utils.data.DataLoader(

@@ -45,7 +45,7 @@ def _init_link_graph() -> None:
         _link_graph = LinkGraph(train_path=args.train_path)
 
 
-def _init_tokenizer(arguments) -> None:
+def init_tokenizer(arguments) -> None:
     global _tokenizer
     if _tokenizer is None:
         _tokenizer = AutoTokenizer.from_pretrained(arguments.pretrained_model)
@@ -74,5 +74,5 @@ def get_link_graph() -> LinkGraph:
 
 def get_tokenizer() -> AutoTokenizer:
     if _tokenizer is None:
-        _init_tokenizer(args)
+        init_tokenizer(args)
     return _tokenizer
