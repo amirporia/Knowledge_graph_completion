@@ -1,8 +1,13 @@
+import argparse
 import os
 import random
-import argparse
 import warnings
+from pathlib import Path
+
 import torch.backends.cudnn as cudnn
+
+# Define the project root directory dynamically
+SCRIPT_DIR = Path(__file__).parent.parent.parent.absolute()
 
 
 def parse_args():
@@ -25,10 +30,10 @@ def parse_args():
     data_group.add_argument('--task', default='wn18rr', type=str,
                             choices=['wn18rr', 'fb15k237', 'wiki5m_ind', 'wiki5m_trans'],
                             help='Dataset name')
-    data_group.add_argument('--train-path', default='data/WN18RR/train.txt.json', type=str,
-                            help='Path to training data')
-    data_group.add_argument('--valid-path', default='data/WN18RR/valid.txt.json', type=str,
-                            help='Path to validation data')
+    data_group.add_argument('--train-path', default=None, type=str,
+                            help='Path to training data (auto-generated from task if not specified)')
+    data_group.add_argument('--valid-path', default=None, type=str,
+                            help='Path to validation data (auto-generated from task if not specified)')
 
     # Training settings
     train_group = parser.add_argument_group('Training')
@@ -51,14 +56,14 @@ def parse_args():
 
     # Model management
     mgmt_group = parser.add_argument_group('Model Management')
-    mgmt_group.add_argument('--model-dir', default='data/WN18RR/checkpoint/', type=str,
-                            help='Path to save model checkpoints')
+    mgmt_group.add_argument('--model-dir', default=None, type=str,
+                            help='Path to save model checkpoints (auto-generated from task if not specified)')
     mgmt_group.add_argument('--max-to-keep', default=4, type=int,
                             help='Max number of checkpoints to keep')
     mgmt_group.add_argument('--eval-every-n-step', default=10000, type=int,
                             help='Evaluate every n steps')
-    mgmt_group.add_argument('--eval-model-path', default='data/WN18RR/checkpoint/model_best.mdl', type=str,
-                            help='Path to model for evaluation')
+    mgmt_group.add_argument('--eval-model-path', default=None, type=str,
+                            help='Path to model for evaluation (auto-generated from task if not specified)')
 
     # Loss and optimization
     loss_group = parser.add_argument_group('Loss and Optimization')
@@ -101,8 +106,32 @@ def parse_args():
     return parser.parse_args()
 
 
+def generate_paths_from_task(arguments):
+    """Generate dynamic paths based on task name."""
+    task = arguments.task.upper()  # Convert to uppercase for folder naming
+
+    # Generate data paths
+    if arguments.train_path is None:
+        arguments.train_path = str(SCRIPT_DIR / 'data' / task / 'train.txt.json')
+
+    if arguments.valid_path is None:
+        arguments.valid_path = str(SCRIPT_DIR / 'data' / task / 'valid.txt.json')
+
+    # Generate model directory and checkpoint paths
+    if arguments.model_dir is None:
+        arguments.model_dir = str(SCRIPT_DIR / 'data' / task / 'checkpoint')
+
+    if arguments.eval_model_path is None:
+        arguments.eval_model_path = str(SCRIPT_DIR / 'data' / task / 'checkpoint' / 'model_best.mdl')
+
+    return arguments
+
+
 def validate_args(arguments):
     """Validate parsed arguments."""
+    # Generate paths from task if not specified
+    arguments = generate_paths_from_task(arguments)
+
     # Validate paths
     if arguments.train_path and not os.path.exists(arguments.train_path):
         raise FileNotFoundError(f"Training data not found: {arguments.train_path}")
