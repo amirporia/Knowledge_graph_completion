@@ -7,7 +7,7 @@ from typing import List, Tuple, Dict
 import torch
 import tqdm
 
-from predict import BertPredictor
+from .predict import BertPredictor
 from ..setting.config import args
 from ..setting.logger_config import logger
 from ..utils.dict_hub import get_entity_dict, get_all_triplet_dict

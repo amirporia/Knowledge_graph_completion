@@ -7,19 +7,25 @@ from multiprocessing import Pool
 from pathlib import Path
 from typing import List
 
+# Current task name
+CURRENT_TASK_NAME = 'WN18RR'
+
 # Get the script's directory (works everywhere)
 SCRIPT_DIR = Path(__file__).parent.parent.parent.absolute()
 
 parser = argparse.ArgumentParser(description='preprocess')
-parser.add_argument('--task', default='WN18RR', type=str, metavar='N',
+parser.add_argument('--task', default=CURRENT_TASK_NAME, type=str, metavar='N',
                     help='dataset name')
 parser.add_argument('--workers', default=2, type=int, metavar='N',
                     help='number of workers')
-parser.add_argument('--train-path', default=str(SCRIPT_DIR / 'data' / 'WN18RR' / 'train.txt'), type=str, metavar='N',
+parser.add_argument('--train-path', default=str(SCRIPT_DIR / 'data' / CURRENT_TASK_NAME / 'train.txt'), type=str,
+                    metavar='N',
                     help='path to training data')
-parser.add_argument('--valid-path', default=str(SCRIPT_DIR / 'data' / 'WN18RR' / 'valid.txt'), type=str, metavar='N',
+parser.add_argument('--valid-path', default=str(SCRIPT_DIR / 'data' / CURRENT_TASK_NAME / 'valid.txt'), type=str,
+                    metavar='N',
                     help='path to valid data')
-parser.add_argument('--test-path', default=str(SCRIPT_DIR / 'data' / 'WN18RR' / 'test.txt'), type=str, metavar='N',
+parser.add_argument('--test-path', default=str(SCRIPT_DIR / 'data' / CURRENT_TASK_NAME / 'test.txt'), type=str,
+                    metavar='N',
                     help='path to valid data')
 
 args = parser.parse_args()
@@ -335,7 +341,7 @@ def main():
         assert False, 'Unknown task: {}'.format(args.task)
 
     dump_all_entities(all_examples,
-                      out_path=os.path.join(os.path.dirname(path), 'zhou_train_sub1_entities.json'),
+                      out_path=os.path.join(os.path.dirname(path), 'entities.json'),
                       id2text=id2text)
     print('Done')
 

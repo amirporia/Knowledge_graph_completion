@@ -11,7 +11,7 @@ from ..utils.dict_hub import build_tokenizer
 from ..utils.doc import Dataset, collate
 from ..setting.logger_config import logger
 from ..evaluation.metric import accuracy
-from models import build_model, ModelOutput
+from .models import build_model, ModelOutput
 # from doc_norela import Dataset, collate, collate_test
 from ..utils.utils import AverageMeter, ProgressMeter
 from ..utils.utils import save_checkpoint, delete_old_ckt, report_num_trainable_parameters, move_to_cuda, get_model_obj

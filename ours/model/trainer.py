@@ -7,7 +7,7 @@ import torch.utils.data
 from transformers import AdamW
 from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 
-from models import build_model, ModelOutput
+from .models import build_model, ModelOutput
 from ..evaluation.metric import accuracy
 from ..setting.logger_config import logger
 from ..utils.dict_hub import init_tokenizer

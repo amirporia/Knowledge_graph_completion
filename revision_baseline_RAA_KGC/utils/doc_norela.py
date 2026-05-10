@@ -6,9 +6,9 @@ import torch.utils.data.dataset
 from typing import Optional, List
 
 from ..setting.config import args
-from triplet import reverse_triplet
-from triplet_mask import construct_mask, construct_self_negative_mask
-from dict_hub import get_entity_dict, get_link_graph, get_tokenizer
+from .triplet import reverse_triplet
+from .triplet_mask import construct_mask, construct_self_negative_mask
+from .dict_hub import get_entity_dict, get_link_graph, get_tokenizer
 from ..setting.logger_config import logger
 
 entity_dict = get_entity_dict()

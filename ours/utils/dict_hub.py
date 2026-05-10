@@ -4,7 +4,7 @@ from typing import Optional
 
 from transformers import AutoTokenizer
 
-from triplet import TripletDict, EntityDict, LinkGraph
+from .triplet import TripletDict, EntityDict, LinkGraph
 from ..setting.config import args
 from ..setting.logger_config import logger
 

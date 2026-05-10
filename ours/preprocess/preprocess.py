@@ -11,6 +11,9 @@ from typing import List, Dict, Any
 # Configuration
 # ============================================================================
 
+# Current task name
+CURRENT_TASK_NAME = "WN18RR"
+
 # Get the script's directory (works everywhere)
 SCRIPT_DIR = Path(__file__).parent.parent.parent.absolute()
 
@@ -52,7 +55,7 @@ def setup_parser():
 
     parser.add_argument(
         '--task',
-        default='WN18RR',
+        default=CURRENT_TASK_NAME,
         type=str,
         help='dataset name'
     )
@@ -553,7 +556,7 @@ def load_and_preprocess_data(args: Any):
 
 def dump_entities_to_file(all_examples: List, output_dir: str, id2text: Dict) -> None:
     """Dump all entities to a JSON file."""
-    output_path = os.path.join(output_dir, 'zhou_train_sub1_entities.json')
+    output_path = os.path.join(output_dir, 'entities.json')
     dump_all_entities(all_examples, out_path=output_path, id2text=id2text)
 
 

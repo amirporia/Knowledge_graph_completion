@@ -2,9 +2,9 @@ import torch
 import json
 import torch.backends.cudnn as cudnn
 
-from setting.config import args
-from model.trainer import Trainer
-from setting.logger_config import logger
+from revision_baseline_RAA_KGC.setting.config import args
+from revision_baseline_RAA_KGC.model.trainer import Trainer
+from revision_baseline_RAA_KGC.setting.logger_config import logger
 
 
 def main():

@@ -9,6 +9,9 @@ import torch.backends.cudnn as cudnn
 # Define the project root directory dynamically
 SCRIPT_DIR = Path(__file__).parent.parent.parent.absolute()
 
+# Current task name
+CURRENT_TASK_NAME = "wn18rr"
+
 
 def parse_args():
     """Parse command line arguments."""
@@ -27,7 +30,7 @@ def parse_args():
 
     # Data settings
     data_group = parser.add_argument_group('Data')
-    data_group.add_argument('--task', default='wn18rr', type=str,
+    data_group.add_argument('--task', default=CURRENT_TASK_NAME, type=str,
                             choices=['wn18rr', 'fb15k237', 'wiki5m_ind', 'wiki5m_trans'],
                             help='Dataset name')
     data_group.add_argument('--train-path', default=None, type=str,

@@ -2,9 +2,9 @@ import torch
 import json
 import torch.backends.cudnn as cudnn
 
-from setting.config import args
-from model.trainer import Trainer
-from setting.logger_config import logger
+from ours.setting.config import args
+from ours.model.trainer import Trainer
+from ours.setting.logger_config import logger
 
 
 def main():

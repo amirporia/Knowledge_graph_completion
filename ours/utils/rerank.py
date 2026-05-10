@@ -2,9 +2,9 @@ from typing import List
 
 import torch
 
-from dict_hub import get_link_graph
-from doc import Example
-from triplet import EntityDict
+from .dict_hub import get_link_graph
+from .doc import Example
+from .triplet import EntityDict
 from ..setting.config import args
 
 
