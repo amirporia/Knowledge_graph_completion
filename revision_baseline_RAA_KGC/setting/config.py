@@ -1,113 +1,187 @@
+import argparse
 import os
 import random
-import torch
-import argparse
 import warnings
+from pathlib import Path
 
 import torch.backends.cudnn as cudnn
 
+# Define the project root directory dynamically
+SCRIPT_DIR = Path(__file__).parent.parent.parent.absolute()
+
+# Current task name
 CURRENT_TASK_NAME = "wn18rr"
 
-parser = argparse.ArgumentParser(description='SimKGC arguments')
-parser.add_argument('--pretrained-model', default='bert-base-uncased', type=str, metavar='N',
-                    help='path to pretrained model')
-parser.add_argument('--task', default=CURRENT_TASK_NAME.lower(), type=str, metavar='N',
-                    help='dataset name')
-parser.add_argument('--train-path', default=f'data/{CURRENT_TASK_NAME}/train.txt.json', type=str, metavar='N',
-                    help='path to training data')
-parser.add_argument('--valid-path', default=f'data/{CURRENT_TASK_NAME}/valid.txt.json', type=str, metavar='N',
-                    help='path to valid data')
-parser.add_argument('--model-dir', default=f'data/{CURRENT_TASK_NAME}/checkpoint/', type=str, metavar='N',
-                    help='path to model dir')
-parser.add_argument('--warmup', default=400, type=int, metavar='N',
-                    help='warmup steps')
-parser.add_argument('--max-to-keep', default=4, type=int, metavar='N',
-                    help='max number of checkpoints to keep')
-parser.add_argument('--grad-clip', default=10.0, type=float, metavar='N',
-                    help='gradient clipping')
-parser.add_argument('--pooling', default='mean', type=str, metavar='N',
-                    help='bert pooling')
-parser.add_argument('--dropout', default=0.1, type=float, metavar='N',
-                    help='dropout on final linear layer')
-parser.add_argument('--use-amp', action='store_true',
-                    help='Use amp if available')
-parser.add_argument('--t', default=0.05, type=float,
-                    help='temperature parameter')
-parser.add_argument('--use-link-graph', action='store_true',
-                    help='use neighbors from link graph as context')
-parser.add_argument('--eval-every-n-step', default=10000, type=int,
-                    help='evaluate every n steps')
-parser.add_argument('--pre-batch', default=0, type=int,
-                    help='number of pre-batch used for negatives')
-parser.add_argument('--pre-batch-weight', default=0.5, type=float,
-                    help='the weight for logits from pre-batch negatives')
-parser.add_argument('--additive-margin', default=0.02, type=float, metavar='N',
-                    help='additive margin for InfoNCE loss function')
-parser.add_argument('--finetune-t', action='store_true',
-                    help='make temperature as a trainable parameter or not')
-parser.add_argument('--max-num-tokens', default=50, type=int,
-                    help='maximum number of tokens')
+
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description='SimKGC arguments')
+
+    # Model settings
+    model_group = parser.add_argument_group('Model')
+    model_group.add_argument('--pretrained-model', default='bert-base-uncased', type=str,
+                             help='Path to pretrained model')
+    model_group.add_argument('--pooling', default='mean', type=str, choices=['cls', 'mean', 'max'],
+                             help='BERT pooling method')
+    model_group.add_argument('--dropout', default=0.1, type=float,
+                             help='Dropout rate on final linear layer')
+    model_group.add_argument('--max-num-tokens', default=50, type=int,
+                             help='Maximum number of tokens')
+
+    # Data settings
+    data_group = parser.add_argument_group('Data')
+    data_group.add_argument('--task', default=CURRENT_TASK_NAME, type=str,
+                            choices=['wn18rr', 'fb15k237', 'wiki5m_ind', 'wiki5m_trans'],
+                            help='Dataset name')
+    data_group.add_argument('--train-path', default=None, type=str,
+                            help='Path to training data (auto-generated from task if not specified)')
+    data_group.add_argument('--valid-path', default=None, type=str,
+                            help='Path to validation data (auto-generated from task if not specified)')
+
+    # Training settings
+    train_group = parser.add_argument_group('Training')
+    train_group.add_argument('--epochs', default=20, type=int,
+                             help='Number of total epochs to run')
+    train_group.add_argument('-b', '--batch-size', default=32, type=int,
+                             help='Mini-batch size')
+    train_group.add_argument('--lr', '--learning-rate', default=5e-5, type=float, dest='lr',
+                             help='Initial learning rate')
+    train_group.add_argument('--wd', '--weight-decay', default=1e-4, type=float, dest='weight_decay',
+                             help='Weight decay')
+    train_group.add_argument('--lr-scheduler', default='linear', type=str, choices=['linear', 'cosine'],
+                             help='Learning rate scheduler')
+    train_group.add_argument('--warmup', default=400, type=int,
+                             help='Number of warmup steps')
+    train_group.add_argument('--grad-clip', default=10.0, type=float,
+                             help='Gradient clipping value')
+    train_group.add_argument('--seed', default=None, type=int,
+                             help='Seed for training initialization')
+
+    # Model management
+    mgmt_group = parser.add_argument_group('Model Management')
+    mgmt_group.add_argument('--model-dir', default=None, type=str,
+                            help='Path to save model checkpoints (auto-generated from task if not specified)')
+    mgmt_group.add_argument('--max-to-keep', default=4, type=int,
+                            help='Max number of checkpoints to keep')
+    mgmt_group.add_argument('--eval-every-n-step', default=10000, type=int,
+                            help='Evaluate every n steps')
+    mgmt_group.add_argument('--eval-model-path', default=None, type=str,
+                            help='Path to model for evaluation (auto-generated from task if not specified)')
+
+    # Loss and optimization
+    loss_group = parser.add_argument_group('Loss and Optimization')
+    loss_group.add_argument('--t', default=0.05, type=float,
+                            help='Temperature parameter')
+    loss_group.add_argument('--additive-margin', default=0.02, type=float,
+                            help='Additive margin for InfoNCE loss')
+    loss_group.add_argument('--finetune-t', action='store_true',
+                            help='Make temperature a trainable parameter')
+    loss_group.add_argument('--pre-batch', default=0, type=int,
+                            help='Number of pre-batch used for negatives')
+    loss_group.add_argument('--pre-batch-weight', default=0.5, type=float,
+                            help='Weight for logits from pre-batch negatives')
+
+    # Graph and context settings
+    graph_group = parser.add_argument_group('Graph')
+    graph_group.add_argument('--use-link-graph', action='store_true',
+                             help='Use neighbors from link graph as context')
+    graph_group.add_argument('--rerank-n-hop', default=2, type=int,
+                             help='Use n-hop nodes for re-ranking entities (evaluation only)')
+    graph_group.add_argument('--neighbor-weight', default=0.02, type=float,
+                             help='Weight for re-ranking entities')
+
+    # System settings
+    system_group = parser.add_argument_group('System')
+    system_group.add_argument('-j', '--workers', default=4, type=int,
+                              help='Number of data loading workers')
+    system_group.add_argument('-p', '--print-freq', default=20, type=int,
+                              help='Print frequency')
+    system_group.add_argument('--use-amp', action='store_true',
+                              help='Use automatic mixed precision if available')
+
+    # Evaluation flags
+    eval_group = parser.add_argument_group('Evaluation')
+    eval_group.add_argument('--is-test', action='store_true', default=False,
+                            help='Run in test mode')
+    eval_group.add_argument('--use-self-negative', action='store_true', default=True,
+                            help='Use head entity as negative sample')
+
+    return parser.parse_args()
 
 
-parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
-                    help='number of data loading workers')
-parser.add_argument('--epochs', default=20, type=int, metavar='N',
-                    help='number of total epochs to run')
-parser.add_argument('-b', '--batch-size', default=32, type=int,
-                    metavar='N',
-                    help='mini-batch size (default: 256), this is the total '
-                         'batch size of all GPUs on the current node when '
-                         'using Data Parallel or Distributed Data Parallel')
-parser.add_argument('--lr', '--learning-rate', default=5e-5, type=float,
-                    metavar='LR', help='initial learning rate', dest='lr')
-parser.add_argument('--lr-scheduler', default='linear', type=str,
-                    help='Lr scheduler to use')
-parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
-                    metavar='W', help='weight decay (default: 1e-4)',
-                    dest='weight_decay')
-parser.add_argument('-p', '--print-freq', default=20, type=int,
-                    metavar='N', help='print frequency (default: 10)')
-parser.add_argument('--seed', default=None, type=int,
-                    help='seed for initializing training. ')
+def generate_paths_from_task(arguments):
+    """Generate dynamic paths based on task name."""
+    task = arguments.task.upper()  # Convert to uppercase for folder naming
 
-# only used for evaluation
-parser.add_argument('--is-test', default=False, action='store_true',
-                    help='is in test mode or not')
-parser.add_argument('--use-self-negative', default=True, action='store_true',
-                    help='use head entity as negative')
-parser.add_argument('--rerank-n-hop', default=2, type=int,
-                    help='use n-hops node for re-ranking entities, only used during evaluation')
-parser.add_argument('--neighbor-weight', default=0.02, type=float,
-                    help='weight for re-ranking entities')
-parser.add_argument('--eval-model-path', default=f'data/{CURRENT_TASK_NAME}/checkpoint/model_best.mdl', type=str, metavar='N',
-                    help='path to model, only used for evaluation')
+    # Generate data paths
+    if arguments.train_path is None:
+        arguments.train_path = str(SCRIPT_DIR / 'data' / task / 'train.txt.json')
 
-args = parser.parse_args()
+    if arguments.valid_path is None:
+        arguments.valid_path = str(SCRIPT_DIR / 'data' / task / 'valid.txt.json')
 
-assert not args.train_path or os.path.exists(args.train_path)
-assert args.pooling in ['cls', 'mean', 'max']
-assert args.task.lower() in ['wn18rr', 'fb15k237', 'wiki5m_ind', 'wiki5m_trans']
-assert args.lr_scheduler in ['linear', 'cosine']
+    # Generate model directory and checkpoint paths
+    if arguments.model_dir is None:
+        arguments.model_dir = str(SCRIPT_DIR / 'data' / task / 'checkpoint')
 
-if args.model_dir:
-    os.makedirs(args.model_dir, exist_ok=True)
-else:
-    assert os.path.exists(args.eval_model_path), 'One of args.model_dir and args.eval_model_path should be valid path'
-    args.model_dir = os.path.dirname(args.eval_model_path)
+    if arguments.eval_model_path is None:
+        arguments.eval_model_path = str(SCRIPT_DIR / 'data' / task / 'checkpoint' / 'model_best.mdl')
 
-if args.seed is not None:
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    cudnn.deterministic = True
+    return arguments
 
-try:
-    if args.use_amp:
-        import torch.cuda.amp
-except Exception:
-    args.use_amp = False
-    warnings.warn('AMP training is not available, set use_amp=False')
 
-if not torch.cuda.is_available():
-    args.use_amp = False
-    args.print_freq = 1
-    warnings.warn('GPU is not available, set use_amp=False and print_freq=1')
+def validate_args(arguments):
+    """Validate parsed arguments."""
+    # Generate paths from task if not specified
+    arguments = generate_paths_from_task(arguments)
+
+    # Validate paths
+    if arguments.train_path and not os.path.exists(arguments.train_path):
+        raise FileNotFoundError(f"Training data not found: {arguments.train_path}")
+    if arguments.valid_path and not os.path.exists(arguments.valid_path):
+        raise FileNotFoundError(f"Validation data not found: {arguments.valid_path}")
+
+    # Setup model directory
+    if arguments.model_dir:
+        os.makedirs(arguments.model_dir, exist_ok=True)
+    elif os.path.exists(arguments.eval_model_path):
+        arguments.model_dir = os.path.dirname(arguments.eval_model_path)
+    else:
+        raise ValueError(
+            'Either --model-dir or a valid --eval-model-path must be provided'
+        )
+
+    # Validate choices are already handled by argparse choices parameter
+    return arguments
+
+
+def setup_environment(arguments):
+    """Setup random seeds and check system capabilities."""
+    import torch
+    if arguments.seed is not None:
+        random.seed(arguments.seed)
+        torch.manual_seed(arguments.seed)
+        cudnn.deterministic = True
+
+    # Check AMP availability
+    if arguments.use_amp:
+        try:
+            import torch.cuda.amp
+        except ImportError:
+            import torch
+            arguments.use_amp = False
+            warnings.warn('AMP training is not available, set use_amp=False')
+
+    # Check GPU availability
+    if not torch.cuda.is_available():
+        arguments.use_amp = False
+        arguments.print_freq = 1
+        warnings.warn('GPU is not available, set use_amp=False and print_freq=1')
+
+    return arguments
+
+
+"""entry point for argument parsing and setup."""
+args = parse_args()
+args = validate_args(args)
+args = setup_environment(args)
