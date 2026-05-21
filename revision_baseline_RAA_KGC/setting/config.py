@@ -6,7 +6,7 @@ import warnings
 
 import torch.backends.cudnn as cudnn
 
-CURRENT_TASK_NAME = "fb15k237"
+CURRENT_TASK_NAME = "wn18rr"
 
 parser = argparse.ArgumentParser(description='SimKGC arguments')
 parser.add_argument('--pretrained-model', default='bert-base-uncased', type=str, metavar='N',

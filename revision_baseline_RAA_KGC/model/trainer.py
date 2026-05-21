@@ -4,7 +4,7 @@ from typing import Dict
 import torch
 import torch.nn as nn
 import torch.utils.data
-from transformers import AdamW
+from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 
 from ..utils.dict_hub import build_tokenizer

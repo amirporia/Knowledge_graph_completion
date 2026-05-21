@@ -91,10 +91,6 @@ class BertPredictor:
         )
 
         # Update global config attributes for test mode
-        # Instead of direct assignment, modify the __dict__ directly
-        # Instead of this code:
-        # args.use_link_graph = self.train_args.use_link_graph
-        # args.is_test = True
         if hasattr(self.train_args, 'use_link_graph'):
             args.__dict__['use_link_graph'] = self.train_args.use_link_graph
         args.__dict__['is_test'] = True
