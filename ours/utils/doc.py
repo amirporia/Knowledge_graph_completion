@@ -70,8 +70,7 @@ def get_neighbor_desc(head_id: str, tail_id: str = None) -> str:
     if not args.is_test and tail_id is not None:
         neighbor_ids = [n_id for n_id in neighbor_ids if n_id != tail_id]
 
-    entities = [entity_dict.get_entity_by_id(n_id).entity for n_id in neighbor_ids]
-    entities = [_parse_entity_name(entity) for entity in entities]
+    entities = [_parse_entity_name(entity_dict.get_entity_by_id(n_id).entity) for n_id in neighbor_ids]
 
     return ' '.join(entities)
 
@@ -188,7 +187,7 @@ class Dataset(torch.utils.data.dataset.Dataset):
         example_vectorized = example.vectorize(test=True)
 
         if self.test_set:
-            return example.vectorize(test=True)
+            return example_vectorized
 
         related_triplets = self.get_related_triplets(
             example.relation, example.tail_id
@@ -387,5 +386,5 @@ def to_indices_and_mask(batch_tensor, pad_token_id=0, need_mask=True):
 
     if need_mask:
         return indices, mask
-    else:
-        return indices
+
+    return indices

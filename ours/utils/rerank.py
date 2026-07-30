@@ -29,11 +29,6 @@ def rerank_by_graph(related_batch_score: torch.tensor,
     if args.neighbor_weight < 1e-6:
         return
 
-    # Sort related batch scores
-    related_sorted_scores, related_sorted_indices = torch.sort(
-        related_batch_score, dim=-1, descending=True
-    )
-
     # Process each example in the batch
     for idx in range(batch_score.size(0)):
         current_example = examples[idx]
@@ -54,6 +49,10 @@ def rerank_by_graph(related_batch_score: torch.tensor,
             neighbor_tensor = torch.LongTensor(list(neighbor_indices)).to(batch_score.device)
             batch_score[idx].index_add_(0, neighbor_tensor, delta_weights)
 
+            # Sort related batch scores
+            _, related_sorted_indices = torch.sort(
+                related_batch_score, dim=-1, descending=True
+            )
             # Weight adjustment for related neighbors (currently zero - placeholder)
             top_related_indices = related_sorted_indices[idx][:len(neighbor_indices)]
             zero_weights = torch.zeros(len(top_related_indices), device=batch_score.device)

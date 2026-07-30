@@ -90,19 +90,7 @@ def move_to_cuda(sample: Any) -> Any:
         return {}
 
     device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
-
-    def _move_to_cuda(obj: Any) -> Any:
-        if torch.is_tensor(obj):
-            return obj.to(device, non_blocking=True)
-        elif isinstance(obj, dict):
-            return {key: _move_to_cuda(value) for key, value in obj.items()}
-        elif isinstance(obj, list):
-            return [_move_to_cuda(item) for item in obj]
-        elif isinstance(obj, tuple):
-            return tuple(_move_to_cuda(item) for item in obj)
-        return obj
-
-    return _move_to_cuda(sample)
+    return move_to_device(sample, device)
 
 
 class AverageMeter:

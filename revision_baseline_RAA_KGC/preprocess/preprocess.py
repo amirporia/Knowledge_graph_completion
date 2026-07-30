@@ -16,7 +16,7 @@ SCRIPT_DIR = Path(__file__).parent.parent.parent.absolute()
 parser = argparse.ArgumentParser(description='preprocess')
 parser.add_argument('--task', default=CURRENT_TASK_NAME, type=str, metavar='N',
                     help='dataset name')
-parser.add_argument('--workers', default=2, type=int, metavar='N',
+parser.add_argument('--workers', default=4, type=int, metavar='N',
                     help='number of workers')
 parser.add_argument('--train-path', default=str(SCRIPT_DIR / 'data' / CURRENT_TASK_NAME / 'train.txt'), type=str,
                     metavar='N',

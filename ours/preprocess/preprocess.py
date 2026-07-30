@@ -61,7 +61,7 @@ def setup_parser():
     )
     parser.add_argument(
         '--workers',
-        default=2,
+        default=4,
         type=int,
         help='number of workers'
     )
