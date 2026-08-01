@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import torch
 import torch.utils.data.dataset
@@ -233,62 +233,71 @@ def load_data(path: str,
     return examples
 
 
+def to_indices_and_mask(batch_tensor, pad_token_id=0, need_mask=True):
+    """Convert batch of tensors to padded indices and attention mask."""
+    max_len = max([t.size(0) for t in batch_tensor])
+    batch_size = len(batch_tensor)
+    indices = torch.LongTensor(batch_size, max_len).fill_(pad_token_id)
+
+    if need_mask:
+        mask = torch.ByteTensor(batch_size, max_len).fill_(0)
+
+    for i, tensor in enumerate(batch_tensor):
+        indices[i, :len(tensor)].copy_(tensor)
+        if need_mask:
+            mask[i, :len(tensor)].fill_(1)
+
+    if need_mask:
+        return indices, mask
+
+    return indices
+
+
+def _pad_triple_fields(examples: List[dict], prefix: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Build padded (token_ids, mask, token_type_ids) tensors for one field
+    group, e.g. prefix='h_triple', 'tail', or 'head'.
+
+    Each `examples[i]` is expected to contain '{prefix}_token_ids' and
+    '{prefix}_token_type_ids' keys.
+    """
+    token_ids, mask = to_indices_and_mask(
+        [torch.LongTensor(ex[f'{prefix}_token_ids']) for ex in examples],
+        pad_token_id=get_tokenizer().pad_token_id
+    )
+    token_type_ids = to_indices_and_mask(
+        [torch.LongTensor(ex[f'{prefix}_token_type_ids']) for ex in examples],
+        need_mask=False
+    )
+    return token_ids, mask, token_type_ids
+
+
 def collate(batch_data: List[dict]) -> dict:
     """Collate function for training batches."""
-    # Extract and pad tensors for example data
-    h_triple_token_ids, h_triple_mask = to_indices_and_mask(
-        [torch.LongTensor(ex['example_vectorized']['h_triple_token_ids'])
-         for ex in batch_data],
-        pad_token_id=get_tokenizer().pad_token_id
+    example_vecs = [ex['example_vectorized'] for ex in batch_data]
+
+    h_triple_token_ids, h_triple_mask, h_triple_token_type_ids = _pad_triple_fields(
+        example_vecs, 'h_triple'
     )
-    h_triple_token_type_ids = to_indices_and_mask(
-        [torch.LongTensor(ex['example_vectorized']['h_triple_token_type_ids'])
-         for ex in batch_data],
-        need_mask=False
+    tail_token_ids, tail_mask, tail_token_type_ids = _pad_triple_fields(
+        example_vecs, 'tail'
+    )
+    head_token_ids, head_mask, head_token_type_ids = _pad_triple_fields(
+        example_vecs, 'head'
     )
 
-    tail_token_ids, tail_mask = to_indices_and_mask(
-        [torch.LongTensor(ex['example_vectorized']['tail_token_ids'])
-         for ex in batch_data],
-        pad_token_id=get_tokenizer().pad_token_id
-    )
-    tail_token_type_ids = to_indices_and_mask(
-        [torch.LongTensor(ex['example_vectorized']['tail_token_type_ids'])
-         for ex in batch_data],
-        need_mask=False
-    )
-
-    head_token_ids, head_mask = to_indices_and_mask(
-        [torch.LongTensor(ex['example_vectorized']['head_token_ids'])
-         for ex in batch_data],
-        pad_token_id=get_tokenizer().pad_token_id
-    )
-    head_token_type_ids = to_indices_and_mask(
-        [torch.LongTensor(ex['example_vectorized']['head_token_type_ids'])
-         for ex in batch_data],
-        need_mask=False
-    )
-
-    # Process related triplets
+    # Process related triplets: one padded (ids, mask, type_ids) triple per example
     related_h_triple_token_ids_list = []
-    related_h_triple_token_type_ids_list = []
     related_h_triple_mask_list = []
+    related_h_triple_token_type_ids_list = []
 
     for ex in batch_data:
-        related_h_triple_token_ids, related_h_triple_mask = to_indices_and_mask(
-            [torch.LongTensor(related_ex['h_triple_token_ids'])
-             for related_ex in ex['related_triplets_vectorized']],
-            pad_token_id=get_tokenizer().pad_token_id
+        rel_token_ids, rel_mask, rel_token_type_ids = _pad_triple_fields(
+            ex['related_triplets_vectorized'], 'h_triple'
         )
-        related_h_triple_token_type_ids = to_indices_and_mask(
-            [torch.LongTensor(related_ex['h_triple_token_type_ids'])
-             for related_ex in ex['related_triplets_vectorized']],
-            need_mask=False
-        )
-
-        related_h_triple_token_ids_list.append(related_h_triple_token_ids)
-        related_h_triple_mask_list.append(related_h_triple_mask)
-        related_h_triple_token_type_ids_list.append(related_h_triple_token_type_ids)
+        related_h_triple_token_ids_list.append(rel_token_ids)
+        related_h_triple_mask_list.append(rel_mask)
+        related_h_triple_token_type_ids_list.append(rel_token_type_ids)
 
     batch_exs = [ex['example_vectorized']['obj'] for ex in batch_data]
     batch_exs_list = [ex['related_triplets_vectorized'][0]['obj'] for ex in batch_data]
@@ -307,41 +316,22 @@ def collate(batch_data: List[dict]) -> dict:
         'related_h_triple_mask_list': related_h_triple_mask_list,
         'related_h_triple_token_type_ids_list': related_h_triple_token_type_ids_list,
         'triplet_mask': construct_mask(row_exs=batch_exs) if not args.is_test else None,
-        'self_negative_mask': construct_self_negative_mask(batch_exs)
-        if not args.is_test else None,
-        'related_triplet_mask': construct_mask(row_exs=batch_exs_list)
-        if not args.is_test else None,
+        'self_negative_mask': construct_self_negative_mask(batch_exs) if not args.is_test else None,
+        'related_triplet_mask': construct_mask(row_exs=batch_exs_list) if not args.is_test else None,
         'test_forward': False,
     }
 
 
 def collate_test(batch_data: List[dict]) -> dict:
     """Collate function for test batches."""
-    h_triple_token_ids, h_triple_mask = to_indices_and_mask(
-        [torch.LongTensor(ex['h_triple_token_ids']) for ex in batch_data],
-        pad_token_id=get_tokenizer().pad_token_id
+    h_triple_token_ids, h_triple_mask, h_triple_token_type_ids = _pad_triple_fields(
+        batch_data, 'h_triple'
     )
-    h_triple_token_type_ids = to_indices_and_mask(
-        [torch.LongTensor(ex['h_triple_token_type_ids']) for ex in batch_data],
-        need_mask=False
+    tail_token_ids, tail_mask, tail_token_type_ids = _pad_triple_fields(
+        batch_data, 'tail'
     )
-
-    tail_token_ids, tail_mask = to_indices_and_mask(
-        [torch.LongTensor(ex['tail_token_ids']) for ex in batch_data],
-        pad_token_id=get_tokenizer().pad_token_id
-    )
-    tail_token_type_ids = to_indices_and_mask(
-        [torch.LongTensor(ex['tail_token_type_ids']) for ex in batch_data],
-        need_mask=False
-    )
-
-    head_token_ids, head_mask = to_indices_and_mask(
-        [torch.LongTensor(ex['head_token_ids']) for ex in batch_data],
-        pad_token_id=get_tokenizer().pad_token_id
-    )
-    head_token_type_ids = to_indices_and_mask(
-        [torch.LongTensor(ex['head_token_type_ids']) for ex in batch_data],
-        need_mask=False
+    head_token_ids, head_mask, head_token_type_ids = _pad_triple_fields(
+        batch_data, 'head'
     )
 
     batch_exs = [ex['obj'] for ex in batch_data]
@@ -364,27 +354,6 @@ def collate_test(batch_data: List[dict]) -> dict:
         'related_head_mask_list': None,
         'batch_data': batch_exs,
         'triplet_mask': construct_mask(row_exs=batch_exs) if not args.is_test else None,
-        'self_negative_mask': construct_self_negative_mask(batch_exs)
-        if not args.is_test else None,
+        'self_negative_mask': construct_self_negative_mask(batch_exs) if not args.is_test else None,
         'test_forward': True,
     }
-
-
-def to_indices_and_mask(batch_tensor, pad_token_id=0, need_mask=True):
-    """Convert batch of tensors to padded indices and attention mask."""
-    max_len = max([t.size(0) for t in batch_tensor])
-    batch_size = len(batch_tensor)
-    indices = torch.LongTensor(batch_size, max_len).fill_(pad_token_id)
-
-    if need_mask:
-        mask = torch.ByteTensor(batch_size, max_len).fill_(0)
-
-    for i, tensor in enumerate(batch_tensor):
-        indices[i, :len(tensor)].copy_(tensor)
-        if need_mask:
-            mask[i, :len(tensor)].fill_(1)
-
-    if need_mask:
-        return indices, mask
-
-    return indices
