@@ -67,6 +67,10 @@ def parse_args():
                             help='Evaluate every n steps')
     mgmt_group.add_argument('--eval-model-path', default=None, type=str,
                             help='Path to model for evaluation (auto-generated from task if not specified)')
+    mgmt_group.add_argument('--resume', action='store_true',
+                            help='Resume training from a checkpoint (model, optimizer, scheduler, epoch)')
+    mgmt_group.add_argument('--resume-path', default=None, type=str,
+                            help='Checkpoint to resume from (default: <model-dir>/model_last.mdl)')
 
     # Loss and optimization
     loss_group = parser.add_argument_group('Loss and Optimization')
@@ -150,6 +154,13 @@ def validate_args(arguments):
         raise ValueError(
             'Either --model-dir or a valid --eval-model-path must be provided'
         )
+
+    # Resolve and validate resume checkpoint path
+    if arguments.resume:
+        if arguments.resume_path is None:
+            arguments.resume_path = os.path.join(arguments.model_dir, 'model_last.mdl')
+        if not os.path.exists(arguments.resume_path):
+            raise FileNotFoundError(f"Resume checkpoint not found: {arguments.resume_path}")
 
     # Validate choices are already handled by argparse choices parameter
     return arguments

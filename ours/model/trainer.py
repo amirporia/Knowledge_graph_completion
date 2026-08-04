@@ -16,6 +16,7 @@ from ..utils.utils import (
     AverageMeter,
     ProgressMeter,
     save_checkpoint,
+    load_checkpoint,
     delete_old_checkpoints,
     report_num_trainable_parameters,
     move_to_cuda,
@@ -30,6 +31,7 @@ class Trainer:
         self.args = args
         self.ngpus_per_node = ngpus_per_node
         self.best_metric = None
+        self.start_epoch = 0
 
         self._initialize_tokenizer()
         self._build_model()
@@ -37,6 +39,8 @@ class Trainer:
         self._init_optimizer_and_criterion()
         self._init_data_loaders()
         self._init_scheduler()
+        self._init_amp()
+        self._maybe_resume()
 
     def _initialize_tokenizer(self):
         """Initialize the tokenizer based on args."""
@@ -115,12 +119,45 @@ class Trainer:
             num_training_steps=num_training_steps
         )
 
+    def _init_amp(self):
+        """Initialize the AMP gradient scaler (created before resume so its state can be restored)."""
+        self.scaler = torch.cuda.amp.GradScaler() if self.args.use_amp else None
+
+    def _maybe_resume(self):
+        """Restore model/optimizer/scheduler/scaler state from a checkpoint if --resume was passed.
+
+        Resumption is at epoch granularity: training continues from the epoch after the
+        one recorded in the checkpoint. If the checkpoint was written mid-epoch (from an
+        --eval-every-n-step save), the remainder of that particular epoch is not replayed;
+        training instead picks up at the start of the next epoch. Optimizer/scheduler/scaler
+        state is still fully restored, so this only affects data coverage for that one epoch,
+        not the learning-rate schedule or optimizer momentum.
+        """
+        if not self.args.resume:
+            return
+
+        checkpoint = load_checkpoint(self.args.resume_path, map_location=self.device)
+
+        get_model_obj(self.model).load_state_dict(checkpoint['state_dict'])
+
+        if checkpoint.get('optimizer') is not None:
+            self.optimizer.load_state_dict(checkpoint['optimizer'])
+        if checkpoint.get('scheduler') is not None:
+            self.scheduler.load_state_dict(checkpoint['scheduler'])
+        if self.args.use_amp and checkpoint.get('scaler') is not None:
+            self.scaler.load_state_dict(checkpoint['scaler'])
+
+        self.best_metric = checkpoint.get('best_metric')
+        self.start_epoch = checkpoint.get('epoch', -1) + 1
+
+        logger.info(
+            f'Resumed from {self.args.resume_path} '
+            f'(checkpoint epoch {checkpoint.get("epoch")}, resuming at epoch {self.start_epoch})'
+        )
+
     def train_loop(self):
         """Main training loop over epochs."""
-        if self.args.use_amp:
-            self.scaler = torch.cuda.amp.GradScaler()
-
-        for epoch in range(self.args.epochs):
+        for epoch in range(self.start_epoch, self.args.epochs):
             self.train_epoch(epoch)
             self._run_eval(epoch=epoch)
 
@@ -273,11 +310,27 @@ class Trainer:
         else:
             filename = f'{self.args.model_dir}/checkpoint_{epoch}_{step}.mdl'
 
-        save_checkpoint({
+        model_state = get_model_obj(self.model).state_dict()
+
+        full_state = {
             'epoch': epoch,
             'args': self.args.__dict__,
-            'state_dict': self.model.state_dict(),
-        }, is_best=is_best, filename=filename)
+            'state_dict': model_state,
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.scheduler.state_dict(),
+            'scaler': self.scaler.state_dict() if self.args.use_amp else None,
+            'best_metric': self.best_metric,
+        }
+        # model_best.mdl is only ever read by eval/predict scripts (BertPredictor.load),
+        # which need just 'args' and 'state_dict' -- keep it free of optimizer/scheduler
+        # tensors so it stays a fraction of the full resume checkpoint's size.
+        eval_state = {
+            'epoch': epoch,
+            'args': self.args.__dict__,
+            'state_dict': model_state,
+        }
+
+        save_checkpoint(full_state, is_best=is_best, filename=filename, eval_state=eval_state)
 
         delete_old_checkpoints(
             path_pattern=f'{self.args.model_dir}/checkpoint_*.mdl',

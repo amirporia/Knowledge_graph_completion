@@ -300,7 +300,7 @@ def collate(batch_data: List[dict]) -> dict:
         related_h_triple_token_type_ids_list.append(rel_token_type_ids)
 
     batch_exs = [ex['example_vectorized']['obj'] for ex in batch_data]
-    batch_exs_list = [ex['related_triplets_vectorized'][0]['obj'] for ex in batch_data]
+    related_batch_exs = [ex['related_triplets_vectorized'][0]['obj'] for ex in batch_data]
 
     return {
         'h_triple_token_ids': h_triple_token_ids,
@@ -317,7 +317,7 @@ def collate(batch_data: List[dict]) -> dict:
         'related_h_triple_token_type_ids_list': related_h_triple_token_type_ids_list,
         'triplet_mask': construct_mask(row_exs=batch_exs) if not args.is_test else None,
         'self_negative_mask': construct_self_negative_mask(batch_exs) if not args.is_test else None,
-        'related_triplet_mask': construct_mask(row_exs=batch_exs_list) if not args.is_test else None,
+        'related_triplet_mask': construct_mask(row_exs=related_batch_exs) if not args.is_test else None,
         'test_forward': False,
     }
 

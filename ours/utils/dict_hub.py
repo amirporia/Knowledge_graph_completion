@@ -72,7 +72,7 @@ def get_link_graph() -> LinkGraph:
     return _link_graph
 
 
-def get_tokenizer() -> AutoTokenizer:
+def get_tokenizer():
     if _tokenizer is None:
         init_tokenizer(args)
     return _tokenizer

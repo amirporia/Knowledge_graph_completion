@@ -17,14 +17,32 @@ class AttrDict(dict):
         self.__dict__ = self
 
 
-def save_checkpoint(state: Dict[str, Any], is_best: bool, filename: str) -> None:
-    """Save model checkpoint and maintain best/last model copies."""
+def save_checkpoint(state: Dict[str, Any], is_best: bool, filename: str,
+                    eval_state: Dict[str, Any] = None) -> None:
+    """Save model checkpoint and maintain best/last model copies.
+
+    `state` (which may include optimizer/scheduler/scaler tensors for resuming) is
+    written to `filename` and mirrored to model_last.mdl. If `is_best`, model_best.mdl
+    is written from `eval_state` when given (falling back to `state` otherwise) --
+    this keeps the best-model file, which is what evaluation/prediction scripts load,
+    free of optimizer/scheduler state it has no use for.
+    """
     torch.save(state, filename)
     dirname = os.path.dirname(filename)
 
     if is_best:
-        shutil.copyfile(filename, os.path.join(dirname, 'model_best.mdl'))
+        torch.save(eval_state if eval_state is not None else state,
+                   os.path.join(dirname, 'model_best.mdl'))
     shutil.copyfile(filename, os.path.join(dirname, 'model_last.mdl'))
+
+
+def load_checkpoint(path: str, map_location=None) -> Dict[str, Any]:
+    """Load a checkpoint dict (model/optimizer/scheduler/epoch/...) from disk."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f'Checkpoint not found: {path}')
+
+    logger.info(f'Loading checkpoint from {path}')
+    return torch.load(path, map_location=map_location)
 
 
 def delete_old_checkpoints(path_pattern: str, keep: int = 5) -> None:
