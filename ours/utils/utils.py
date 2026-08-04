@@ -103,11 +103,16 @@ def split_and_move_to_device(tensor_list: List, device_ids: List[int]) -> Dict[i
 
 
 def move_to_cuda(sample: Any) -> Any:
-    """Recursively move sample to CUDA device 1 or CPU."""
+    """Recursively move sample to the current process's CUDA device (or CPU if unavailable).
+
+    Uses torch.cuda.current_device() rather than a hardcoded index so this is correct
+    both for single-GPU runs (whatever device Trainer/BertPredictor selected) and for
+    each rank of a multi-GPU DDP run (after torch.cuda.set_device(local_rank)).
+    """
     if not sample:
         return {}
 
-    device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+    device = torch.device(f'cuda:{torch.cuda.current_device()}') if torch.cuda.is_available() else torch.device('cpu')
     return move_to_device(sample, device)
 
 

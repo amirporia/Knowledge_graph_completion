@@ -2,8 +2,10 @@ import json
 from typing import Dict
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.utils.data
+import torch.utils.data.distributed
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 
@@ -47,59 +49,94 @@ class Trainer:
         init_tokenizer(self.args)
 
     def _build_model(self):
-        """Build and log the model architecture."""
-        logger.info("=> creating model")
+        """Build and log the model architecture (rank 0 only, to avoid duplicate log spam)."""
+        if self.args.rank == 0:
+            logger.info("=> creating model")
         self.model = build_model(self.args)
-        logger.info(self.model)
+        if self.args.rank == 0:
+            logger.info(self.model)
 
     def _setup_device(self):
-        """Setup the training device (CPU/GPU)."""
-        self.device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+        """Place the model on this process's device, wrapping in DDP if distributed."""
+        if self.args.distributed:
+            self.device = torch.device(f'cuda:{self.args.local_rank}')
+            torch.cuda.set_device(self.device)
+        elif torch.cuda.is_available():
+            self.device = torch.device(f'cuda:{self.args.gpu}')
+            torch.cuda.set_device(self.device)
+        else:
+            self.device = torch.device('cpu')
+
         self.model.to(self.device)
+
+        if self.args.distributed:
+            self.model = nn.parallel.DistributedDataParallel(
+                self.model, device_ids=[self.args.local_rank], output_device=self.args.local_rank
+            )
 
     def _init_optimizer_and_criterion(self):
         """Initialize loss function, optimizer, and log trainable parameters."""
-        self.criterion = nn.CrossEntropyLoss().cuda()
+        self.criterion = nn.CrossEntropyLoss().to(self.device)
         self.optimizer = AdamW(
             [p for p in self.model.parameters() if p.requires_grad],
             lr=self.args.lr,
             weight_decay=self.args.weight_decay
         )
-        report_num_trainable_parameters(self.model)
+        if self.args.rank == 0:
+            report_num_trainable_parameters(get_model_obj(self.model))
 
     def _init_data_loaders(self):
         """Initialize training and validation data loaders."""
         self.train_dataset = Dataset(path=self.args.train_path, test_set=False)
-        self.valid_dataset = (
-            Dataset(path=self.args.valid_path, test_set=False)
-            if self.args.valid_path else None
+
+        self.train_loader, self.train_sampler = self._create_data_loader(
+            self.train_dataset, shuffle=True, drop_last=True, distributed=self.args.distributed
         )
 
-        self.train_loader = self._create_data_loader(self.train_dataset, shuffle=True, drop_last=True)
-        self.valid_loader = self._create_data_loader(self.valid_dataset, shuffle=True) if self.valid_dataset else None
+        # Validation only ever runs on rank 0 (see _run_eval), so other ranks skip
+        # loading/tokenizing it entirely instead of duplicating that work per GPU.
+        self.valid_dataset = None
+        self.valid_loader = None
+        if self.args.valid_path and self.args.rank == 0:
+            self.valid_dataset = Dataset(path=self.args.valid_path, test_set=False)
+            self.valid_loader, _ = self._create_data_loader(
+                self.valid_dataset, shuffle=True, distributed=False
+            )
 
-    def _create_data_loader(self, dataset, shuffle, drop_last=False):
-        """Create a DataLoader with standard configuration."""
-        return torch.utils.data.DataLoader(
+    def _create_data_loader(self, dataset, shuffle, drop_last=False, distributed=False):
+        """Create a DataLoader, using a DistributedSampler when sharding across ranks."""
+        sampler = (
+            torch.utils.data.distributed.DistributedSampler(dataset, shuffle=shuffle)
+            if distributed else None
+        )
+
+        loader = torch.utils.data.DataLoader(
             dataset,
             batch_size=self.args.batch_size,
-            shuffle=shuffle,
+            shuffle=shuffle if sampler is None else False,
+            sampler=sampler,
             collate_fn=collate,
             num_workers=self.args.workers,
             pin_memory=False,
             drop_last=drop_last
         )
+        return loader, sampler
 
     def _init_scheduler(self):
         """Initialize learning rate scheduler."""
-        num_training_steps = (
-                self.args.epochs * len(self.train_dataset) // max(self.args.batch_size, 1)
-        )
+        # Under DDP, each rank only ever sees 1/world_size of the dataset (via the
+        # DistributedSampler), so the scheduler -- which steps once per local optimizer
+        # step -- needs the per-rank step count, not the full dataset's.
+        world_size = self.args.world_size if self.args.distributed else 1
+        steps_per_epoch = len(self.train_dataset) // world_size // max(self.args.batch_size, 1)
+        num_training_steps = self.args.epochs * steps_per_epoch
+
         self.args.warmup = min(self.args.warmup, num_training_steps // 10)
-        logger.info(
-            f'Total training steps: {num_training_steps}, '
-            f'warmup steps: {self.args.warmup}'
-        )
+        if self.args.rank == 0:
+            logger.info(
+                f'Total training steps: {num_training_steps}, '
+                f'warmup steps: {self.args.warmup}'
+            )
         self.scheduler = self._create_lr_scheduler(num_training_steps)
 
     def _create_lr_scheduler(self, num_training_steps):
@@ -150,10 +187,11 @@ class Trainer:
         self.best_metric = checkpoint.get('best_metric')
         self.start_epoch = checkpoint.get('epoch', -1) + 1
 
-        logger.info(
-            f'Resumed from {self.args.resume_path} '
-            f'(checkpoint epoch {checkpoint.get("epoch")}, resuming at epoch {self.start_epoch})'
-        )
+        if self.args.rank == 0:
+            logger.info(
+                f'Resumed from {self.args.resume_path} '
+                f'(checkpoint epoch {checkpoint.get("epoch")}, resuming at epoch {self.start_epoch})'
+            )
 
     def train_loop(self):
         """Main training loop over epochs."""
@@ -163,6 +201,11 @@ class Trainer:
 
     def train_epoch(self, epoch):
         """Train for one epoch."""
+        if self.args.distributed:
+            # Reshuffles each rank's shard differently per epoch; without this every
+            # epoch would repeat the same rank->shard assignment.
+            self.train_sampler.set_epoch(epoch)
+
         meters = self._init_training_meters()
         progress = ProgressMeter(
             len(self.train_loader),
@@ -182,12 +225,13 @@ class Trainer:
             self._backward_pass(loss_components['total_loss'])
             self.scheduler.step()
 
-            if i % self.args.print_freq == 0:
+            if i % self.args.print_freq == 0 and self.args.rank == 0:
                 progress.display(i)
             if (i + 1) % self.args.eval_every_n_step == 0:
                 self._run_eval(epoch=epoch, step=i + 1)
 
-        logger.info(f'Learning rate: {self.scheduler.get_last_lr()[0]}')
+        if self.args.rank == 0:
+            logger.info(f'Learning rate: {self.scheduler.get_last_lr()[0]}')
 
     def _init_training_meters(self):
         """Initialize AverageMeter objects for tracking metrics."""
@@ -286,14 +330,24 @@ class Trainer:
 
     @torch.no_grad()
     def _run_eval(self, epoch, step=0):
-        """Run evaluation and handle checkpointing."""
-        metric_dict = self.eval_epoch(epoch)
-        is_best = self._check_best_metric(metric_dict)
+        """Run evaluation and handle checkpointing (rank 0 only under DDP).
 
-        if is_best:
-            self.best_metric = metric_dict
+        Only rank 0 evaluates and writes checkpoint files -- running this on every rank
+        would duplicate work and risk multiple processes writing the same file at once.
+        The barrier keeps other ranks from racing ahead into the next epoch while rank 0
+        is still evaluating/saving.
+        """
+        if self.args.rank == 0:
+            metric_dict = self.eval_epoch(epoch)
+            is_best = self._check_best_metric(metric_dict)
 
-        self._save_checkpoint(epoch, step, is_best)
+            if is_best:
+                self.best_metric = metric_dict
+
+            self._save_checkpoint(epoch, step, is_best)
+
+        if self.args.distributed:
+            dist.barrier()
 
     def _check_best_metric(self, metric_dict):
         """Check if current metrics are the best so far."""

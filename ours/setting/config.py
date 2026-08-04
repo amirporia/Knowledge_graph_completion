@@ -102,6 +102,10 @@ def parse_args():
                               help='Print frequency')
     system_group.add_argument('--use-amp', action='store_true',
                               help='Use automatic mixed precision if available')
+    system_group.add_argument('--gpu', default=0, type=int,
+                              help='GPU index to use when not running distributed (ignored under torchrun)')
+    system_group.add_argument('--dist-backend', default='nccl', type=str, choices=['nccl', 'gloo'],
+                              help='torch.distributed backend for multi-GPU training')
 
     # Evaluation flags
     eval_group = parser.add_argument_group('Evaluation')
@@ -192,7 +196,22 @@ def setup_environment(arguments):
     return arguments
 
 
+def setup_distributed(arguments):
+    """Detect single-node multi-GPU (DDP) settings from torchrun's environment variables.
+
+    Launching with `torchrun --nproc_per_node=N ...` sets RANK/LOCAL_RANK/WORLD_SIZE
+    for each of the N processes it starts; a plain `python main.py` leaves them unset,
+    which this treats as a single-process, non-distributed run (world_size=1, rank=0).
+    """
+    arguments.world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    arguments.rank = int(os.environ.get('RANK', '0'))
+    arguments.local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+    arguments.distributed = arguments.world_size > 1
+    return arguments
+
+
 """entry point for argument parsing and setup."""
 args = parse_args()
 args = validate_args(args)
 args = setup_environment(args)
+args = setup_distributed(args)
