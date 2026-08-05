@@ -71,7 +71,8 @@ class Trainer:
 
         if self.args.distributed:
             self.model = nn.parallel.DistributedDataParallel(
-                self.model, device_ids=[self.args.local_rank], output_device=self.args.local_rank
+                self.model, device_ids=[self.args.local_rank], output_device=self.args.local_rank,
+                broadcast_buffers=False,
             )
 
     def _init_optimizer_and_criterion(self):

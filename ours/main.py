@@ -15,7 +15,10 @@ def main():
         # Launched via `torchrun --nproc_per_node=N ...`: args.rank/local_rank/world_size
         # were populated from RANK/LOCAL_RANK/WORLD_SIZE in config.setup_distributed().
         torch.cuda.set_device(args.local_rank)
-        dist.init_process_group(backend=args.dist_backend, init_method='env://')
+        dist.init_process_group(
+            backend=args.dist_backend, init_method='env://',
+            device_id=torch.device(f'cuda:{args.local_rank}'),
+        )
         logger.info(
             f'Distributed training: rank {args.rank}/{args.world_size} '
             f'(local GPU {args.local_rank}, backend={args.dist_backend})'
