@@ -49,7 +49,14 @@ class CustomBertModel(nn.Module, ABC):
 
         # Dual encoder architecture
         self.hr_bert = AutoModel.from_pretrained(args.pretrained_model)
+        self._drop_unused_pooler(self.hr_bert)
         self.tail_bert = deepcopy(self.hr_bert)
+
+    @staticmethod
+    def _drop_unused_pooler(encoder: nn.Module) -> None:
+        """Remove the encoder's pooler head, if it has one."""
+        if getattr(encoder, 'pooler', None) is not None:
+            encoder.pooler = None
 
     def _init_pre_batch_vectors(self):
         """Initialize pre-batch vectors for negative sampling."""
