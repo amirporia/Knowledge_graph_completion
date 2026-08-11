@@ -7,13 +7,13 @@ from typing import List, Tuple, Dict
 import torch
 import tqdm
 
-from .predict import BertPredictor
-from ..setting.config import args
-from ..setting.logger_config import logger
-from ..utils.dict_hub import get_entity_dict, get_all_triplet_dict
-from ..utils.doc import load_data, Example
-from ..utils.rerank import rerank_by_graph
-from ..utils.triplet import EntityDict
+from predict import BertPredictor
+from ours.setting.config import args
+from ours.setting.logger_config import logger
+from ours.utils.dict_hub import get_entity_dict, get_all_triplet_dict
+from ours.utils.doc import load_data, Example
+from ours.utils.rerank import rerank_by_graph
+from ours.utils.triplet import EntityDict
 
 
 # ---------------------------------------------------------------------------
