@@ -12,7 +12,7 @@ from ours.setting.config import args
 from ours.setting.logger_config import logger
 from ours.utils.dict_hub import get_entity_dict, get_all_triplet_dict
 from ours.utils.doc import load_data, Example
-from ours.utils.rerank import rerank_by_graph
+from ours.utils.utils import rerank_by_graph
 from ours.utils.triplet import EntityDict
 
 
