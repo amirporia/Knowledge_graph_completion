@@ -144,7 +144,7 @@ class ARPMConfig:
     # Training / optimization
     # ------------------------------------------------------------------
     epochs: int = 20
-    batch_size: int = 32
+    batch_size: int = 16
     lr: float = 5e-5
     weight_decay: float = 1e-4
     lr_scheduler: str = "linear"    # 'linear' | 'cosine'
