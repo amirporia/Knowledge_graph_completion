@@ -7,12 +7,12 @@ import torch
 import torch.utils.data
 import tqdm
 
-from ours.model.models import build_model
-from ours.setting.config import args
-from ours.setting.logger_config import logger
-from ours.utils.dict_hub import init_tokenizer
-from ours.utils.doc import collate, Example, Dataset, collate_test
-from ours.utils.utils import AttrDict, move_to_cuda
+from Baseline.model.models import build_model
+from Baseline.setting.config import args
+from Baseline.setting.logger_config import logger
+from Baseline.utils.dict_hub import init_tokenizer
+from Baseline.utils.doc import collate, Example, Dataset, collate_test
+from Baseline.utils.utils import AttrDict, move_to_cuda
 
 
 def clean_state_dict(state_dict: dict) -> OrderedDict:

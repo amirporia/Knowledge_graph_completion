@@ -3,9 +3,9 @@ import json
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 
-from ours.setting.config import args
-from ours.model.trainer import Trainer
-from ours.setting.logger_config import logger
+from Baseline.setting.config import args
+from Baseline.model.trainer import Trainer
+from Baseline.setting.logger_config import logger
 
 
 def main():

@@ -22,7 +22,7 @@ DATASET_VARS = {
     'WN18RR': {
         'id2ent': {}
     },
-    'FB15k': {
+    'fb15k237': {
         'id2ent': {},
         'id2desc': {}
     },
@@ -35,8 +35,8 @@ DATASET_VARS = {
 
 # Backward compatibility references
 wn18rr_id2ent = DATASET_VARS['WN18RR']['id2ent']
-fb15k_id2ent = DATASET_VARS['FB15k']['id2ent']
-fb15k_id2desc = DATASET_VARS['FB15k']['id2desc']
+fb15k_id2ent = DATASET_VARS['fb15k237']['id2ent']
+fb15k_id2desc = DATASET_VARS['fb15k237']['id2desc']
 wiki5m_id2rel = DATASET_VARS['WiKi5m']['id2rel']
 wiki5m_id2ent = DATASET_VARS['WiKi5m']['id2ent']
 wiki5m_id2text = DATASET_VARS['WiKi5m']['id2text']
