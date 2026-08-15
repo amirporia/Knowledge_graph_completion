@@ -156,7 +156,11 @@ class Trainer:
             logger.info(f"Total training steps: {total_steps}, warmup steps: {cfg.warmup}")
 
     def _init_amp(self) -> None:
-        self.scaler = torch.cuda.amp.GradScaler() if self.config.use_amp else None
+        """Initializes the AMP gradient scaler (created before resume so its
+        state can be restored). Uses the current `torch.amp` API
+        (`torch.cuda.amp.GradScaler`/`autocast` are deprecated aliases as of
+        recent PyTorch)."""
+        self.scaler = torch.amp.GradScaler("cuda") if self.config.use_amp else None
 
     def _maybe_resume(self) -> None:
         if not self.config.resume:
@@ -205,14 +209,14 @@ class Trainer:
             batch = move_to_cuda(batch) if torch.cuda.is_available() else batch
 
             if cfg.use_amp:
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast("cuda"):
                     output = to_model_output(self.model(batch))
                     loss_out = compute_loss(get_model_obj(self.model), output, batch, self.train_triplet_dict)
             else:
                 output = to_model_output(self.model(batch))
                 loss_out = compute_loss(get_model_obj(self.model), output, batch, self.train_triplet_dict)
 
-            self._update_meters(meters, loss_out, output, batch, cfg.batch_size)
+            self._update_meters(meters, loss_out, cfg.batch_size)
             self._backward(loss_out.total)
             self.scheduler.step()
 
@@ -225,9 +229,13 @@ class Trainer:
         if cfg.rank == 0:
             logger.info(f"Learning rate: {self.scheduler.get_last_lr()[0]}")
 
-    def _update_meters(self, meters: Dict[str, AverageMeter], loss_out, output, batch, batch_size: int) -> None:
-        from .losses import build_training_scores
-        scores = build_training_scores(get_model_obj(self.model), output, batch, self.train_triplet_dict)
+    def _update_meters(self, meters: Dict[str, AverageMeter], loss_out, batch_size: int) -> None:
+        # Reuses loss_out.scores (computed once, inside the same autocast()
+        # context as the forward pass when AMP is on) instead of recomputing
+        # scores separately -- recomputing outside that context mixes
+        # float16/float32 tensors under AMP and crashes; it was also purely
+        # redundant compute even without AMP.
+        scores = loss_out.scores
         acc1, acc3 = accuracy(scores["S"], scores["target"], topk=(1, 3))
 
         meters["loss"].update(loss_out.total.item(), batch_size)
@@ -276,8 +284,7 @@ class Trainer:
             output = to_model_output(self.model(batch))
             loss_out = compute_loss(get_model_obj(self.model), output, batch, self.train_triplet_dict)
 
-            from .losses import build_training_scores
-            scores = build_training_scores(get_model_obj(self.model), output, batch, self.train_triplet_dict)
+            scores = loss_out.scores
             acc1, acc3 = accuracy(scores["S"], scores["target"], topk=(1, 3))
 
             bs = self.config.batch_size

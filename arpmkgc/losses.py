@@ -31,6 +31,12 @@ class LossOutput:
     retrieval: torch.Tensor
     diversity: torch.Tensor
     relevance: torch.Tensor
+    scores: Dict[str, torch.Tensor]  # the same {"S", "Sq", "Sp", "target"} dict build_training_scores
+                                      # produced -- callers (e.g. Trainer, for accuracy logging)
+                                      # should reuse this instead of recomputing it. Recomputing it
+                                      # outside the forward pass's autocast() context (when AMP is
+                                      # on) mixes float16/float32 tensors and crashes; reusing this
+                                      # field sidesteps that entirely, as well as the wasted compute.
 
 
 def build_training_scores(model: ARPMKGCModel, output: ModelOutput, batch: dict,
@@ -95,4 +101,4 @@ def compute_loss(model: ARPMKGCModel, output: ModelOutput, batch: dict,
     total = l_final + cfg.prototype_loss_weight * l_p + cfg.retrieval_loss_weight * l_retr
 
     return LossOutput(total=total, final=l_final, prototype=l_p, retrieval=l_retr,
-                       diversity=l_div, relevance=l_rel)
+                       diversity=l_div, relevance=l_rel, scores=scores)

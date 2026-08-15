@@ -20,8 +20,8 @@ from time import time
 from typing import Dict, List, Optional
 
 import torch
-from torch.utils.data import DataLoader
 import tqdm
+from torch.utils.data import DataLoader
 
 from .config import ARPMConfig
 from .data.dataset import ARPMDataset, Collator, Tokenization, load_examples
