@@ -187,11 +187,16 @@ retrieval architecture's effective receptive field (M in Sec 4.3), so it's
 left as an explicit, separate choice rather than a bundled "optimization."
 
 **Multi-GPU** now has two paths:
-- `distributed` (DDP via `torchrun --nproc_per_node=N`) -- unchanged from before.
+- `distributed` (DDP via `torchrun --nproc_per_node=N`) -- see
+  `KAGGLE_DDP.md` at the repo root for a tested Kaggle T4x2 recipe and the
+  environment-level fixes that make it reliable on Kaggle's virtualized
+  GPU hosts (NCCL P2P/IB/SHM transports are unstable there and are disabled
+  automatically by `main.py` before the process group is created).
 - `--data-parallel` (new): wraps the model in `nn.DataParallel`, which needs
   no external launcher and splits each batch across every visible GPU
   automatically within a single process -- generally the simpler option in
-  a notebook environment (e.g. Kaggle). If both are set, DDP takes priority.
+  a notebook environment (e.g. Kaggle) if you'd rather avoid `torchrun`
+  entirely. If both are set, DDP takes priority.
   This also required changing `ARPMKGCModel.forward()` to return a plain
   dict instead of the `ModelOutput` dataclass (`nn.DataParallel`'s
   automatic gather across GPUs only knows how to merge Tensors/dicts/lists/
@@ -208,10 +213,12 @@ python -m arpmkgc.preprocess --task fb15k237  --raw-dir <dir with train/valid/te
 
 Writes `<split>.txt.json`, `entities.json`, and `relations.json` (the
 relation vocabulary used by every `r`-conditioned scorer) into
-`data/<TASK>/` by default. `relations.json` includes the `"inverse <r>"`
-relation for every forward relation, matching the convention used when
-examples are loaded (`data/triplets.py: reverse_triplet`), so backward
-(tail->head) queries share the same relation-embedding table.
+`data/<TASK>/` by default (a top-level `data/` directory that sits *next
+to* the `arpmkgc/` package directory -- see `config.py: PACKAGE_ROOT`).
+`relations.json` includes the `"inverse <r>"` relation for every forward
+relation, matching the convention used when examples are loaded
+(`data/triplets.py: reverse_triplet`), so backward (tail->head) queries
+share the same relation-embedding table.
 
 ## 8. A note on validation
 
@@ -228,3 +235,12 @@ bugs (an all-padding attention-mask NaN hazard, a DDP unused-parameter gap,
 a checkpoint-vs-runtime config mismatch in `evaluate.py`, and a CLI flag
 being silently dropped) -- but it does not substitute for an actual run
 against real WN18RR/FB15k-237 data on a GPU, which is the natural next step.
+
+## 9. Kaggle 2x T4 DDP
+
+See `KAGGLE_DDP.md` at the repo root for the exact launch recipe and a
+summary of the two `main.py` changes (NCCL transport env vars, and a
+version-tolerant `dist.init_process_group` call) that were added so
+`torchrun --nproc_per_node=2 -m arpmkgc.main train ...` runs reliably on
+Kaggle's dual-T4 notebook instances instead of hanging at process-group
+init or the first cross-GPU all-reduce.
