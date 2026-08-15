@@ -13,15 +13,6 @@ alternative multi-GPU paths:
     It splits each batch across every visible GPU automatically. If both are
     set, DDP takes priority.
 
-When DDP is combined with `--use-gradient-checkpointing`, `_setup_device`
-also calls `model._set_static_graph()` right after wrapping. Without it,
-DDP can raise `RuntimeError: Expected to mark a variable ready only once`
-on an arbitrary parameter: `encoder.e0` is invoked both plainly
-(`encode_query`) and through `torch.utils.checkpoint` (`encode_anchors`)
-in the same forward pass, and checkpoint's backward-time recompute throws
-off DDP's default per-iteration parameter-hook bookkeeping for the whole
-model. See the inline comment at the call site for the full explanation.
-
 Full filtered-ranking evaluation (Sec 7.2) is comparatively expensive (it
 requires encoding every entity in the KG), so per-epoch / per-eval-step
 "light" validation here uses in-batch top-1/top-3 accuracy on `S` (Sec
@@ -106,25 +97,6 @@ class Trainer:
                 self.model, device_ids=[cfg.local_rank], output_device=cfg.local_rank,
                 broadcast_buffers=False, find_unused_parameters=True,
             )
-            if cfg.use_gradient_checkpointing and hasattr(self.model, "_set_static_graph"):
-                # `encoder.e0` is invoked two different ways in the same
-                # forward pass: plainly for encode_query, and through
-                # torch.utils.checkpoint for encode_anchors. Checkpoint's
-                # backward-time recompute throws off DDP's default
-                # "each parameter's gradient hook fires exactly once per
-                # iteration" bookkeeping for the *whole* wrapped module --
-                # not just the checkpointed submodule -- which is why the
-                # resulting RuntimeError ("Expected to mark a variable ready
-                # only once ... Parameter ... log_inv_t has been marked as
-                # ready twice") can name a parameter that was never anywhere
-                # near the checkpoint. This is a known DDP + activation-
-                # checkpointing interaction; the error text itself names
-                # `_set_static_graph()` as the fix. It's safe here because
-                # which submodules run on a given iteration is controlled
-                # entirely by `ARPMConfig` (fixed for the whole run), never
-                # by tensor values, so the parameter-usage graph DDP sees is
-                # identical every iteration.
-                self.model._set_static_graph()
         elif cfg.data_parallel and torch.cuda.device_count() > 1:
             device_ids = list(range(torch.cuda.device_count()))
             logger.info(f"Using nn.DataParallel across GPUs {device_ids} "
