@@ -28,7 +28,7 @@ from .data.dataset import ARPMDataset, Collator, Tokenization, load_examples
 from .data.dict_hub import get_all_triplet_dict, get_entity_dict
 from .logging_utils import logger
 from .metrics import compute_ranks, filter_known_answers, summarize_ranks
-from .model import ARPMKGCModel
+from .model import ARPMKGCModel, to_model_output
 from .utils import get_model_obj, move_to_cuda
 
 
@@ -49,7 +49,7 @@ class PredInfo:
 
 @torch.no_grad()
 def compute_entity_embeddings(model: ARPMKGCModel, entity_ids: List[str], tokenization: Tokenization,
-                               batch_size: int, use_cuda: bool) -> torch.Tensor:
+                              batch_size: int, use_cuda: bool) -> torch.Tensor:
     model.eval()
     embeddings = []
     for start in tqdm.tqdm(range(0, len(entity_ids), batch_size), desc="Encoding entities"):
@@ -80,8 +80,8 @@ def _pad(seqs, pad_id):
 
 @torch.no_grad()
 def eval_single_direction(config: ARPMConfig, model: ARPMKGCModel, entity_tensor: torch.Tensor,
-                           eval_forward: bool, use_cuda: bool, data_path: str,
-                           batch_size: int = 64) -> Dict:
+                          eval_forward: bool, use_cuda: bool, data_path: str,
+                          batch_size: int = 64) -> Dict:
     start_time = time()
     model.eval()
 
@@ -95,7 +95,7 @@ def eval_single_direction(config: ARPMConfig, model: ARPMKGCModel, entity_tensor
 
     collator = Collator(config, tokenization)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collator,
-                         num_workers=config.workers)
+                        num_workers=config.workers)
 
     all_ranks: List[int] = []
     pred_infos: List[PredInfo] = []
@@ -103,16 +103,16 @@ def eval_single_direction(config: ARPMConfig, model: ARPMKGCModel, entity_tensor
     for batch in tqdm.tqdm(loader, desc=f"Eval ({'fwd' if eval_forward else 'bwd'})"):
         if use_cuda:
             batch = move_to_cuda(batch)
-        output = model(batch)
+        output = to_model_output(model(batch))
 
-        scores = model.score(output.qe, output.prototypes, output.lambda_mem, entity_tensor,
-                              apply_margin_diagonal=False)["S"]
+        scores = get_model_obj(model).score(output.qe, output.prototypes, output.lambda_mem, entity_tensor,
+                                            apply_margin_diagonal=False)["S"]
 
         target_idx = torch.tensor(
             [entity_dict.entity_to_idx(t) for t in batch["tail_ids"]], device=scores.device,
         )
         filter_known_answers(scores, batch["head_ids"], batch["relations"], target_idx,
-                              all_triplet_dict, entity_dict)
+                             all_triplet_dict, entity_dict)
 
         ranks, sorted_scores, sorted_indices = compute_ranks(scores, target_idx)
         all_ranks.extend(ranks.tolist())
@@ -144,7 +144,7 @@ def predict_by_split(config: ARPMConfig) -> Dict:
 
     from .predict import ARPMPredictor
     predictor = ARPMPredictor(config)
-    predictor.load(config.eval_model_path)
+    predictor.load(config.eval_model_path, use_data_parallel=config.data_parallel)
     model = predictor.model
     # Everything architecture/data-generation sensitive (max_hop,
     # candidate_budget, anchor_selection_mode, ...) must come from the
@@ -157,14 +157,14 @@ def predict_by_split(config: ARPMConfig) -> Dict:
     entity_dict = get_entity_dict(eval_config)
     entity_ids = [ex.entity_id for ex in entity_dict.entity_exs]
     entity_tensor = compute_entity_embeddings(model, entity_ids, predictor.tokenization,
-                                               batch_size=eval_config.batch_size, use_cuda=use_cuda)
+                                              batch_size=eval_config.batch_size, use_cuda=use_cuda)
     if use_cuda:
         entity_tensor = entity_tensor.cuda()
 
     forward_result = eval_single_direction(eval_config, model, entity_tensor, eval_forward=True,
-                                            use_cuda=use_cuda, data_path=data_path)
+                                           use_cuda=use_cuda, data_path=data_path)
     backward_result = eval_single_direction(eval_config, model, entity_tensor, eval_forward=False,
-                                             use_cuda=use_cuda, data_path=data_path)
+                                            use_cuda=use_cuda, data_path=data_path)
 
     averaged = {
         k: round((forward_result["metrics"][k] + backward_result["metrics"][k]) / 2, 4)
@@ -190,6 +190,7 @@ def predict_by_split(config: ARPMConfig) -> Dict:
 
 if __name__ == "__main__":
     from .config import parse_args
+
     cfg = parse_args()
     cfg.is_test = True
     predict_by_split(cfg)

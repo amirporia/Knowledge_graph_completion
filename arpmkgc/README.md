@@ -162,7 +162,44 @@ choice rather than silently guessing:
   (on by default) has a non-zero effect on the total loss even when
   `L_rel` itself is disabled (which it is, by default). Default `eta_r=1.0`.
 
-## 6. Data preparation
+## 6. Performance: memory and multi-GPU
+
+Encoding the candidate anchor pool dominates the cost of a training step --
+`candidate_budget` full BERT forward passes per example versus 1 each for
+the query/head/tail -- so batch size and step time are governed almost
+entirely by that, not by parameter count. Three flags reduce this cost
+*without changing any score the model computes* (all three were verified,
+with a fixed set of weights, to produce bit-identical output on/off --
+they only change how the computation is scheduled):
+
+| Flag | Effect |
+|---|---|
+| `--deduplicate-anchors` (on by default) | Identical `(h_i, r, t_i)` anchors within the same flattened batch (common with skewed relation distributions, since global candidates for the same relation are drawn from the same pool across queries) are encoded once and broadcast back. |
+| `--anchor-encode-chunk-size N` | Caps anchors-per-BERT-call, trading wall-clock time for lower peak activation memory. |
+| `--use-gradient-checkpointing` | Recomputes anchor-encoder activations during backward instead of storing them: ~20-30% more compute, large activation-memory reduction. Training-time only. |
+| `--anchor-max-num-tokens N` | Independent, shorter token budget for anchor text (default: falls back to `--max-num-tokens`). Unlike the three above, this *does* slightly change what the anchor encoder sees (more truncation) -- an opt-in trade, not free. |
+
+Combine these with `--use-amp` (already existed) for the largest memory win.
+None of them touch `candidate_budget`/`local_candidates_per_hop`/
+`global_candidates` -- if you still need more headroom after enabling all
+of the above, shrinking those is the next lever, but it does change the
+retrieval architecture's effective receptive field (M in Sec 4.3), so it's
+left as an explicit, separate choice rather than a bundled "optimization."
+
+**Multi-GPU** now has two paths:
+- `distributed` (DDP via `torchrun --nproc_per_node=N`) -- unchanged from before.
+- `--data-parallel` (new): wraps the model in `nn.DataParallel`, which needs
+  no external launcher and splits each batch across every visible GPU
+  automatically within a single process -- generally the simpler option in
+  a notebook environment (e.g. Kaggle). If both are set, DDP takes priority.
+  This also required changing `ARPMKGCModel.forward()` to return a plain
+  dict instead of the `ModelOutput` dataclass (`nn.DataParallel`'s
+  automatic gather across GPUs only knows how to merge Tensors/dicts/lists/
+  tuples/None, not arbitrary dataclasses); call
+  `to_model_output(model(batch))` to get the `ModelOutput` used everywhere
+  else. `Trainer`/`evaluate.py` already do this.
+
+## 7. Data preparation
 
 ```
 python -m arpmkgc.preprocess --task wn18rr    --raw-dir <dir with train/valid/test.txt + wordnet-mlj12-definitions.txt>
@@ -176,7 +213,7 @@ relation for every forward relation, matching the convention used when
 examples are loaded (`data/triplets.py: reverse_triplet`), so backward
 (tail->head) queries share the same relation-embedding table.
 
-## 7. A note on validation
+## 8. A note on validation
 
 This environment has no GPU/torch/network access, so the implementation was
 validated with a hand-written numpy-backed stub of the torch/transformers

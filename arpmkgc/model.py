@@ -23,9 +23,18 @@ exceptions -- they are only constructed when their governing flag is on,
 since a `None` submodule (rather than an unused live one) is the more
 natural way to express "this branch does not exist" for the two ablations
 (A9/A10) that explicitly test removing an entire memory source.
+
+Note on `forward`'s return type: it returns a plain dict, not `ModelOutput`,
+so that `nn.DataParallel` (single-process multi-GPU, split across GPUs by
+`Trainer` when `config.data_parallel=True`) can gather per-GPU-shard results
+correctly -- its automatic gather only knows how to merge Tensors, dicts,
+lists, tuples, and None, not arbitrary dataclass instances. Call
+`to_model_output(model(batch))` to get the attribute-access `ModelOutput`
+used by `losses.py`/`evaluate.py`/etc. This works identically whether the
+model is unwrapped, DDP-wrapped, or DataParallel-wrapped.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Dict, List, Optional
 
 import torch
@@ -59,6 +68,23 @@ class ModelOutput:
     hop_has_data: Optional[torch.Tensor]                 # [B, L] or None
 
 
+_MODEL_OUTPUT_FIELDS = tuple(f.name for f in fields(ModelOutput))
+
+
+def to_model_output(result) -> ModelOutput:
+    """Converts `ARPMKGCModel.forward`'s plain-dict return value into the
+    attribute-access `ModelOutput` used everywhere else in the codebase
+    (losses.py, evaluate.py, ...). `forward` itself returns a plain dict --
+    not `ModelOutput` directly -- purely so `nn.DataParallel` can gather per-
+    GPU results: DataParallel's automatic gather only knows how to merge
+    Tensors, dicts, lists, tuples, and None, not arbitrary dataclasses. Every
+    call site that invokes the model (`model(batch)`) should wrap the result
+    with this function before using it."""
+    if isinstance(result, ModelOutput):
+        return result
+    return ModelOutput(**{k: result[k] for k in _MODEL_OUTPUT_FIELDS})
+
+
 class ARPMKGCModel(nn.Module):
     def __init__(self, config: ARPMConfig, num_relations: int):
         super().__init__()
@@ -66,9 +92,7 @@ class ARPMKGCModel(nn.Module):
         self.num_relations = num_relations
         self.gumbel_tau = config.gumbel_temperature_init  # updated once per epoch by the Trainer
 
-        self.encoder = DualTowerEncoder(
-            config.pretrained_model, config.pooling, config.dropout, config.tie_encoders,
-        )
+        self.encoder = DualTowerEncoder(config)
         d = self.encoder.hidden_size
 
         self.anchor_selector = AnchorSelector(config, d, num_relations)
@@ -101,7 +125,9 @@ class ARPMKGCModel(nn.Module):
         )
 
     # ------------------------------------------------------------------
-    def forward(self, batch: dict) -> ModelOutput:
+    def forward(self, batch: dict) -> dict:
+        """Returns a plain dict (see `to_model_output` above for why) with
+        exactly the fields of `ModelOutput`."""
         cfg = self.config
         q = self.encoder.encode_query(batch["query"])
         tail_vector = self.encoder.encode_entity(batch["tail_entity"])
@@ -146,12 +172,12 @@ class ARPMKGCModel(nn.Module):
         qe = self.query_memory_fusion(qp, m)
         lambda_mem = resolve_memory_gate(cfg, self.memory_gate, q, relation_ids)
 
-        return ModelOutput(
-            q=q, qp=qp, qe=qe, tail_vector=tail_vector, head_vector=head_vector,
-            prototypes=prototypes, lambda_mem=lambda_mem,
-            anchors=anchors, anchor_mask=anchor_mask, alpha=alpha, raw_scores=raw_scores,
-            beta=beta, gamma=gamma, slot_mask=slot_mask, hop_has_data=hop_has_data,
-        )
+        return {
+            "q": q, "qp": qp, "qe": qe, "tail_vector": tail_vector, "head_vector": head_vector,
+            "prototypes": prototypes, "lambda_mem": lambda_mem,
+            "anchors": anchors, "anchor_mask": anchor_mask, "alpha": alpha, "raw_scores": raw_scores,
+            "beta": beta, "gamma": gamma, "slot_mask": slot_mask, "hop_has_data": hop_has_data,
+        }
 
     def _fuse_memory(self, m_p: Optional[torch.Tensor], m_struct: Optional[torch.Tensor],
                       q_like: torch.Tensor) -> torch.Tensor:

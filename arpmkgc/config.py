@@ -60,6 +60,28 @@ class ARPMConfig:
     tie_encoders: bool = False     # if True, E0 and E1 share weights at init only (still two towers)
 
     # ------------------------------------------------------------------
+    # Anchor-encoding compute/memory controls. These are pure engineering
+    # knobs (not part of the proposal's architecture -- they change how the
+    # anchor encoding is *scheduled*, never what gets computed) aimed at the
+    # dominant cost of a training step: encoding `candidate_budget` anchors
+    # per example is far more BERT work than the 1 query + 1 head + 1 tail
+    # encode. See modules/encoders.py's module docstring for details.
+    # ------------------------------------------------------------------
+    anchor_max_num_tokens: Optional[int] = None   # None -> falls back to max_num_tokens
+    deduplicate_anchors: bool = True              # encode each unique (h_i,r,t_i) once per batch
+    anchor_encode_chunk_size: Optional[int] = None  # None -> one BERT call for all unique anchors
+    use_gradient_checkpointing: bool = False        # checkpoint E0's anchor-encoding forward pass
+
+    # ------------------------------------------------------------------
+    # Multi-GPU, single process (no torchrun needed) -- an alternative to
+    # `distributed` (DDP via torchrun) that is often more convenient in
+    # notebook environments (e.g. Kaggle). Splits each batch across all
+    # visible GPUs via nn.DataParallel. Ignored if `distributed` is active
+    # (DDP takes priority when both are set).
+    # ------------------------------------------------------------------
+    data_parallel: bool = False
+
+    # ------------------------------------------------------------------
     # 4.3 Relation-aware candidate memory (local + global candidate pool)
     # ------------------------------------------------------------------
     max_hop: int = 2                       # L: max structural hop distance considered
@@ -312,6 +334,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     enc.add_argument("--dropout", type=float, default=defaults.dropout)
     enc.add_argument("--max-num-tokens", type=int, default=defaults.max_num_tokens)
 
+    perf = parser.add_argument_group("Performance (engineering knobs, no architecture effect)")
+    perf.add_argument("--anchor-max-num-tokens", type=int, default=None)
+    _add_bool_arg(perf, "deduplicate-anchors", defaults.deduplicate_anchors,
+                  "Encode each unique in-batch anchor once")
+    perf.add_argument("--anchor-encode-chunk-size", type=int, default=None,
+                       help="Cap anchors per BERT call to lower peak memory")
+    _add_bool_arg(perf, "use-gradient-checkpointing", defaults.use_gradient_checkpointing,
+                  "Trade compute for anchor-encoder activation memory")
+    _add_bool_arg(perf, "data-parallel", defaults.data_parallel,
+                  "Single-process multi-GPU via nn.DataParallel (no torchrun needed)")
+
     cand = parser.add_argument_group("Candidate memory (Sec 4.3)")
     cand.add_argument("--max-hop", type=int, default=defaults.max_hop)
     cand.add_argument("--candidate-budget", type=int, default=defaults.candidate_budget)
@@ -403,7 +436,10 @@ def parse_args(argv=None) -> ARPMConfig:
                       "eval_model_path", "run_name", "epochs", "batch_size",
                       "lr", "seed", "workers", "use_amp", "gpu",
                       "resume", "resume_path", "eval_split", "print_freq",
-                      "max_to_keep", "eval_every_n_step")
+                      "max_to_keep", "eval_every_n_step",
+                      "anchor_max_num_tokens", "deduplicate_anchors",
+                      "anchor_encode_chunk_size", "use_gradient_checkpointing",
+                      "data_parallel")
             and v is not None
         }
         for k, v in cli_overrides.items():

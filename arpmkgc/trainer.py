@@ -1,9 +1,17 @@
 """
 Training loop for ARPM-KGC. Independent implementation (no `ours` import),
 but follows the same general shape as a standard dual-encoder KGC trainer:
-AdamW + linear/cosine warmup, gradient clipping, optional AMP, optional
-single-node multi-GPU DDP (detected via torchrun's RANK/LOCAL_RANK/WORLD_SIZE
-env vars, exactly as `config.setup_distributed` does).
+AdamW + linear/cosine warmup, gradient clipping, optional AMP, and two
+alternative multi-GPU paths:
+
+  - DDP (`config.distributed`), detected via torchrun's
+    RANK/LOCAL_RANK/WORLD_SIZE env vars, exactly as `config.setup_distributed`
+    does -- the standard multi-process approach.
+  - `nn.DataParallel` (`config.data_parallel`), a single-process alternative
+    that needs no external launcher (`torchrun`, `mp.spawn`, ...) and so is
+    often the more convenient option in notebook environments (e.g. Kaggle).
+    It splits each batch across every visible GPU automatically. If both are
+    set, DDP takes priority.
 
 Full filtered-ranking evaluation (Sec 7.2) is comparatively expensive (it
 requires encoding every entity in the KG), so per-epoch / per-eval-step
@@ -29,7 +37,7 @@ from .data.dict_hub import get_relation_vocab, get_train_triplet_dict, init_toke
 from .logging_utils import logger
 from .losses import compute_loss
 from .metrics import accuracy
-from .model import ARPMKGCModel
+from .model import ARPMKGCModel, to_model_output
 from .utils import (
     AverageMeter,
     ProgressMeter,
@@ -89,6 +97,14 @@ class Trainer:
                 self.model, device_ids=[cfg.local_rank], output_device=cfg.local_rank,
                 broadcast_buffers=False, find_unused_parameters=True,
             )
+        elif cfg.data_parallel and torch.cuda.device_count() > 1:
+            device_ids = list(range(torch.cuda.device_count()))
+            logger.info(f"Using nn.DataParallel across GPUs {device_ids} "
+                        f"(effective per-GPU batch size ~= batch_size / {len(device_ids)})")
+            self.model = nn.DataParallel(self.model, device_ids=device_ids)
+        elif cfg.data_parallel:
+            logger.warning("config.data_parallel=True but fewer than 2 GPUs are visible; "
+                           "training on a single device.")
 
     def _init_optimizer(self) -> None:
         cfg = self.config
@@ -102,7 +118,7 @@ class Trainer:
     def _init_data_loaders(self) -> None:
         cfg = self.config
         self.train_dataset = ARPMDataset(cfg, cfg.train_path, tokenization=self.tokenization,
-                                          seed=cfg.seed)
+                                         seed=cfg.seed)
         collator = Collator(cfg, self.tokenization)
 
         self.train_sampler = None
@@ -119,7 +135,7 @@ class Trainer:
         self.valid_loader = None
         if cfg.valid_path and cfg.rank == 0:
             valid_dataset = ARPMDataset(cfg, cfg.valid_path, tokenization=self.tokenization,
-                                         seed=cfg.seed)
+                                        seed=cfg.seed)
             self.valid_loader = torch.utils.data.DataLoader(
                 valid_dataset, batch_size=cfg.batch_size, shuffle=True,
                 collate_fn=collator, num_workers=cfg.workers,
@@ -190,10 +206,10 @@ class Trainer:
 
             if cfg.use_amp:
                 with torch.cuda.amp.autocast():
-                    output = self.model(batch)
+                    output = to_model_output(self.model(batch))
                     loss_out = compute_loss(get_model_obj(self.model), output, batch, self.train_triplet_dict)
             else:
-                output = self.model(batch)
+                output = to_model_output(self.model(batch))
                 loss_out = compute_loss(get_model_obj(self.model), output, batch, self.train_triplet_dict)
 
             self._update_meters(meters, loss_out, output, batch, cfg.batch_size)
@@ -257,7 +273,7 @@ class Trainer:
 
         for batch in self.valid_loader:
             batch = move_to_cuda(batch) if torch.cuda.is_available() else batch
-            output = self.model(batch)
+            output = to_model_output(self.model(batch))
             loss_out = compute_loss(get_model_obj(self.model), output, batch, self.train_triplet_dict)
 
             from .losses import build_training_scores
@@ -270,7 +286,7 @@ class Trainer:
             meters["top3"].update(acc3.item(), bs)
 
         metric_dict = {"Acc@1": round(meters["top1"].avg, 3), "Acc@3": round(meters["top3"].avg, 3),
-                        "loss": round(meters["loss"].avg, 3)}
+                       "loss": round(meters["loss"].avg, 3)}
         logger.info(f"Epoch {epoch} valid metrics: {json.dumps(metric_dict)}")
         return metric_dict
 

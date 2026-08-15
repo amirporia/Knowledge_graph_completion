@@ -92,11 +92,12 @@ class Tokenization:
     def encode_anchor(self, head_id: str, relation: str, tail_id: str) -> dict:
         """E0(h_i, r, t_i): head text + [relation [SEP] tail text]."""
         pair_text = f"{relation} [SEP] {self.entity_text(tail_id)}"
+        max_len = self.config.anchor_max_num_tokens or self.config.max_num_tokens
         enc = self.tokenizer(
             text=self.entity_text(head_id),
             text_pair=pair_text,
             add_special_tokens=True,
-            max_length=self.config.max_num_tokens,
+            max_length=max_len,
             truncation=True,
             return_token_type_ids=True,
         )
