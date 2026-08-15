@@ -6,9 +6,15 @@ CLI entry point.
     python -m arpmkgc.main evaluate --ablation full --task wn18rr \
         --eval-model-path data/WN18RR/checkpoint/full/model_best.mdl
     python -m arpmkgc.main list-ablations
+
+    # multi-GPU (DDP):
+    torchrun --nproc_per_node=2 -m arpmkgc.main train --ablation full --task wn18rr
 """
 
 import sys
+
+import torch
+import torch.distributed as dist
 
 from .ablations import ABLATIONS
 from .config import parse_args
@@ -29,16 +35,33 @@ def _dispatch() -> None:
         return
 
     config = parse_args()
-    logger.info(f"Config ({config.ablation_name}):\n{config.to_dict()}")
-    config.save(f"{config.model_dir}/config.json")
 
-    if command == "train":
-        from .trainer import Trainer
-        Trainer(config).train_loop()
-    elif command == "evaluate":
-        from .evaluate import predict_by_split
-        config.is_test = True
-        predict_by_split(config)
+    if config.distributed:
+        torch.cuda.set_device(config.local_rank)
+        dist.init_process_group(
+            backend=config.dist_backend, init_method="env://",
+            device_id=torch.device(f"cuda:{config.local_rank}"),
+        )
+        logger.info(
+            f"Distributed training: rank {config.rank}/{config.world_size} "
+            f"(local GPU {config.local_rank}, backend={config.dist_backend})"
+        )
+
+    if config.rank == 0:
+        logger.info(f"Config ({config.ablation_name}):\n{config.to_dict()}")
+        config.save(f"{config.model_dir}/config.json")
+
+    try:
+        if command == "train":
+            from .trainer import Trainer
+            Trainer(config).train_loop()
+        elif command == "evaluate":
+            from .evaluate import predict_by_split
+            config.is_test = True
+            predict_by_split(config)
+    finally:
+        if config.distributed:
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
