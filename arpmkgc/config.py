@@ -35,6 +35,8 @@ HOP_SELECTION_MODES = ("soft", "uniform", "gumbel_softmax")
 # Prototype-count strategies (Section 4.5.1; A13/4.13.3)
 PROTOTYPE_GATING_MODES = ("fixed", "gumbel_sigmoid_slots")
 SUPPORTED_TASKS = ("wn18rr", "fb15k237")
+FULL_EVAL_ONLY_METRICS = ("mrr", "hit@1", "hit@3", "hit@10", "hit@50", "mean_rank")
+CHECKPOINT_METRICS = FULL_EVAL_ONLY_METRICS + ("Acc@1", "Acc@3")
 
 
 @dataclass
@@ -163,6 +165,21 @@ class ARPMConfig:
     gumbel_proto_temperature: Optional[float] = None  # tau_proto override
 
     # ------------------------------------------------------------------
+    # Best-checkpoint selection. The cheap in-batch Acc@1/Acc@3 proxy
+    # (computed every validation pass regardless) does not reliably track
+    # the real filtered-ranking metrics (Hit@k, MRR) -- it scores each
+    # example against only the ~batch_size other tails in the same
+    # mini-batch, a much easier task than ranking against the full entity
+    # set with known answers filtered out. `checkpoint_metric` selects which
+    # metric actually drives model_best.mdl; by default this is MRR from a
+    # *real* filtered-ranking pass over the validation set, run periodically
+    # during training (see full_eval_frequency).
+    # ------------------------------------------------------------------
+    checkpoint_metric: str = "mrr"       # mrr | hit@1 | hit@3 | hit@10 | hit@50 | mean_rank | Acc@1 | Acc@3
+    full_eval_frequency: int = 1         # run the full filtered-ranking eval every N epochs (epoch-end only); <=0 disables it
+    full_eval_batch_size: int = 64       # batch size for the full-ranking pass, independent of training batch_size
+
+    # ------------------------------------------------------------------
     # Training / optimization
     # ------------------------------------------------------------------
     epochs: int = 20
@@ -214,6 +231,18 @@ class ARPMConfig:
         assert self.top_k_hop >= 1
         if self.hop_selection_mode == "gumbel_softmax":
             assert self.top_k_hop <= self.max_hop
+        assert self.checkpoint_metric in CHECKPOINT_METRICS, (
+            f"Unknown checkpoint_metric '{self.checkpoint_metric}'. Choices: {CHECKPOINT_METRICS}"
+        )
+        if self.checkpoint_metric in FULL_EVAL_ONLY_METRICS and self.full_eval_frequency <= 0:
+            raise ValueError(
+                f"checkpoint_metric='{self.checkpoint_metric}' requires a real filtered-ranking "
+                f"pass, but full_eval_frequency={self.full_eval_frequency} disables it. Without "
+                f"this, metric_dict will never contain '{self.checkpoint_metric}' after the first "
+                f"epoch and the first checkpoint would silently stay 'best' forever. Either set "
+                f"full_eval_frequency >= 1, or set checkpoint_metric to 'Acc@1'/'Acc@3' to use the "
+                f"cheap in-batch proxy instead."
+            )
         if not self.use_local_candidates and self.use_structural_memory:
             warnings.warn(
                 "use_structural_memory=True but use_local_candidates=False: "
@@ -402,6 +431,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--eval-every-n-step", type=int, default=defaults.eval_every_n_step)
     train.add_argument("--resume", action="store_true", default=False)
     train.add_argument("--resume-path", default=None)
+    train.add_argument("--checkpoint-metric", default=defaults.checkpoint_metric,
+                        choices=list(CHECKPOINT_METRICS))
+    train.add_argument("--full-eval-frequency", type=int, default=defaults.full_eval_frequency,
+                        help="Run the full filtered-ranking eval on valid every N epochs; <=0 disables it")
+    train.add_argument("--full-eval-batch-size", type=int, default=defaults.full_eval_batch_size)
 
     sysg = parser.add_argument_group("System")
     sysg.add_argument("-j", "--workers", type=int, default=defaults.workers)
@@ -439,7 +473,8 @@ def parse_args(argv=None) -> ARPMConfig:
                       "max_to_keep", "eval_every_n_step",
                       "anchor_max_num_tokens", "deduplicate_anchors",
                       "anchor_encode_chunk_size", "use_gradient_checkpointing",
-                      "data_parallel")
+                      "data_parallel", "checkpoint_metric", "full_eval_frequency",
+                      "full_eval_batch_size")
             and v is not None
         }
         for k, v in cli_overrides.items():

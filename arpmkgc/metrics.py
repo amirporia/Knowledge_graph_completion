@@ -7,6 +7,16 @@ import torch
 from .data.entities import EntityDict
 from .data.triplets import TripletDict
 
+# Whether a larger value is better, for every metric key that can appear in
+# a validation metric_dict -- used by Trainer._check_best to compare
+# checkpoints regardless of which metric is configured as the selection
+# criterion. mean_rank is the one metric here where *lower* is better.
+METRIC_HIGHER_IS_BETTER: Dict[str, bool] = {
+    "mrr": True, "hit@1": True, "hit@3": True, "hit@10": True, "hit@50": True,
+    "mean_rank": False,
+    "Acc@1": True, "Acc@3": True,
+}
+
 
 @torch.no_grad()
 def accuracy(scores: torch.Tensor, target: torch.Tensor, topk=(1,)) -> List[torch.Tensor]:

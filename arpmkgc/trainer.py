@@ -14,10 +14,17 @@ alternative multi-GPU paths:
     set, DDP takes priority.
 
 Full filtered-ranking evaluation (Sec 7.2) is comparatively expensive (it
-requires encoding every entity in the KG), so per-epoch / per-eval-step
-"light" validation here uses in-batch top-1/top-3 accuracy on `S` (Sec
-4.10's final score) purely to pick the best checkpoint; `evaluate.py` /
-`predict.py` run the full filtered-ranking protocol on demand.
+requires encoding every entity in the KG), so `eval_epoch` always computes a
+cheap in-batch top-1/top-3 accuracy proxy on `S` for fast per-step logging,
+but that proxy does NOT reliably track the real ranking metrics (Hit@k,
+MRR) -- it only has to discriminate the right tail from the handful of
+other tails in the same mini-batch, a much easier task than ranking against
+the full entity set with known answers filtered out. Best-checkpoint
+selection (`config.checkpoint_metric`, default "mrr") is therefore driven by
+a periodic *real* filtered-ranking pass over the validation set
+(`config.full_eval_frequency` epochs; runs at epoch boundaries only, never
+on the mid-epoch `eval_every_n_step` checks) via `evaluate.run_filtered_ranking_eval`
+-- the same code path `evaluate.py`/`predict.py` use for final reporting.
 """
 
 import json
@@ -34,9 +41,10 @@ from transformers import get_cosine_schedule_with_warmup, get_linear_schedule_wi
 from .config import ARPMConfig
 from .data.dataset import ARPMDataset, Collator, Tokenization
 from .data.dict_hub import get_relation_vocab, get_train_triplet_dict, init_tokenizer
+from .evaluate import run_filtered_ranking_eval
 from .logging_utils import logger
 from .losses import compute_loss
-from .metrics import accuracy
+from .metrics import METRIC_HIGHER_IS_BETTER, accuracy
 from .model import ARPMKGCModel, to_model_output
 from .utils import (
     AverageMeter,
@@ -263,7 +271,7 @@ class Trainer:
     @torch.no_grad()
     def _run_eval(self, epoch: int, step: int = 0) -> None:
         if self.config.rank == 0:
-            metric_dict = self.eval_epoch(epoch)
+            metric_dict = self.eval_epoch(epoch, step=step)
             is_best = self._check_best(metric_dict)
             if is_best:
                 self.best_metric = metric_dict
@@ -271,8 +279,14 @@ class Trainer:
         if self.config.distributed:
             dist.barrier()
 
+    def _should_run_full_eval(self, epoch: int) -> bool:
+        freq = self.config.full_eval_frequency
+        if freq is None or freq <= 0:
+            return False
+        return epoch % freq == 0
+
     @torch.no_grad()
-    def eval_epoch(self, epoch: int) -> Dict:
+    def eval_epoch(self, epoch: int, step: int = 0) -> Dict:
         if not self.valid_loader:
             return {}
         self.model.eval()
@@ -294,15 +308,44 @@ class Trainer:
 
         metric_dict = {"Acc@1": round(meters["top1"].avg, 3), "Acc@3": round(meters["top3"].avg, 3),
                        "loss": round(meters["loss"].avg, 3)}
+
+        # Full filtered-ranking pass, epoch boundaries only (never on
+        # mid-epoch eval_every_n_step checks, to keep those cheap regardless
+        # of full_eval_frequency).
+        if step == 0 and self._should_run_full_eval(epoch):
+            full_result = run_filtered_ranking_eval(
+                self.config, self.model, self.tokenization, use_cuda=torch.cuda.is_available(),
+                data_path=self.config.valid_path, batch_size=self.config.full_eval_batch_size,
+            )
+            metric_dict.update(full_result["average"])
+            logger.info(f"Epoch {epoch} FULL filtered-ranking valid metrics "
+                        f"(avg fwd/bwd): {json.dumps(full_result['average'])}")
+
         logger.info(f"Epoch {epoch} valid metrics: {json.dumps(metric_dict)}")
         return metric_dict
 
     def _check_best(self, metric_dict: Dict) -> bool:
         if not self.valid_loader:
             return False
-        if self.best_metric is None:
+        key = self.config.checkpoint_metric
+        if key not in metric_dict:
+            # This validation pass has no real signal for the configured
+            # metric (e.g. a mid-epoch check, or an epoch where
+            # full_eval_frequency skipped the full ranking pass) -- leave
+            # the current best checkpoint untouched rather than comparing
+            # against a metric that wasn't actually measured this time.
+            return False
+        if self.best_metric is None or key not in self.best_metric:
+            # First time this metric has ever actually been measured --
+            # nothing legitimate to compare against yet, so this pass wins
+            # outright (also self-heals from a possible bootstrap where
+            # best_metric was set from an early mid-epoch check that never
+            # got a chance to include the full-eval metric).
             return True
-        return metric_dict.get("Acc@1", 0) > self.best_metric.get("Acc@1", 0)
+        higher_is_better = METRIC_HIGHER_IS_BETTER.get(key, True)
+        if higher_is_better:
+            return metric_dict[key] > self.best_metric[key]
+        return metric_dict[key] < self.best_metric[key]
 
     def _save_checkpoint(self, epoch: int, step: int, is_best: bool) -> None:
         cfg = self.config

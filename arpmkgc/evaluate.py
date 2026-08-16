@@ -139,6 +139,38 @@ def eval_single_direction(config: ARPMConfig, model: ARPMKGCModel, entity_tensor
     return {"metrics": metrics, "pred_infos": pred_infos}
 
 
+def run_filtered_ranking_eval(config: ARPMConfig, model, tokenization: Tokenization, use_cuda: bool,
+                              data_path: str, batch_size: int = 64,
+                              entity_tensor: Optional[torch.Tensor] = None) -> Dict:
+    """Runs the full forward+backward filtered-ranking protocol against
+    `data_path` for an already-in-memory model -- works equally for a model
+    freshly loaded from checkpoint (`predict_by_split`, below) and for the
+    live in-training model (`Trainer`, for periodic best-checkpoint
+    selection; see config.full_eval_frequency). Recomputes entity embeddings
+    unless a pre-computed `entity_tensor` is supplied.
+
+    Returns {"forward": {...}, "backward": {...}, "average": {...}}, each an
+    inner dict of {mean_rank, mrr, hit@1, hit@3, hit@10, hit@50}.
+    """
+    if entity_tensor is None:
+        entity_dict = get_entity_dict(config)
+        entity_ids = [ex.entity_id for ex in entity_dict.entity_exs]
+        entity_tensor = compute_entity_embeddings(model, entity_ids, tokenization,
+                                                  batch_size=batch_size, use_cuda=use_cuda)
+        if use_cuda:
+            entity_tensor = entity_tensor.cuda()
+
+    forward_result = eval_single_direction(config, model, entity_tensor, eval_forward=True,
+                                           use_cuda=use_cuda, data_path=data_path, batch_size=batch_size)
+    backward_result = eval_single_direction(config, model, entity_tensor, eval_forward=False,
+                                            use_cuda=use_cuda, data_path=data_path, batch_size=batch_size)
+    averaged = {
+        k: round((forward_result["metrics"][k] + backward_result["metrics"][k]) / 2, 4)
+        for k in forward_result["metrics"]
+    }
+    return {"forward": forward_result, "backward": backward_result, "average": averaged}
+
+
 def predict_by_split(config: ARPMConfig) -> Dict:
     use_cuda = torch.cuda.is_available()
 
@@ -154,22 +186,9 @@ def predict_by_split(config: ARPMConfig) -> Dict:
     eval_config = predictor.config
     data_path = eval_config.test_path if config.eval_split == "test" else eval_config.valid_path
 
-    entity_dict = get_entity_dict(eval_config)
-    entity_ids = [ex.entity_id for ex in entity_dict.entity_exs]
-    entity_tensor = compute_entity_embeddings(model, entity_ids, predictor.tokenization,
-                                              batch_size=eval_config.batch_size, use_cuda=use_cuda)
-    if use_cuda:
-        entity_tensor = entity_tensor.cuda()
-
-    forward_result = eval_single_direction(eval_config, model, entity_tensor, eval_forward=True,
-                                           use_cuda=use_cuda, data_path=data_path)
-    backward_result = eval_single_direction(eval_config, model, entity_tensor, eval_forward=False,
-                                            use_cuda=use_cuda, data_path=data_path)
-
-    averaged = {
-        k: round((forward_result["metrics"][k] + backward_result["metrics"][k]) / 2, 4)
-        for k in forward_result["metrics"]
-    }
+    result = run_filtered_ranking_eval(eval_config, model, predictor.tokenization, use_cuda,
+                                       data_path=data_path, batch_size=eval_config.batch_size)
+    forward_result, backward_result, averaged = result["forward"], result["backward"], result["average"]
     logger.info(f"Averaged metrics ({config.eval_split}): {averaged}")
 
     prefix = os.path.dirname(eval_config.eval_model_path)
@@ -180,10 +199,10 @@ def predict_by_split(config: ARPMConfig) -> Dict:
         json.dump({"forward": forward_result["metrics"], "backward": backward_result["metrics"],
                    "average": averaged}, f, indent=2)
 
-    for direction, result in (("forward", forward_result), ("backward", backward_result)):
+    for direction, result_dir in (("forward", forward_result), ("backward", backward_result)):
         out_path = os.path.join(prefix, f"predictions_{split}_{direction}_{basename}.json")
         with open(out_path, "w", encoding="utf-8") as f:
-            json.dump([asdict(p) for p in result["pred_infos"]], f, ensure_ascii=False, indent=2)
+            json.dump([asdict(p) for p in result_dir["pred_infos"]], f, ensure_ascii=False, indent=2)
 
     return {"forward": forward_result["metrics"], "backward": backward_result["metrics"], "average": averaged}
 
