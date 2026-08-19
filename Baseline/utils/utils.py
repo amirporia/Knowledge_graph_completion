@@ -31,7 +31,7 @@ def save_checkpoint(state: Dict[str, Any], is_best: bool, filename: str,
     this keeps the best-model file, which is what evaluation/prediction scripts load,
     free of optimizer/scheduler state it has no use for.
     """
-    torch.save(state, filename)
+    # torch.save(state, filename)
     dirname = os.path.dirname(filename)
 
     if is_best:

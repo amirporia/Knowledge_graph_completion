@@ -100,7 +100,7 @@ def save_checkpoint(state: Dict[str, Any], is_best: bool, filename: str,
     evaluation/prediction scripts don't need to load optimizer/scheduler state.
     """
     os.makedirs(os.path.dirname(filename), exist_ok=True)
-    torch.save(state, filename)
+    # torch.save(state, filename)
     dirname = os.path.dirname(filename)
 
     if is_best:
