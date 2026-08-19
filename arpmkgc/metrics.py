@@ -37,8 +37,8 @@ def accuracy(scores: torch.Tensor, target: torch.Tensor, topk=(1,)) -> List[torc
 
 @torch.no_grad()
 def filter_known_answers(scores: torch.Tensor, head_ids: List[str], relations: List[str],
-                          target_idx: torch.Tensor, all_triplet_dict: TripletDict,
-                          entity_dict: EntityDict) -> None:
+                         target_idx: torch.Tensor, all_triplet_dict: TripletDict,
+                         entity_dict: EntityDict) -> None:
     """In-place filtered-ranking mask: for each row i, sets the score of
     every entity that is a *known* correct answer for (head_ids[i],
     relations[i]) -- other than the target itself -- to -inf, following the
@@ -48,7 +48,7 @@ def filter_known_answers(scores: torch.Tensor, head_ids: List[str], relations: L
         if len(known) <= 1:
             continue
         idx_to_mask = [entity_dict.entity_to_idx(e) for e in known
-                        if entity_dict.entity_to_idx(e) != target_idx[i].item()]
+                       if entity_dict.entity_to_idx(e) != target_idx[i].item()]
         if idx_to_mask:
             scores[i, torch.tensor(idx_to_mask, device=scores.device)] = float("-inf")
 
@@ -58,7 +58,8 @@ def compute_ranks(scores: torch.Tensor, target_idx: torch.Tensor) -> Tuple[torch
     """Returns (ranks [B] (1-based), sorted_scores [B, N], sorted_indices [B, N])."""
     sorted_scores, sorted_indices = torch.sort(scores, dim=-1, descending=True)
     matches = sorted_indices.eq(target_idx.unsqueeze(-1))
-    rank_pos = matches.float().argmax(dim=-1)  # first True position (argmax on bool->float is fine, exactly one True per row)
+    rank_pos = matches.float().argmax(
+        dim=-1)  # first True position (argmax on bool->float is fine, exactly one True per row)
     ranks = rank_pos + 1
     return ranks, sorted_scores, sorted_indices
 

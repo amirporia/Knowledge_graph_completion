@@ -22,22 +22,20 @@ class AttrDict(dict):
 
 
 def save_checkpoint(state: Dict[str, Any], is_best: bool, filename: str,
-                    eval_state: Dict[str, Any] = None) -> None:
-    """Save model checkpoint and maintain best/last model copies.
-
-    `state` (which may include optimizer/scheduler/scaler tensors for resuming) is
-    written to `filename` and mirrored to model_last.mdl. If `is_best`, model_best.mdl
-    is written from `eval_state` when given (falling back to `state` otherwise) --
-    this keeps the best-model file, which is what evaluation/prediction scripts load,
-    free of optimizer/scheduler state it has no use for.
+                     eval_state: Dict[str, Any] = None) -> None:
+    """Persist a full training checkpoint, and mirror to `model_last.mdl` /
+    (if `is_best`) `model_best.mdl`. `eval_state` -- when given -- is the
+    lightweight subset (config + weights only) written to model_best.mdl so
+    evaluation/prediction scripts don't need to load optimizer/scheduler state.
     """
-    # torch.save(state, filename)
     dirname = os.path.dirname(filename)
+    os.makedirs(dirname, exist_ok=True)
+    # torch.save(state, filename)
 
     if is_best:
         torch.save(eval_state if eval_state is not None else state,
-                   os.path.join(dirname, 'model_best.mdl'))
-    shutil.copyfile(filename, os.path.join(dirname, 'model_last.mdl'))
+                   os.path.join(dirname, "model_best.mdl"))
+    torch.save(state, os.path.join(dirname, "model_last.mdl"))
 
 
 def load_checkpoint(path: str, map_location=None) -> Dict[str, Any]:

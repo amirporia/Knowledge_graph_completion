@@ -6,7 +6,6 @@ Independent re-implementation; not imported from the baseline package.
 
 import glob
 import os
-import shutil
 from typing import Any, Dict, List
 
 import torch
@@ -93,20 +92,20 @@ def move_to_cuda(sample: Any) -> Any:
 
 
 def save_checkpoint(state: Dict[str, Any], is_best: bool, filename: str,
-                     eval_state: Dict[str, Any] = None) -> None:
+                    eval_state: Dict[str, Any] = None) -> None:
     """Persist a full training checkpoint, and mirror to `model_last.mdl` /
     (if `is_best`) `model_best.mdl`. `eval_state` -- when given -- is the
     lightweight subset (config + weights only) written to model_best.mdl so
     evaluation/prediction scripts don't need to load optimizer/scheduler state.
     """
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
-    # torch.save(state, filename)
     dirname = os.path.dirname(filename)
+    os.makedirs(dirname, exist_ok=True)
+    # torch.save(state, filename)
 
     if is_best:
         torch.save(eval_state if eval_state is not None else state,
                    os.path.join(dirname, "model_best.mdl"))
-    shutil.copyfile(filename, os.path.join(dirname, "model_last.mdl"))
+    torch.save(state, os.path.join(dirname, "model_last.mdl"))
 
 
 def load_checkpoint(path: str, map_location=None) -> Dict[str, Any]:
