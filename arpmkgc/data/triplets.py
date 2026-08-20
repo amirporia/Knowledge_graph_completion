@@ -27,15 +27,6 @@ def reverse_triplet(triplet: dict) -> dict:
 
 
 class TripletDict:
-    """Indexes a set of json triplet files (each a list of
-    {head_id, head, relation, tail_id, tail}) for fast candidate/filter lookups.
-
-    Both the forward and the inverse-relation direction of every triple are
-    indexed, so head-prediction queries (which are answered by scoring the
-    inverse relation) get the same candidate/filtering support as tail
-    prediction.
-    """
-
     def __init__(self, path_list: List[str]):
         self.path_list = path_list
         self.hr2tails: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
@@ -43,6 +34,7 @@ class TripletDict:
         self.relation2pairs: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
         self.relations: Set[str] = set()
         self.triplet_cnt = 0
+        self.tail2heads: Dict[str, Set[str]] = defaultdict(set)
 
         for path in path_list:
             self._load(path)
@@ -58,6 +50,7 @@ class TripletDict:
             self.hr2tails[(h, r)].add(t)
             self.relation2heads[r].add(h)
             self.relation2pairs[r].append((h, t))
+            self.tail2heads[t].add(h)
             self.triplet_cnt += 1
 
     def get_neighbor_tails(self, head_id: str, relation: str) -> Set[str]:
@@ -68,6 +61,9 @@ class TripletDict:
 
     def get_relation_pairs(self, relation: str) -> List[Tuple[str, str]]:
         return self.relation2pairs.get(relation, [])
+
+    def get_predecessors(self, entity_id: str) -> Set[str]:
+        return self.tail2heads.get(entity_id, set())
 
 
 class RelationVocab:

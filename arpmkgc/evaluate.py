@@ -25,9 +25,9 @@ from torch.utils.data import DataLoader
 
 from .config import ARPMConfig
 from .data.dataset import ARPMDataset, Collator, Tokenization, load_examples
-from .data.dict_hub import get_all_triplet_dict, get_entity_dict
+from .data.dict_hub import get_all_triplet_dict, get_entity_dict, get_link_graph
 from .logging_utils import logger
-from .metrics import compute_ranks, filter_known_answers, summarize_ranks
+from .metrics import apply_neighbor_rerank_bonus, compute_ranks, filter_known_answers, summarize_ranks
 from .model import ARPMKGCModel, to_model_output
 from .utils import get_model_obj, move_to_cuda
 
@@ -88,10 +88,11 @@ def eval_single_direction(config: ARPMConfig, model: ARPMKGCModel, entity_tensor
     tokenization = Tokenization(config)
     entity_dict = get_entity_dict(config)
     all_triplet_dict = get_all_triplet_dict(config)
+    link_graph = get_link_graph(config) if config.eval_neighbor_rerank_weight != 0.0 else None
 
     raw_examples = load_examples(data_path, add_forward=eval_forward, add_backward=not eval_forward)
     dataset = ARPMDataset(config, data_path, tokenization=tokenization)
-    dataset.examples = raw_examples  # reuse the dataset's candidate pipeline over just this direction
+    dataset.examples = raw_examples
 
     collator = Collator(config, tokenization)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collator,
@@ -111,8 +112,18 @@ def eval_single_direction(config: ARPMConfig, model: ARPMKGCModel, entity_tensor
         target_idx = torch.tensor(
             [entity_dict.entity_to_idx(t) for t in batch["tail_ids"]], device=scores.device,
         )
+
+        # Order matches Baseline: apply the graph bonus first, then mask
+        # known-answer entities to -inf (masking always wins on overlap).
+        if link_graph is not None:
+            apply_neighbor_rerank_bonus(scores, batch["head_ids"], link_graph, entity_dict,
+                                        weight=config.eval_neighbor_rerank_weight,
+                                        n_hop=config.eval_neighbor_rerank_n_hop)
+
         filter_known_answers(scores, batch["head_ids"], batch["relations"], target_idx,
-                             all_triplet_dict, entity_dict)
+                             all_triplet_dict, entity_dict,
+                             broad_filter=config.eval_broad_answer_filter,
+                             tail_ids=batch["tail_ids"] if config.eval_broad_answer_filter else None)
 
         ranks, sorted_scores, sorted_indices = compute_ranks(scores, target_idx)
         all_ranks.extend(ranks.tolist())
