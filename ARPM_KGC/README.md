@@ -76,6 +76,9 @@ ARPM-KGC-specific hyperparameters (all with the defaults used above) are:
 | `--proto-temperature` | `tau_p` | 0.1 |
 | `--eta-proto`, `--eta-struct`, `--eta-div` | `eta_p, eta_s, eta_div` | 0.1, 0.1, 0.01 |
 | `--disable-link-graph` | turn off local candidates entirely | off (link graph **on** by default — see §4) |
+| `--checkpoint-metric` | metric used to pick the best checkpoint (§5) | `mrr` |
+| `--full-eval-every-n-epochs` | cadence of the expensive full filtered-ranking validation (§5) | 1 |
+| `--full-eval-batch-size` | batch size for that full validation pass | 256 |
 
 ## 3. Ablation study — every row is one flag
 
@@ -192,7 +195,45 @@ interpretable and reproducible.
   call per pass; this was necessary anyway since ARPM-KGC's candidate budget
   `M` is much larger than Baseline's.
 
-## 5. Validation performed
+## 5. Checkpoint selection: real filtered-ranking metrics, not in-batch accuracy
+
+Best-checkpoint selection uses the **same filtered-ranking protocol as final
+evaluation** — forward + backward MRR/Hits@1/3/10/50 against the *full* entity
+dictionary (`evaluation/evaluate.py::evaluate_predictor`, wrapped around the
+in-memory model via `ARPMPredictor.from_model`) — not a cheap in-batch proxy.
+
+This matters because in-batch accuracy (can the model pick the right tail out
+of the ~batch_size other tails sitting in the same mini-batch?) and real
+filtered ranking (can it beat the *entire* entity dictionary, with known
+correct alternatives masked out?) are different tasks with different
+difficulty; a model that looks great on the former can be middling on the
+latter, so selecting on it can silently pick the wrong checkpoint. Concretely:
+
+- `Trainer.eval_epoch` still runs every epoch and logs `Acc@1`/`Acc@3`/`loss`
+  computed in-batch — cheap (one pass over `valid_loader`, no entity
+  encoding), useful as a fast training-health signal, but explicitly logged as
+  **"NOT used for checkpoint selection"** and never touches `best_metric`.
+- `Trainer._compute_full_validation_metrics` runs the real protocol: it wraps
+  the current in-memory model as a predictor, encodes every entity, and calls
+  the exact same `evaluate_predictor` used by the standalone
+  `evaluation/evaluate.py` script (just with `save_details=False`, so it
+  doesn't spam per-query prediction files every epoch). Its output —
+  `mean_rank`, `mrr`, `hit@1`, `hit@3`, `hit@10`, `hit@50` — is what decides
+  `is_best`, via `--checkpoint-metric` (default `mrr`, the standard choice in
+  this literature; `hit@1/3/10/50` are also selectable).
+- Because encoding the whole entity dictionary every epoch is real work
+  (fine for WN18RR/FB15k-237, prohibitive for wiki5m without sharding/caching
+  a full pass), it only runs at epoch boundaries, and only every
+  `--full-eval-every-n-epochs` epochs (default 1). Skipped epochs still save
+  `model_last.mdl` (for resuming), they just never overwrite `model_best.mdl`.
+
+No new files were added for this — `evaluation/predict.py::ARPMPredictor.from_model`
+and `evaluation/evaluate.py::evaluate_predictor`/`save_details` are small,
+reusable additions that both the trainer and the standalone eval scripts now
+share, so there's exactly one code path computing MRR/Hits@k, not two that
+could drift apart.
+
+## 6. Validation performed
 
 The full pipeline (candidate retrieval → anchor selection → diversity loss →
 prototypes → structural memory → gating → combined score → training loss →
@@ -201,9 +242,12 @@ a small synthetic dataset with a randomly-initialized, fully local (no
 internet) tiny BERT, covering: a full `train_loop` with checkpoint save/load,
 `evaluation/evaluate.py::predict_by_split` (forward + backward MRR/Hits@k),
 all three optional Gumbel extensions together, `--disable-link-graph`
-(global-only candidates), and the `--anchor-budget 0` zero-candidate edge
-case — all produced finite losses/metrics with no shape or NaN errors. This
-confirms the implementation is mechanically correct; it does **not** substitute
-for a real training run on WN18RR/FB15k-237 to validate the proposal's
-empirical claims, which requires downloading `bert-base-uncased` and GPU time
-neither of which were available in this environment.
+(global-only candidates), the `--anchor-budget 0` zero-candidate edge case,
+**and the full-filtered-ranking checkpoint selection of §5** (including
+`--full-eval-every-n-epochs`, verified to run the expensive full-entity pass
+only on due epochs while `model_last.mdl` is still updated every epoch) — all
+produced finite losses/metrics with no shape or NaN errors. This confirms the
+implementation is mechanically correct; it does **not** substitute for a real
+training run on WN18RR/FB15k-237 to validate the proposal's empirical claims,
+which requires downloading `bert-base-uncased` and GPU time neither of which
+were available in this environment.

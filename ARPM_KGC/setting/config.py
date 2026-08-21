@@ -78,6 +78,22 @@ def parse_args():
                             help='Resume training from a checkpoint (model, optimizer, scheduler, epoch)')
     mgmt_group.add_argument('--resume-path', default=None, type=str,
                             help='Checkpoint to resume from (default: <model-dir>/model_last.mdl)')
+    mgmt_group.add_argument('--checkpoint-metric', default='mrr', type=str,
+                            choices=['mrr', 'hit@1', 'hit@3', 'hit@10', 'hit@50'],
+                            help='Metric used to pick the best checkpoint. Computed via the SAME '
+                                 'filtered-ranking protocol as final evaluation (forward+backward '
+                                 'averaged S(t|h,r) ranking against the full entity set, Sec. 4.2 '
+                                 '/ evaluation/evaluate.py) -- NOT the cheap in-batch accuracy that '
+                                 'is also logged every epoch purely as a training diagnostic.')
+    mgmt_group.add_argument('--full-eval-every-n-epochs', default=1, type=int,
+                            help='Run the full filtered-ranking validation (used for checkpoint '
+                                 'selection) every N epochs. Increase this for very large entity '
+                                 'dictionaries (e.g. wiki5m) where encoding every entity each '
+                                 'epoch is too expensive; other epochs still checkpoint '
+                                 '(model_last.mdl) but never overwrite model_best.mdl.')
+    mgmt_group.add_argument('--full-eval-batch-size', default=256, type=int,
+                            help='Batch size used only for the full filtered-ranking validation '
+                                 '(query-vs-full-entity-set scoring), independent of --batch-size')
 
     # Loss and optimization (shared InfoNCE machinery, same defaults as baseline)
     loss_group = parser.add_argument_group('Loss and Optimization')

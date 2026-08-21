@@ -4,7 +4,7 @@ from typing import Dict
 
 import torch
 
-from .evaluate import eval_single_direction
+from .evaluate import evaluate_predictor
 from .predict import ARPMPredictor
 from ..setting.config import args
 from ..setting.logger_config import logger
@@ -85,16 +85,6 @@ def validate_paths() -> None:
         assert os.path.exists(path), f'{path_name} does not exist: {path}'
 
 
-def compute_averaged_metrics(
-        forward_metrics: Dict[str, float],
-        backward_metrics: Dict[str, float]
-) -> Dict[str, float]:
-    return {
-        key: round((forward_metrics[key] + backward_metrics[key]) / 2, 4)
-        for key in forward_metrics
-    }
-
-
 def save_metrics(
         forward_metrics: Dict[str, float],
         backward_metrics: Dict[str, float],
@@ -129,21 +119,11 @@ def predict_by_split() -> None:
     dump_entity_embeddings(predictor)
     entity_tensor = load_entity_embeddings().cuda()
 
-    forward_metrics = eval_single_direction(
-        predictor,
-        entity_tensor=entity_tensor,
-        eval_forward=True,
-        batch_size=EVAL_BATCH_SIZE
+    result = evaluate_predictor(predictor, entity_tensor=entity_tensor,
+                                 batch_size=EVAL_BATCH_SIZE, save_details=True)
+    forward_metrics, backward_metrics, averaged_metrics = (
+        result['forward'], result['backward'], result['average']
     )
-
-    backward_metrics = eval_single_direction(
-        predictor,
-        entity_tensor=entity_tensor,
-        eval_forward=False,
-        batch_size=EVAL_BATCH_SIZE
-    )
-
-    averaged_metrics = compute_averaged_metrics(forward_metrics, backward_metrics)
     logger.info(f'Averaged metrics: {averaged_metrics}')
 
     save_metrics(forward_metrics, backward_metrics, averaged_metrics)

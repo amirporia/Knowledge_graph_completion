@@ -207,6 +207,7 @@ def eval_single_direction(
         entity_tensor: torch.Tensor,
         eval_forward: bool = True,
         batch_size: int = 64,
+        save_details: bool = True,
 ) -> Dict:
     start_time = time()
 
@@ -245,14 +246,49 @@ def eval_single_direction(
     direction = 'forward' if eval_forward else 'backward'
     logger.info(f'{direction} metrics: {json.dumps(metrics)}')
 
-    _save_prediction_details(
-        examples, topk_scores, topk_indices, target, ranks,
-        lambda_p_tensor, lambda_s_tensor,
-        eval_direction=direction,
-    )
+    if save_details:
+        _save_prediction_details(
+            examples, topk_scores, topk_indices, target, ranks,
+            lambda_p_tensor, lambda_s_tensor,
+            eval_direction=direction,
+        )
 
     logger.info(f'Evaluation took {round(time() - start_time, 3)} seconds')
     return metrics
+
+
+def evaluate_predictor(
+        predictor: ARPMPredictor,
+        entity_tensor: torch.Tensor,
+        batch_size: int = 256,
+        save_details: bool = True,
+) -> Dict[str, Dict[str, float]]:
+    """Run the full filtered-ranking protocol (forward + backward, averaged) on
+    `args.valid_path` for an already-loaded-or-wrapped predictor. This is THE
+    evaluation protocol of ARPM_KGC_Proposal.tex Sec. 4.2 (MRR, Hits@1/3/10) and
+    is shared by both:
+      - the standalone `predict_by_split()` below (save_details=True, writes
+        the full per-query prediction/gate dump), and
+      - `model/trainer.py`'s best-checkpoint selection (save_details=False,
+        no file I/O), which otherwise would have to pick "best" using a much
+        weaker in-batch proxy accuracy instead of real MRR/Hits@k.
+
+    Returns {'forward': {...}, 'backward': {...}, 'average': {...}}, each a
+    dict with keys 'mean_rank', 'mrr', 'hit@1', 'hit@3', 'hit@10', 'hit@50'.
+    """
+    forward_metrics = eval_single_direction(
+        predictor, entity_tensor=entity_tensor, eval_forward=True,
+        batch_size=batch_size, save_details=save_details,
+    )
+    backward_metrics = eval_single_direction(
+        predictor, entity_tensor=entity_tensor, eval_forward=False,
+        batch_size=batch_size, save_details=save_details,
+    )
+    averaged_metrics = {
+        k: round((forward_metrics[k] + backward_metrics[k]) / 2, 4)
+        for k in forward_metrics
+    }
+    return {'forward': forward_metrics, 'backward': backward_metrics, 'average': averaged_metrics}
 
 
 def _save_prediction_details(
@@ -313,17 +349,10 @@ def predict_by_split() -> None:
 
     entity_tensor = predictor.predict_by_entities(entity_dict.entity_exs)
 
-    forward_metrics = eval_single_direction(
-        predictor, entity_tensor=entity_tensor, eval_forward=True,
+    result = evaluate_predictor(predictor, entity_tensor=entity_tensor, save_details=True)
+    forward_metrics, backward_metrics, averaged_metrics = (
+        result['forward'], result['backward'], result['average']
     )
-    backward_metrics = eval_single_direction(
-        predictor, entity_tensor=entity_tensor, eval_forward=False,
-    )
-
-    averaged_metrics = {
-        k: round((forward_metrics[k] + backward_metrics[k]) / 2, 4)
-        for k in forward_metrics
-    }
     logger.info(f'Averaged metrics: {averaged_metrics}')
 
     prefix = os.path.dirname(args.eval_model_path)

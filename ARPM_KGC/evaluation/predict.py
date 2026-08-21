@@ -39,6 +39,22 @@ class ARPMPredictor:
         self.train_args = AttrDict()
         self.use_cuda = False
         self.device = None
+        self.batch_size = args.batch_size
+
+    @classmethod
+    def from_model(cls, model: torch.nn.Module, device: torch.device,
+                    use_cuda: bool, batch_size: int = None) -> 'ARPMPredictor':
+        """Wrap an already-in-memory model (e.g. the model currently being
+        trained) as a predictor, without touching disk. Used by
+        model/trainer.py to run the real filtered-ranking validation protocol
+        (evaluation/evaluate.py) for best-checkpoint selection, instead of
+        loading a checkpoint that may not even have been written yet."""
+        predictor = cls()
+        predictor.model = model
+        predictor.device = device
+        predictor.use_cuda = use_cuda
+        predictor.batch_size = batch_size or args.batch_size
+        return predictor
 
     def load(self, ckt_path: str, use_data_parallel: bool = False) -> None:
         if not os.path.exists(ckt_path):
@@ -158,7 +174,7 @@ class ARPMPredictor:
         return torch.utils.data.DataLoader(
             dataset,
             num_workers=4,
-            batch_size=args.batch_size,
+            batch_size=self.batch_size,
             collate_fn=collate_fn,
             shuffle=False,
             pin_memory=self.use_cuda

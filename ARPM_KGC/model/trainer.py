@@ -367,12 +367,50 @@ class Trainer:
 
     @torch.no_grad()
     def _run_eval(self, epoch, step=0):
-        if self.args.rank == 0:
-            metric_dict = self.eval_epoch(epoch)
-            is_best = self._check_best_metric(metric_dict)
+        """Rank-0-only validation + checkpointing after each epoch (step=0) or
+        every `--eval-every-n-step` steps mid-epoch (step=i+1).
 
-            if is_best:
-                self.best_metric = metric_dict
+        Two distinct things happen here, and they are NOT the same metric:
+          1. `eval_epoch` -- a cheap in-batch diagnostic (Acc@1/Acc@3/loss on
+             S(t|h,r) among only the ~batch_size other tails in the same
+             mini-batch). Logged every call for a fast training-health signal,
+             but NEVER used to decide the best checkpoint -- an easy 1-in-32
+             in-batch discrimination task is a poor proxy for the real,
+             filtered, full-entity-set ranking problem the model is actually
+             trained to solve.
+          2. `_compute_full_validation_metrics` -- the REAL evaluation
+             protocol (forward+backward filtered MRR/Hits@1/3/10/50 against
+             the full entity dictionary, exactly matching
+             evaluation/evaluate.py). This is what `--checkpoint-metric`
+             (default 'mrr') selects the best checkpoint on. It's run only at
+             epoch boundaries (step == 0), and only every
+             `--full-eval-every-n-epochs` epochs, since it requires
+             re-encoding every entity in the dictionary and is far more
+             expensive than (1) -- mid-epoch / skipped-epoch calls still
+             checkpoint model_last.mdl but never overwrite model_best.mdl.
+        """
+        if self.args.rank == 0:
+            in_batch_metric_dict = self.eval_epoch(epoch)
+            logger.info(
+                f'Epoch {epoch} in-batch diagnostic (NOT used for checkpoint '
+                f'selection): {json.dumps(in_batch_metric_dict)}'
+            )
+
+            is_epoch_boundary = (step == 0)
+            due_for_full_eval = (epoch + 1) % max(self.args.full_eval_every_n_epochs, 1) == 0
+            run_full_eval = self.valid_loader is not None and is_epoch_boundary and due_for_full_eval
+
+            is_best = False
+            if run_full_eval:
+                full_metric_dict = self._compute_full_validation_metrics()
+                logger.info(
+                    f'Epoch {epoch} full filtered-ranking validation (used for '
+                    f'checkpoint selection via --checkpoint-metric='
+                    f'{self.args.checkpoint_metric}): {json.dumps(full_metric_dict)}'
+                )
+                is_best = self._check_best_metric(full_metric_dict)
+                if is_best:
+                    self.best_metric = full_metric_dict
 
             self._save_checkpoint(epoch, step, is_best)
 
@@ -380,11 +418,12 @@ class Trainer:
             dist.barrier()
 
     def _check_best_metric(self, metric_dict):
-        if not self.valid_loader:
+        if not metric_dict:
             return False
         if self.best_metric is None:
             return True
-        return metric_dict.get('Acc@1', 0) > self.best_metric.get('Acc@1', 0)
+        key = self.args.checkpoint_metric
+        return metric_dict.get(key, 0) > self.best_metric.get(key, 0)
 
     def _save_checkpoint(self, epoch, step, is_best):
         if step == 0:
@@ -418,10 +457,11 @@ class Trainer:
 
     @torch.no_grad()
     def eval_epoch(self, epoch) -> Dict:
-        """Evaluate the model on the validation set using the same in-batch
-        combined-score / accuracy protocol as training (Acc@1/Acc@3 on
-        S(t|h,r) among the batch's own tails), analogous to Baseline's
-        `eval_epoch` (which used hr_logits/hr_labels)."""
+        """Cheap in-batch diagnostic: Acc@1/Acc@3/loss on S(t|h,r) among only
+        the batch's own tails. Fast (one pass over `valid_loader`, no full
+        entity-set encoding), useful as a training-health signal every call,
+        but see `_run_eval`'s docstring -- this is NOT what selects the best
+        checkpoint."""
         if not self.valid_loader:
             return {}
 
@@ -447,10 +487,7 @@ class Trainer:
             meters['top1'].update(acc1.item(), batch_size)
             meters['top3'].update(acc3.item(), batch_size)
 
-        metric_dict = self._format_metrics(meters)
-        logger.info(f'Epoch {epoch}, valid metric: {json.dumps(metric_dict)}')
-
-        return metric_dict
+        return self._format_metrics(meters)
 
     def _format_metrics(self, meters):
         return {
@@ -458,3 +495,45 @@ class Trainer:
             'Acc@3': round(meters['top3'].avg, 3),
             'loss': round(meters['losses'].avg, 3)
         }
+
+    @torch.no_grad()
+    def _compute_full_validation_metrics(self) -> Dict[str, float]:
+        """The real evaluation protocol (ARPM_KGC_Proposal.tex Sec. 4.2):
+        forward+backward filtered ranking of S(t|h,r) against the FULL entity
+        dictionary, averaged -- identical to what `evaluation/evaluate.py`
+        computes for final reporting, just run mid-training against the
+        in-memory model instead of a checkpoint on disk, and without writing
+        the per-query prediction/gate dump to disk.
+
+        Temporarily flips `args.is_test = True` so entity/query text
+        vectorization (utils/doc.py) and false-negative-mask construction
+        (utils/doc.py::collate) run in the exact same mode real test-time
+        evaluation does, then restores whatever it was.
+        """
+        from ..evaluation.predict import ARPMPredictor
+        from ..evaluation.evaluate import evaluate_predictor
+        from ..utils.dict_hub import get_entity_dict
+
+        model_obj = get_model_obj(self.model)
+        was_training = model_obj.training
+        was_is_test = self.args.is_test
+
+        model_obj.eval()
+        self.args.is_test = True
+        try:
+            predictor = ARPMPredictor.from_model(
+                model_obj, device=self.device, use_cuda=torch.cuda.is_available(),
+                batch_size=self.args.full_eval_batch_size,
+            )
+            entity_dict = get_entity_dict()
+            entity_tensor = predictor.predict_by_entities(entity_dict.entity_exs)
+
+            result = evaluate_predictor(
+                predictor, entity_tensor=entity_tensor,
+                batch_size=self.args.full_eval_batch_size, save_details=False,
+            )
+        finally:
+            self.args.is_test = was_is_test
+            model_obj.train(was_training)
+
+        return result['average']
