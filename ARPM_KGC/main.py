@@ -6,6 +6,7 @@ import torch.distributed as dist
 from ARPM_KGC.setting.config import args
 from ARPM_KGC.model.trainer import Trainer
 from ARPM_KGC.setting.logger_config import logger
+from datetime import timedelta
 
 
 def main():
@@ -18,6 +19,7 @@ def main():
         dist.init_process_group(
             backend=args.dist_backend, init_method='env://',
             device_id=torch.device(f'cuda:{args.local_rank}'),
+            timeout=timedelta(minutes=60),
         )
         logger.info(
             f'Distributed training: rank {args.rank}/{args.world_size} '
