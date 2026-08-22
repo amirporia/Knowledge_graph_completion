@@ -270,6 +270,7 @@ This confirms the implementation is mechanically correct. It does not substitute
 
 ## Citation
 
+
 If you use this implementation, please cite the underlying baseline it extends:
 
 ```
