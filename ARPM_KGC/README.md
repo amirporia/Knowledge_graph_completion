@@ -108,22 +108,22 @@ All standard training flags (`--batch-size`, `--lr`, `--epochs`, `--pretrained-m
 ## Hyperparameters
 
 | Flag | Meaning | Default |
-| --- | --- | --- |
-| `--num-hops` | $N$: max graph distance beyond hop-0, yielding $N+1$ local categories (hop-0 .. hop-$N$) | 2 |
-| `--num-prototypes` | $K$: semantic prototypes, one of $\{1,2,4,8\}$ | 4 |
-| `--local-per-hop-budget` | Max local anchors sampled per hop (including hop-0) | 5 |
-| `--global-budget` | Max global anchors sampled from $\mathcal{T}_r$ | 10 |
-| `--anchor-budget` | $M$: total candidate-pool cap after merging local and global | 20 |
-| `--retrieval-temperature` | $\tau_r$: softmax temperature for anchor weights $\alpha_i$ | 0.1 |
-| `--proto-temperature` | $\tau_p$: log-sum-exp pooling temperature for $S_p(t)$ | 0.1 |
-| `--eta-proto` | $\eta_p$: weight of $\mathcal{L}_{\text{proto}}$ | 0.1 |
-| `--eta-struct` | $\eta_s$: weight of $\mathcal{L}_{\text{struct}}$ | 0.1 |
-| `--eta-div` | $\eta_{\text{div}}$: weight of $\mathcal{L}_{\text{div}}$ | 0.01 |
-| `--eta-combined` | $\eta_c$: weight of $\mathcal{L}_{\text{combined}}$, the sole loss term that trains $G_\lambda$ (see [Design Decisions](#training-the-memory-gate)) | 0.1 |
-| `--disable-link-graph` | Disable local candidates entirely (equivalent to ablation A7) | off |
-| `--checkpoint-metric` | Metric used for best-checkpoint selection ([details](#checkpoint-selection)) | `mrr` |
-| `--full-eval-every-n-epochs` | Cadence of the full filtered-ranking validation pass | 1 |
-| `--full-eval-batch-size` | Batch size for the full validation pass | 256 |
+| --- | --- |---------|
+| `--num-hops` | $N$: max graph distance beyond hop-0, yielding $N+1$ local categories (hop-0 .. hop-$N$) | 2       |
+| `--num-prototypes` | $K$: semantic prototypes, one of $\{1,2,4,8\}$ | 4       |
+| `--local-per-hop-budget` | Max local anchors sampled per hop (including hop-0) | 5       |
+| `--global-budget` | Max global anchors sampled from $\mathcal{T}_r$ | 10      |
+| `--anchor-budget` | $M$: total candidate-pool cap after merging local and global | 20      |
+| `--retrieval-temperature` | $\tau_r$: softmax temperature for anchor weights $\alpha_i$ | 0.1     |
+| `--proto-temperature` | $\tau_p$: log-sum-exp pooling temperature for $S_p(t)$ | 0.1     |
+| `--eta-proto` | $\eta_p$: weight of $\mathcal{L}_{\text{proto}}$ | 0.1     |
+| `--eta-struct` | $\eta_s$: weight of $\mathcal{L}_{\text{struct}}$ | 0.1     |
+| `--eta-div` | $\eta_{\text{div}}$: weight of $\mathcal{L}_{\text{div}}$ | 0.01    |
+| `--eta-combined` | $\eta_c$: weight of $\mathcal{L}_{\text{combined}}$, the sole loss term that trains $G_\lambda$ (see [Design Decisions](#training-the-memory-gate)) | 0.1     |
+| `--disable-link-graph` | Disable local candidates entirely (equivalent to ablation A7) | off     |
+| `--checkpoint-metric` | Metric used for best-checkpoint selection ([details](#checkpoint-selection)) | `mrr`   |
+| `--full-eval-every-n-epochs` | Cadence of the full filtered-ranking validation pass | 1       |
+| `--full-eval-batch-size` | Batch size for the full validation pass | 8       |
 
 ## Ablation Study
 

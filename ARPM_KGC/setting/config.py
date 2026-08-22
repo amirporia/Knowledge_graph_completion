@@ -84,7 +84,7 @@ def parse_args():
                                  'dictionaries (e.g. wiki5m) where encoding every entity each '
                                  'epoch is too expensive; other epochs still checkpoint '
                                  '(model_last.mdl) but never overwrite model_best.mdl.')
-    mgmt_group.add_argument('--full-eval-batch-size', default=256, type=int,
+    mgmt_group.add_argument('--full-eval-batch-size', default=8, type=int,
                             help='Batch size used only for the full filtered-ranking validation '
                                  '(query-vs-full-entity-set scoring), independent of --batch-size')
 
