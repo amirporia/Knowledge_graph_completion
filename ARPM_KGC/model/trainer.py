@@ -72,6 +72,7 @@ class Trainer:
             self.model = nn.parallel.DistributedDataParallel(
                 self.model, device_ids=[self.args.local_rank], output_device=self.args.local_rank,
                 broadcast_buffers=False,
+                find_unused_parameters=True,
             )
 
     def _init_optimizer_and_criterion(self):
@@ -186,8 +187,8 @@ class Trainer:
         progress = ProgressMeter(
             len(self.train_loader),
             [meters['losses'], meters['query_losses'], meters['proto_losses'],
-             meters['struct_losses'], meters['div_losses'], meters['inv_t'],
-             meters['top1'], meters['top3']],
+             meters['struct_losses'], meters['div_losses'], meters['combined_losses'],
+             meters['inv_t'], meters['top1'], meters['top3']],
             prefix=f"Epoch: [{epoch}]"
         )
 
@@ -217,6 +218,7 @@ class Trainer:
             'proto_losses': AverageMeter('L_proto', ':.4'),
             'struct_losses': AverageMeter('L_struct', ':.4'),
             'div_losses': AverageMeter('L_div', ':.4'),
+            'combined_losses': AverageMeter('L_combined', ':.4'),
             'top1': AverageMeter('Acc@1', ':6.2f'),
             'top3': AverageMeter('Acc@3', ':6.2f'),
             'inv_t': AverageMeter('InvT', ':6.2f')
@@ -243,9 +245,16 @@ class Trainer:
 
         A shared inverse-temperature `exp(log_inv_t)` (and, for S_q only, the
         additive margin + self-negative term) is applied ONLY to the copies of
-        S_q/S_p/S_struct used to form the CE logits below -- never to the raw
-        S_q/S_p/S_struct/S(t|h,r) values returned for ranking or analysis
-        (see model/models.py scoring docstring).
+        S_q/S_p/S_struct/S(t|h,r) used to form the CE logits below -- never to the
+        raw values returned for ranking or analysis (see model/models.py scoring
+        docstring).
+
+        L_combined (weighted by --eta-combined) is a bidirectional CE loss on the
+        scaled combined score S(t|h,r) = S_q + lambda_p*S_p + lambda_s*S_struct.
+        It exists purely so MemoryGate (G_lambda, producing lambda_p/lambda_s)
+        sits on a path back to total_loss -- L_query/L_proto/L_struct/L_div never
+        touch lambda_p/lambda_s, so without this term the gate is never trained
+        and, under DDP, triggers "unused parameter" errors.
         """
         model_obj = get_model_obj(self.model)
 
@@ -295,10 +304,16 @@ class Trainer:
         L_proto = self._bidirectional_ce(p_logits, labels, batch_size)
         L_struct = self._bidirectional_ce(s_logits, labels, batch_size)
 
-        total_loss = L_query + self.args.eta_proto * L_proto + \
-                     self.args.eta_struct * L_struct + self.args.eta_div * div_loss
-
+        # ---- L_combined: the only term touching lambda_p/lambda_s (MemoryGate) ----
         combined_score = model_obj.combined_score(S_q, S_p, S_s, lambda_p, lambda_s)
+        combined_logits = combined_score * inv_t
+        if triplet_mask is not None:
+            combined_logits = combined_logits.masked_fill(~triplet_mask, model_obj.NEGATIVE_INF)
+        L_combined = self._bidirectional_ce(combined_logits, labels, batch_size)
+
+        total_loss = L_query + self.args.eta_proto * L_proto + \
+                     self.args.eta_struct * L_struct + self.args.eta_div * div_loss + \
+                     self.args.eta_combined * L_combined
 
         return {
             'total_loss': total_loss,
@@ -306,6 +321,7 @@ class Trainer:
             'proto_loss': L_proto,
             'struct_loss': L_struct,
             'div_loss': div_loss,
+            'combined_loss': L_combined,
             'combined_score': combined_score,
             'labels': labels,
         }
@@ -335,6 +351,7 @@ class Trainer:
         meters['proto_losses'].update(loss_components['proto_loss'].item(), batch_size)
         meters['struct_losses'].update(loss_components['struct_loss'].item(), batch_size)
         meters['div_losses'].update(loss_components['div_loss'].item(), batch_size)
+        meters['combined_losses'].update(loss_components['combined_loss'].item(), batch_size)
         meters['top1'].update(acc1.item(), batch_size)
         meters['top3'].update(acc3.item(), batch_size)
 

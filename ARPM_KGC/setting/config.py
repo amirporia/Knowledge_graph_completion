@@ -98,6 +98,11 @@ def parse_args():
                             help='Additive margin for the S_q InfoNCE loss only')
     loss_group.add_argument('--finetune-t', action='store_true',
                             help='Make temperature a trainable parameter')
+    loss_group.add_argument('--eta-combined', default=0.1, type=float, dest='eta_combined',
+                            help='eta_c: weight of the auxiliary combined-score loss L_combined. '
+                                 'This is the ONLY loss term that backprops through the memory '
+                                 'gate G_lambda (lambda_p, lambda_s) -- without it MemoryGate '
+                                 'never receives a gradient and stays at random init.')
 
     # Graph and context settings
     graph_group = parser.add_argument_group('Graph')
