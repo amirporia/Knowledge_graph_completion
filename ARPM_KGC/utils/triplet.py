@@ -158,8 +158,8 @@ class LinkGraph:
         the set of entity IDs at EXACT graph distance l from `entity_id` (l = 1..max_hop).
 
         This is the structural-distance primitive used to build the local candidate
-        pools A_local^(l)(h,r) of ARPM_KGC_Proposal.tex Sec. 3.2, and (via the anchors'
-        stored hop labels) the hop-specific memories m^(l) of Sec. 3.5. Unlike
+        pools A_local^(l)(h,r), and (via the anchors'
+        stored hop labels) the hop-specific memories m^(l). Unlike
         `get_n_hop_entity_indices`, hops are kept separate rather than merged into a
         single cumulative n-hop neighborhood.
         """

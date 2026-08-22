@@ -28,12 +28,6 @@ from ..utils.utils import (
 
 class Trainer:
     """Handles ARPM-KGC model training, evaluation, and checkpointing.
-
-    Structurally identical to Baseline/model/trainer.py (same optimizer, scheduler,
-    DDP/AMP setup, checkpointing, resume semantics) so training runs are directly
-    comparable; only `_forward_pass` / `_compute_losses` / `_update_meters` /
-    `eval_epoch` differ, to implement the ARPM-KGC objective of Sec. 3.7:
-
         L = L_query + eta_p * L_proto + eta_s * L_struct + eta_div * L_div
     """
 
@@ -235,17 +229,15 @@ class Trainer:
 
     def _forward_pass(self, batch_dict):
         model_kwargs = {k: v for k, v in batch_dict.items()
-                         if k not in ('triplet_mask', 'self_negative_mask', 'batch_data', 'test_forward')}
+                        if k not in ('triplet_mask', 'self_negative_mask', 'batch_data', 'test_forward')}
         if self.args.use_amp:
             with torch.cuda.amp.autocast():
                 return self.model(**model_kwargs)
         return self.model(**model_kwargs)
 
     def _compute_losses(self, outputs, batch_dict) -> Dict:
-        """Sec. 3.7 training objective.
-
-        In-batch negatives (batch tail vectors act as the candidate entity set),
-        exactly as in Baseline. The same false-negative `triplet_mask` is applied
+        """In-batch negatives (batch tail vectors act as the candidate entity set).
+         The same false-negative `triplet_mask` is applied
         to all three logit matrices (S_q, S_p, S_struct) since an unmasked false
         negative would corrupt every one of them, not just S_q.
 
@@ -304,7 +296,7 @@ class Trainer:
         L_struct = self._bidirectional_ce(s_logits, labels, batch_size)
 
         total_loss = L_query + self.args.eta_proto * L_proto + \
-            self.args.eta_struct * L_struct + self.args.eta_div * div_loss
+                     self.args.eta_struct * L_struct + self.args.eta_div * div_loss
 
         combined_score = model_obj.combined_score(S_q, S_p, S_s, lambda_p, lambda_s)
 
@@ -320,11 +312,10 @@ class Trainer:
 
     @staticmethod
     def _bidirectional_ce(logits: torch.Tensor, labels: torch.Tensor, batch_size: int) -> torch.Tensor:
-        """CE(logits, labels) in both directions (t->prediction and prediction->t),
-        matching Baseline's `_compute_bidirectional_loss`. `logits` may have an
-        extra trailing self-negative column (only ever present for S_q); the
-        backward direction always uses only the square (batch_size, batch_size)
-        block, exactly as Baseline does."""
+        """CE(logits, labels) in both directions (t->prediction and prediction->t).
+        `logits` may have an extra trailing self-negative column (only ever present for S_q);
+        the backward direction always uses only the square (batch_size, batch_size)
+        block."""
         criterion = nn.CrossEntropyLoss()
         loss = criterion(logits, labels)
         loss = loss + criterion(logits[:, :batch_size].t(), labels)
@@ -369,25 +360,6 @@ class Trainer:
     def _run_eval(self, epoch, step=0):
         """Rank-0-only validation + checkpointing after each epoch (step=0) or
         every `--eval-every-n-step` steps mid-epoch (step=i+1).
-
-        Two distinct things happen here, and they are NOT the same metric:
-          1. `eval_epoch` -- a cheap in-batch diagnostic (Acc@1/Acc@3/loss on
-             S(t|h,r) among only the ~batch_size other tails in the same
-             mini-batch). Logged every call for a fast training-health signal,
-             but NEVER used to decide the best checkpoint -- an easy 1-in-32
-             in-batch discrimination task is a poor proxy for the real,
-             filtered, full-entity-set ranking problem the model is actually
-             trained to solve.
-          2. `_compute_full_validation_metrics` -- the REAL evaluation
-             protocol (forward+backward filtered MRR/Hits@1/3/10/50 against
-             the full entity dictionary, exactly matching
-             evaluation/evaluate.py). This is what `--checkpoint-metric`
-             (default 'mrr') selects the best checkpoint on. It's run only at
-             epoch boundaries (step == 0), and only every
-             `--full-eval-every-n-epochs` epochs, since it requires
-             re-encoding every entity in the dictionary and is far more
-             expensive than (1) -- mid-epoch / skipped-epoch calls still
-             checkpoint model_last.mdl but never overwrite model_best.mdl.
         """
         if self.args.rank == 0:
             in_batch_metric_dict = self.eval_epoch(epoch)
@@ -458,10 +430,7 @@ class Trainer:
     @torch.no_grad()
     def eval_epoch(self, epoch) -> Dict:
         """Cheap in-batch diagnostic: Acc@1/Acc@3/loss on S(t|h,r) among only
-        the batch's own tails. Fast (one pass over `valid_loader`, no full
-        entity-set encoding), useful as a training-health signal every call,
-        but see `_run_eval`'s docstring -- this is NOT what selects the best
-        checkpoint."""
+        the batch's own tails."""
         if not self.valid_loader:
             return {}
 
@@ -498,18 +467,7 @@ class Trainer:
 
     @torch.no_grad()
     def _compute_full_validation_metrics(self) -> Dict[str, float]:
-        """The real evaluation protocol (ARPM_KGC_Proposal.tex Sec. 4.2):
-        forward+backward filtered ranking of S(t|h,r) against the FULL entity
-        dictionary, averaged -- identical to what `evaluation/evaluate.py`
-        computes for final reporting, just run mid-training against the
-        in-memory model instead of a checkpoint on disk, and without writing
-        the per-query prediction/gate dump to disk.
 
-        Temporarily flips `args.is_test = True` so entity/query text
-        vectorization (utils/doc.py) and false-negative-mask construction
-        (utils/doc.py::collate) run in the exact same mode real test-time
-        evaluation does, then restores whatever it was.
-        """
         from ..evaluation.predict import ARPMPredictor
         from ..evaluation.evaluate import evaluate_predictor
         from ..utils.dict_hub import get_entity_dict

@@ -5,7 +5,7 @@ from typing import Optional, List, Tuple
 import torch
 import torch.utils.data.dataset
 
-from .candidate_pool import get_candidate_pool_builder, CandidateAnchor
+from .candidate_pool import get_candidate_pool_builder, CandidateAnchor, NO_HOP
 from .dict_hub import get_entity_dict, get_link_graph, get_tokenizer
 from .triplet import reverse_triplet
 from .triplet_mask import construct_mask, construct_self_negative_mask
@@ -78,13 +78,12 @@ def get_neighbor_desc(head_id: str, tail_id: str = None) -> str:
 class Example:
     """Represents a knowledge graph triplet example.
 
-    `vectorize(test=True)` tokenizes (head, relation) ONLY -- this is exactly the
-    query encoding q = E_0(h, r) of Sec. 3.3. `vectorize(test=False)` tokenizes
+    `vectorize(test=True)` tokenizes (head, relation) ONLY.
+     `vectorize(test=False)` tokenizes
     (head, relation, tail) together -- this is exactly the anchor encoding
     a_i = E_0(h_i, r, t_i). Both the query example and every candidate anchor
     reuse the same `hr_bert` encoder (see model/models.py), so E_0 is a single
-    shared module applied with two different input compositions, matching the
-    proposal's notation in Sec. 3.2.
+    shared module applied with two different input compositions.
     """
 
     def __init__(self, head_id, relation, tail_id, **kwargs):
@@ -202,7 +201,7 @@ class Dataset(torch.utils.data.dataset.Dataset):
         return len(self.examples)
 
     def _build_candidates(self, example: Example) -> Tuple[List[dict], List[int], List[bool]]:
-        """Retrieve A(h,r) for `example` (Sec. 3.2) and vectorize every candidate
+        """Retrieve A(h,r) for `example` and vectorize every candidate
         as an anchor encoding a_i = E_0(h_i, r, t_i)."""
         candidates: List[CandidateAnchor] = self.pool_builder.build(
             example.head_id, example.relation, example.tail_id
@@ -295,7 +294,7 @@ def _pad_triple_fields(examples: List[dict], prefix: str) -> Tuple[torch.Tensor,
 def collate(batch_data: List[dict]) -> dict:
     """Collate function for ARPM-KGC batches (train and eval alike; the only
     difference between the two is whether args.is_test gates triplet_mask /
-    self_negative_mask, exactly as in Baseline).
+    self_negative_mask).
 
     Produces, in addition to the usual (h_triple, tail, head) fields:
       - candidate_token_ids / candidate_mask_tok / candidate_token_type_ids:
@@ -303,8 +302,13 @@ def collate(batch_data: List[dict]) -> dict:
         candidate anchor in the batch (padded slots use the dummy candidate).
       - candidate_valid_mask: (batch_size, max_candidates) bool, True where a
         real candidate anchor exists.
-      - candidate_hop_id: (batch_size, max_candidates) long, hop distance
-        (1..L) for local anchors, 0 for global anchors / padding.
+      - candidate_hop_id: (batch_size, max_candidates) long, hop SLOT
+        (0-indexed: slot 0 = same head & relation as the query / graph
+        distance 0, slots 1..num_hops = increasing graph distance -- e.g.
+        --num-hops 2 gives slots {0,1,2}) for local anchors, NO_HOP (-1) for
+        global anchors AND for padding slots -- padding must not use 0,
+        since that would collide with genuine "local hop 0" (see
+        utils/candidate_pool.py).
       - candidate_is_local: (batch_size, max_candidates) bool.
     """
     example_vecs = [ex['example_vectorized'] for ex in batch_data]
@@ -325,7 +329,7 @@ def collate(batch_data: List[dict]) -> dict:
     dummy_candidate = _get_dummy_candidate_vectorized()
     flat_candidates: List[dict] = []
     candidate_valid_mask = torch.zeros(batch_size, max_candidates, dtype=torch.bool)
-    candidate_hop_id = torch.zeros(batch_size, max_candidates, dtype=torch.long)
+    candidate_hop_id = torch.full((batch_size, max_candidates), NO_HOP, dtype=torch.long)
     candidate_is_local = torch.zeros(batch_size, max_candidates, dtype=torch.bool)
 
     for b, ex in enumerate(batch_data):
@@ -374,8 +378,7 @@ def collate(batch_data: List[dict]) -> dict:
 
 def collate_entity(batch_data: List[dict]) -> dict:
     """Collate function for entity-only encoding (Dataset(test_set=True)); used
-    solely to compute E_1(t) for every entity in the dictionary, exactly as in
-    Baseline's `collate_test` -- no candidates / query encoding required."""
+    solely to compute E_1(t) for every entity in the dictionary` -- no candidates / query encoding required."""
     tail_token_ids, tail_mask, tail_token_type_ids = _pad_triple_fields(batch_data, 'tail')
 
     return {

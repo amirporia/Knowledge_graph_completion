@@ -1,12 +1,7 @@
 # ARPM-KGC: Reference Implementation
 
 This is a complete, standalone implementation of **Adaptive Relation-Aware
-Prototype Memory for Knowledge Graph Completion (ARPM-KGC)**, as specified in
-`ARPM_KGC_Proposal.tex`. It is built directly on top of the `Baseline/`
-codebase (same dual-BERT encoder, same data format, same preprocessing, same
-filtered-ranking evaluation protocol) so that the two can be trained and
-compared like-for-like, but it is a fully separate package — nothing in
-`ARPM_KGC/` imports from `Baseline/`.
+Prototype Memory for Knowledge Graph Completion (ARPM-KGC)**.
 
 ```
 ARPM_KGC/
@@ -14,7 +9,7 @@ ARPM_KGC/
   utils/        triplet.py, dict_hub.py, candidate_pool.py, doc.py, triplet_mask.py, utils.py
   model/        modules.py, models.py, trainer.py
   evaluation/   metric.py, predict.py, evaluate.py, eval_wiki5m_trans.py
-  preprocess/   preprocess.py            (unchanged from Baseline — same data format)
+  preprocess/   preprocess.py            
   main.py
 ```
 
@@ -26,7 +21,7 @@ ARPM_KGC/
 | Sec. 3.3 Query-Conditioned Anchor Selection (RQ1) | `alpha_i`, weighted anchor set `W_q` | `model/models.py::ARPMModel._build_memory` |
 | Sec. 3.3.1 Diversity Regularization | `L_div` | `model/modules.py::diversity_loss` |
 | Sec. 3.4 Multi-Prototype Semantic Memory (RQ2) | `ProtoGen`, prototypes `p_k` | `model/modules.py::ProtoGen` |
-| Sec. 3.5 Adaptive Structural Memory (RQ3) | `m^(l)`, `G_hop`, `beta_l`, `m_struct` | `model/models.py::ARPMModel._structural_memory`, `model/modules.py::HopScorer` |
+| Sec. 3.5 Adaptive Structural Memory (RQ3) | `m^(l)`, `G_hop`, `beta_l`, `m_struct` (plus empty-hop / no-local-anchor safeguards, §4) | `model/models.py::ARPMModel._structural_memory`, `model/modules.py::HopScorer` |
 | Sec. 3.6 Adaptive Memory-Aware Tail Prediction (RQ4) | `S_q, S_p, S_struct`, `G_lambda`, `S(t\|h,r)` | `model/models.py::ARPMModel.score_query/score_prototypes/score_struct/combined_score`, `model/modules.py::MemoryGate` |
 | Sec. 3.7 Training Objective | `L = L_query + eta_p L_proto + eta_s L_struct + eta_div L_div` | `model/trainer.py::Trainer._compute_losses` |
 | Sec. 3.8.1 Gumbel anchor gate (A11) | `c_i^ST` | `model/modules.py::gumbel_sigmoid_gate` |
@@ -35,17 +30,12 @@ ARPM_KGC/
 | Sec. 5 Memory Gate Analysis | per-query `lambda_p, lambda_s` | dumped into `task_hrt_*.json` by `evaluation/evaluate.py::_save_prediction_details` |
 
 `Example.vectorize(test=True)` (query, `E_0(h,r)`) and `Example.vectorize(test=False)`
-(anchor, `E_0(h_i,r,t_i)`) already existed in `Baseline/utils/doc.py` for exactly
-this purpose (they're what the baseline used for its own primary example and
-its naive "related triplets"); ARPM-KGC reuses them unchanged and only
-replaces *which* triplets get vectorized as anchors (`utils/candidate_pool.py`
-instead of `Dataset.get_related_triplets`) and *how* they're combined
-(`model/models.py` instead of a plain average).
+(anchor, `E_0(h_i,r,t_i)`); ARPM-KGC reuses them unchanged and only
+replaces *which* triplets get vectorized as anchors.
 
 ## 2. Running it
 
-Preprocessing is unchanged — reuse whatever `Baseline/data/<TASK>/*.txt.json` /
-`entities.json` you already produced with `Baseline/preprocess/preprocess.py`
+Preprocessing
 (or run `python -m ARPM_KGC.preprocess.preprocess --task wn18rr`, which
 produces byte-identical output). From the directory that *contains*
 `ARPM_KGC/`:
@@ -61,15 +51,15 @@ python -m ARPM_KGC.evaluation.evaluate --task wn18rr --is-test
 python -m ARPM_KGC.evaluation.eval_wiki5m_trans --task wiki5m_trans --is-test
 ```
 
-Every `Baseline` flag (`--batch-size`, `--lr`, `--epochs`, `--pretrained-model`,
+Every flag (`--batch-size`, `--lr`, `--epochs`, `--pretrained-model`,
 `--pooling`, `--use-amp`, `torchrun` DDP, ...) works identically. The
 ARPM-KGC-specific hyperparameters (all with the defaults used above) are:
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--num-hops` | `L`, structural hop distances | 2 |
+| `--num-hops` | `N`, max graph distance beyond hop-0 (yields N+1 local categories: hop-0..hop-N) | 2 |
 | `--num-prototypes` | `K`, semantic prototypes, one of `{1,2,4,8}` | 4 |
-| `--local-per-hop-budget` | max local anchors sampled per hop | 5 |
+| `--local-per-hop-budget` | max local anchors sampled per hop (incl. hop-0) | 5 |
 | `--global-budget` | max global anchors sampled from `T_r` | 10 |
 | `--anchor-budget` | `M`, total candidate-pool cap | 20 |
 | `--retrieval-temperature` | `tau_r` | 0.1 |
@@ -126,26 +116,15 @@ interpretable and reproducible.
   combined `S(t|h,r)` returned by `model/models.py` and used for *ranking*
   (evaluation, the Sec. 5 gate analysis) are always the raw, paper-exact
   similarities — no temperature, no margin. `model/trainer.py` applies
-  Baseline's shared `exp(log_inv_t)` inverse-temperature (and, for `S_q`
+  shared `exp(log_inv_t)` inverse-temperature (and, for `S_q`
   only, the additive margin + self-negative term) purely to sharpen the
   in-batch cross-entropy *losses*; since this is a positive monotonic
   rescaling applied identically inside each loss, it changes optimization
-  dynamics but never the ranking any of the three scores would produce. This
-  keeps training comparable to `Baseline`'s tuned SimKGC-style setup without
-  contaminating the quantities the proposal actually defines.
+  dynamics but never the ranking any of the three scores would produce.
 - **False-negative masking (`triplet_mask`) is applied to `S_q`, `S_p`, and
   `S_struct` alike** during in-batch training — an unmasked false negative
   would corrupt all three losses, not just the query loss.
-- **Pre-batch negatives are not implemented.** `Baseline` supports an
-  optional pre-batch negative queue (`--pre-batch`, default `0`, i.e. off by
-  default there too); it's orthogonal to ARPM-KGC's contribution and was
-  dropped for clarity. Keep `--pre-batch 0` on the `Baseline` side when
-  comparing.
-- **`rerank_by_graph` is gone, on purpose.** `Baseline/utils/utils.py`'s
-  post-hoc graph re-ranking heuristic is exactly what adaptive structural
-  memory (Sec. 3.5), gated by the *learned* `lambda_s` (Sec. 3.6), is meant to
-  replace with a principled, trainable mechanism — `evaluation/evaluate.py`
-  now scores directly with `S(t|h,r)` instead.
+- **Pre-batch negatives are not implemented.**
 - **Zero-candidate queries are handled explicitly, not silently patched.** If
   `CandidatePoolBuilder.build(...)` returns an empty list (isolated head,
   relation seen nowhere else), the model does **not** fall back to using the
@@ -188,12 +167,69 @@ interpretable and reproducible.
   (`utils/dict_hub.py::get_train_triplet_dict`, independent of
   `args.is_test`), so no validation/test label ever enters the candidate pool,
   at either training or evaluation time.
-- **Efficiency.** Unlike `Baseline`'s Python `for`-loop over its (<=3)
-  "related triplets", the whole candidate pipeline here — retrieval scoring,
+- **Efficiency.** the whole candidate pipeline here — retrieval scoring,
   diversity, prototype attention, hop-specific aggregation — is vectorized
   over a padded `(batch, max_candidates)` grid with a single batched BERT
   call per pass; this was necessary anyway since ARPM-KGC's candidate budget
   `M` is much larger than Baseline's.
+- **Local hop 0 is "same head & relation", not "nearest graph neighbor" —
+  and `--num-hops N` yields N+1 categories, not N.** Local candidates span
+  hop-0 (other valid tails for the *exact same* `(h, r)` pair — graph
+  distance 0, no traversal — tightest possible evidence, most useful for
+  one-to-many relations), then hop-1 (graph distance 1, i.e. direct/1-edge
+  neighbors), ..., hop-N (graph distance N): `--num-hops 2` therefore builds
+  *three* structural-memory slots, hop-0/1/2, not two. `HopScorer` and
+  `m^(l)` are allocated `num_hops + 1` slots accordingly
+  (`ARPMModel.num_hop_slots`, `model/models.py`). Global candidates, and
+  padding slots in `utils/doc.py::collate`, are tagged `NO_HOP = -1`
+  (`utils/candidate_pool.py`) precisely so they can never be mistaken for a
+  genuine local hop-0 candidate — reusing `0` as that sentinel would have
+  silently collided with this indexing. `_global_candidates` also excludes
+  any pair sharing the query's head (not just its exact true tail), since
+  that's already covered by the dedicated hop-0 category — keeping "global"
+  strictly meaning "a different head" so the two categories don't overlap.
+- **Empty-hop and no-local-anchor safeguards in `_structural_memory`
+  (Sec. 3.5), both parameter-free:**
+  1. *Some hops empty, not all.* The hop-selection weighting — the dense
+     `softmax(G_hop(q))`, its `--use-gumbel-hop` (A12) counterpart, and even
+     the `--uniform-hop-weighting` (A5) ablation — is masked so a hop with
+     zero local anchors for a given query gets *exactly* zero weight,
+     instead of relying on `G_hop` to learn that on its own. Verified
+     adversarially: forcing `G_hop` to output a very large logit for a
+     deliberately-empty hop still yields exactly `0` weight for it after
+     masking.
+  2. *No local anchor at any hop (including hop-0).* `m_struct` is hard-set
+     to the zero vector for that query (via `torch.where`, an element-wise
+     *replace* rather than a multiplicative mask — the latter would let a
+     NaN from a degenerate all-hops-masked softmax leak through as
+     `0 * NaN = NaN`), and `forward()` hard-overrides `lambda_s <- 0` for
+     that query, *after* any `--fixed-lambda-s` ablation override (so "no
+     evidence" always wins, even under a deliberately fixed non-adaptive
+     gate — see §3, A8/A10). Verified directly, including that the override
+     survives `--fixed-lambda-s 0.9`.
+
+  Fixing safeguard 2 surfaced a related pre-existing off-by-one in
+  `CandidatePoolBuilder._local_candidates`/`_same_head_candidates`: the
+  per-hop budget was checked *after* appending a candidate, so
+  `--local-per-hop-budget 0` still let one candidate per non-empty hop
+  through. The check now runs before appending, so a `0` budget means
+  exactly `0` local candidates, as documented. `--num-hops 0` is also a
+  valid, meaningful configuration under the corrected indexing: hop-0
+  (same head & relation) only, with no graph traversal at all — a more
+  surgical restriction than `--disable-link-graph` (A7), which removes
+  *every* local category, hop-0 included.
+- **Known limitation, not (yet) fixed: `A(h,r) = A_local(h,r) U A_global(r)`
+  is currently a concatenation, not a true set union.** `_global_candidates`
+  excludes any pair sharing the query's head (deduplicating against hop-0),
+  but a triple reached via graph traversal for hop `l >= 1` can still also be
+  independently sampled into the global pool, so it may appear twice with
+  two different tags (once local/hop-`l`, once global). No correctness
+  impact -- the local copy still feeds structural memory correctly, the
+  extra global copy just adds slightly more retrieval/prototype weight to
+  that one anchor -- but worth knowing if you inspect per-query candidate
+  pools directly. Flagging rather than silently patching this since it
+  wasn't part of what was asked; happy to dedupe properly (e.g. tracking
+  seen `(head_id, tail_id)` pairs per query) if wanted.
 
 ## 5. Checkpoint selection: real filtered-ranking metrics, not in-batch accuracy
 
@@ -241,13 +277,32 @@ checkpointing → evaluation with filtered ranking) was exercised end-to-end on
 a small synthetic dataset with a randomly-initialized, fully local (no
 internet) tiny BERT, covering: a full `train_loop` with checkpoint save/load,
 `evaluation/evaluate.py::predict_by_split` (forward + backward MRR/Hits@k),
-all three optional Gumbel extensions together, `--disable-link-graph`
-(global-only candidates), the `--anchor-budget 0` zero-candidate edge case,
-**and the full-filtered-ranking checkpoint selection of §5** (including
-`--full-eval-every-n-epochs`, verified to run the expensive full-entity pass
-only on due epochs while `model_last.mdl` is still updated every epoch) — all
-produced finite losses/metrics with no shape or NaN errors. This confirms the
-implementation is mechanically correct; it does **not** substitute for a real
-training run on WN18RR/FB15k-237 to validate the proposal's empirical claims,
-which requires downloading `bert-base-uncased` and GPU time neither of which
-were available in this environment.
+all three optional Gumbel extensions together (including `--gumbel-topk-hop 2`
+with a masked top-k selection), `--random-anchor-selection` (A1),
+`--uniform-hop-weighting` (A5), `--fixed-lambda-p/-s 0` (A9/A10),
+`--disable-link-graph` (A7, global-only candidates), `--num-hops 0` and
+`--num-hops 1` (hop-0-only and hop-0/1-only edge cases), the `--anchor-budget
+0` zero-candidate edge case, and the full-filtered-ranking checkpoint
+selection of §5 (including `--full-eval-every-n-epochs`, verified to run the
+expensive full-entity pass only on due epochs while `model_last.mdl` is still
+updated every epoch) — all produced finite losses/metrics with no shape or
+NaN errors. In addition:
+- `CandidatePoolBuilder` was checked directly against the synthetic training
+  graph: `--num-hops 2` was confirmed to produce exactly the three local hop
+  slots `{0, 1, 2}` (hop-0 = same head & relation with a different tail,
+  hop-1 = a genuinely different, 1-edge-away head, hop-2 = 2 edges away), and
+  `ARPMModel.num_hop_slots` / `HopScorer`'s output width were confirmed to
+  equal `num_hops + 1`.
+- `_structural_memory`'s two safeguards (§4) were unit-tested directly
+  against hand-crafted candidate grids (re-run under the corrected `L =
+  num_hops + 1` shape): a query with an empty middle hop but populated
+  neighboring hops (verified exact-zero weight on the empty hop even when
+  `G_hop` is adversarially biased toward it), a query with only global
+  candidates, and a query with zero candidates at all (both verified to
+  produce an exact-zero `m_struct` and `lambda_s`, including under a
+  `--fixed-lambda-s 0.9` override).
+
+This confirms the implementation is mechanically correct; it does **not**
+substitute for a real training run on WN18RR/FB15k-237 to validate the
+proposal's empirical claims, which requires downloading `bert-base-uncased`
+and GPU time neither of which were available in this environment.

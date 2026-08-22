@@ -27,12 +27,10 @@ def clean_state_dict(state_dict: dict) -> OrderedDict:
 class ARPMPredictor:
     """Predictor class for ARPM-KGC inference.
 
-    Mirrors Baseline/evaluation/predict.py::BertPredictor, but `predict_by_examples`
-    returns the full memory bundle (query embedding, prototypes, structural memory,
-    gates) needed to compute S(t|h,r) = S_q + lambda_p*S_p + lambda_s*S_struct
-    against the full entity set in evaluation/evaluate.py, instead of just a
-    single hr_vector.
-    """
+    `predict_by_examples` returns the full memory bundle (query embedding,
+    prototypes, structural memory, gates) needed to compute S(t|h,r) = S_q
+    + lambda_p*S_p + lambda_s*S_struct against the full entity set in
+     evaluation/evaluate.py."""
 
     def __init__(self):
         self.model = None
@@ -43,12 +41,7 @@ class ARPMPredictor:
 
     @classmethod
     def from_model(cls, model: torch.nn.Module, device: torch.device,
-                    use_cuda: bool, batch_size: int = None) -> 'ARPMPredictor':
-        """Wrap an already-in-memory model (e.g. the model currently being
-        trained) as a predictor, without touching disk. Used by
-        model/trainer.py to run the real filtered-ranking validation protocol
-        (evaluation/evaluate.py) for best-checkpoint selection, instead of
-        loading a checkpoint that may not even have been written yet."""
+                   use_cuda: bool, batch_size: int = None) -> 'ARPMPredictor':
         predictor = cls()
         predictor.model = model
         predictor.device = device
@@ -126,7 +119,7 @@ class ARPMPredictor:
 
         for batch_dict in tqdm.tqdm(data_loader, desc='Predicting query memory'):
             model_kwargs = {k: v for k, v in batch_dict.items()
-                             if k not in ('triplet_mask', 'self_negative_mask', 'batch_data', 'test_forward')}
+                            if k not in ('triplet_mask', 'self_negative_mask', 'batch_data', 'test_forward')}
             batch_dict_dev = self._move_to_device(model_kwargs)
             outputs = self.model(**batch_dict_dev)
 

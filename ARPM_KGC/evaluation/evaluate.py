@@ -126,9 +126,8 @@ def compute_metrics(
 ) -> Tuple[List, List, Dict, List]:
     """Compute filtered-ranking evaluation metrics using ARPM-KGC's combined
     score S(t|h,r) = S_q(t) + lambda_p*S_p(t) + lambda_s*S_struct(t) against the
-    full entity set. This directly replaces Baseline's `rerank_by_graph`
-    post-hoc heuristic: adaptive structural memory (Sec. 3.5), gated by the
-    learned lambda_s (Sec. 3.6), IS the graph-aware re-ranking signal now.
+    full entity set. adaptive structural memory, gated by the
+    learned lambda_s, IS the graph-aware re-ranking signal now.
     """
     d = q_tensor.size(1)
     assert d == entities_tensor.size(1), "Embedding dimensions must match"
@@ -264,17 +263,7 @@ def evaluate_predictor(
         save_details: bool = True,
 ) -> Dict[str, Dict[str, float]]:
     """Run the full filtered-ranking protocol (forward + backward, averaged) on
-    `args.valid_path` for an already-loaded-or-wrapped predictor. This is THE
-    evaluation protocol of ARPM_KGC_Proposal.tex Sec. 4.2 (MRR, Hits@1/3/10) and
-    is shared by both:
-      - the standalone `predict_by_split()` below (save_details=True, writes
-        the full per-query prediction/gate dump), and
-      - `model/trainer.py`'s best-checkpoint selection (save_details=False,
-        no file I/O), which otherwise would have to pick "best" using a much
-        weaker in-batch proxy accuracy instead of real MRR/Hits@k.
-
-    Returns {'forward': {...}, 'backward': {...}, 'average': {...}}, each a
-    dict with keys 'mean_rank', 'mrr', 'hit@1', 'hit@3', 'hit@10', 'hit@50'.
+    `args.valid_path` for an already-loaded-or-wrapped predictor.
     """
     forward_metrics = eval_single_direction(
         predictor, entity_tensor=entity_tensor, eval_forward=True,
@@ -302,8 +291,7 @@ def _save_prediction_details(
         eval_direction: str,
 ) -> None:
     """Save detailed predictions, including the per-query memory gates
-    lambda_p/lambda_s -- these are the direct, interpretable evidence used by
-    the Sec. 5 "Memory Gate Analysis"."""
+    lambda_p/lambda_s"""
     pred_infos = []
 
     for idx, example in enumerate(examples):

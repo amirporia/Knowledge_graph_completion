@@ -1,16 +1,13 @@
 """Neural building blocks for ARPM-KGC.
 
-Each class/function here is named after -- and implements -- one boxed equation
-of ARPM_KGC_Proposal.tex:
-
-  - ProtoGen       -> Sec. 3.4 (Multi-Prototype Semantic Memory), P_q = ProtoGen(W_q, q)
-  - HopScorer      -> Sec. 3.5 (Adaptive Structural Memory), z_l = G_hop(q, l)
-  - MemoryGate     -> Sec. 3.6 (Adaptive Memory-Aware Tail Prediction), [lambda_p,lambda_s]=G_lambda(q)
-  - PrototypeActivationScorer -> Sec. 3.8.3, zeta_k = G_K(q, r, k)  (optional, A13)
-  - diversity_loss -> Sec. 3.3.1, L_div
-  - gumbel_sigmoid_gate      -> Sec. 3.8.1 (A11, anchor keep/drop gate c_i)
-  - gumbel_softmax_topk      -> Sec. 3.8.2 (A12, hop selection beta_l)
-  - gumbel_sigmoid_slot_gate -> Sec. 3.8.3 (A13, prototype slot gate omega_k)
+  - ProtoGen       -> (Multi-Prototype Semantic Memory), P_q = ProtoGen(W_q, q)
+  - HopScorer      -> (Adaptive Structural Memory), z_l = G_hop(q, l)
+  - MemoryGate     -> (Adaptive Memory-Aware Tail Prediction), [lambda_p,lambda_s]=G_lambda(q)
+  - PrototypeActivationScorer -> zeta_k = G_K(q, r, k)  (optional, A13)
+  - diversity_loss -> L_div
+  - gumbel_sigmoid_gate      -> (A11, anchor keep/drop gate c_i)
+  - gumbel_softmax_topk      -> (A12, hop selection beta_l)
+  - gumbel_sigmoid_slot_gate -> (A13, prototype slot gate omega_k)
 """
 from typing import Optional
 
@@ -18,10 +15,17 @@ import torch
 import torch.nn as nn
 
 _EPS = 1e-10
+_NEG_INF = -1e4  # finite sentinel, so an all-masked row still
+
+
+# produces a finite (if meaningless) softmax instead of NaN;
+# callers that need "no valid options" to mean exactly zero
+# downstream (e.g. hop selection when a query has no local
+# anchor at any hop) handle that explicitly at a higher level.
 
 
 class ProtoGen(nn.Module):
-    """Sec. 3.4: maps the weighted anchor set W_q = {(a_i, alpha_i)} to K semantic
+    """maps the weighted anchor set W_q = {(a_i, alpha_i)} to K semantic
     prototypes via query-conditioned attention.
 
     u_ik = a_i^T W_k q / sqrt(d)                         (per-prototype bilinear score)
@@ -59,17 +63,20 @@ class ProtoGen(nn.Module):
         u_max = u.amax(dim=1, keepdim=True)
         exp_u = torch.exp(u - u_max) * valid_mask.unsqueeze(-1)
 
-        weighted = alpha.unsqueeze(-1) * exp_u                    # (B, N, K)
+        weighted = alpha.unsqueeze(-1) * exp_u  # (B, N, K)
         denom = weighted.sum(dim=1, keepdim=True).clamp(min=1e-12)  # (B, 1, K)
-        rho = weighted / denom                                     # (B, N, K)
+        rho = weighted / denom  # (B, N, K)
 
         prototypes = torch.einsum('bnk,bnd->bkd', rho, cand_emb)
         return prototypes
 
 
 class HopScorer(nn.Module):
-    """Sec. 3.5: z_l = G_hop(q, l), implemented as a single linear layer whose
-    l-th output channel is z_l -- i.e. G_hop(q, l) = W[l, :] . q + b[l]."""
+    """z_l = G_hop(q, l), implemented as a single linear layer whose
+    l-th output channel is z_l -- i.e. G_hop(q, l) = W[l, :] . q + b[l].
+    Constructed with num_hops+1 channels (l=0 is the same-head/same-relation
+    local category, graph distance 0; l=1..num_hops are increasing graph
+    distances)"""
 
     def __init__(self, hidden_size: int, num_hops: int):
         super().__init__()
@@ -80,7 +87,7 @@ class HopScorer(nn.Module):
 
 
 class MemoryGate(nn.Module):
-    """Sec. 3.6: [lambda_p, lambda_s] = G_lambda(q), independent per-source gates
+    """[lambda_p, lambda_s] = G_lambda(q), independent per-source gates
     in [0, 1] via a linear layer + sigmoid."""
 
     def __init__(self, hidden_size: int):
@@ -92,7 +99,7 @@ class MemoryGate(nn.Module):
 
 
 class PrototypeActivationScorer(nn.Module):
-    """Sec. 3.8.3 (A13, optional): zeta_k = G_K(q, r, k), implemented the same way
+    """(A13, optional): zeta_k = G_K(q, r, k), implemented the same way
     as HopScorer -- one linear output channel per prototype slot."""
 
     def __init__(self, hidden_size: int, num_prototypes: int):
@@ -104,21 +111,21 @@ class PrototypeActivationScorer(nn.Module):
 
 
 def diversity_loss(cand_emb: torch.Tensor, alpha: torch.Tensor,
-                    valid_mask: torch.Tensor) -> torch.Tensor:
-    """Sec. 3.3.1: L_div = (1/Z) * sum_{i!=j} alpha_i alpha_j sim(a_i, a_j),
+                   valid_mask: torch.Tensor) -> torch.Tensor:
+    """L_div = (1/Z) * sum_{i!=j} alpha_i alpha_j sim(a_i, a_j),
     Z = N_A * (N_A - 1), averaged over the batch.
 
     cand_emb is expected to already be L2-normalized (as produced by the shared
     E_0 encoder), so a_i . a_j IS cosine similarity.
     """
     sim = torch.einsum('bnd,bmd->bnm', cand_emb, cand_emb)  # (B, N, N)
-    outer = alpha.unsqueeze(2) * alpha.unsqueeze(1)          # (B, N, N)
+    outer = alpha.unsqueeze(2) * alpha.unsqueeze(1)  # (B, N, N)
 
     n = alpha.size(1)
     eye = torch.eye(n, device=alpha.device, dtype=torch.bool).unsqueeze(0)
     outer = outer.masked_fill(eye, 0.0)
 
-    weighted_sum = (outer * sim).sum(dim=(1, 2))              # (B,)
+    weighted_sum = (outer * sim).sum(dim=(1, 2))  # (B,)
 
     n_valid = valid_mask.sum(dim=-1).float()
     z = (n_valid * (n_valid - 1)).clamp(min=1.0)
@@ -127,13 +134,13 @@ def diversity_loss(cand_emb: torch.Tensor, alpha: torch.Tensor,
 
 
 # ---------------------------------------------------------------------------
-# Optional discrete (Gumbel) extensions -- Sec. 3.8 / ablations A11-A13.
+# Optional discrete (Gumbel) extensions -- ablations A11-A13.
 # All three use the Gumbel-Softmax / straight-through (ST) estimator: hard in
 # the forward pass, soft (differentiable) in the backward pass.
 # ---------------------------------------------------------------------------
 
 def gumbel_sigmoid_gate(relevance_logit: torch.Tensor, tau: float, training: bool) -> torch.Tensor:
-    """Sec. 3.8.1 (A11): binary keep/drop gate c_i for anchor retrieval.
+    """(A11): binary keep/drop gate c_i for anchor retrieval.
 
     pi_i = sigma(s_i) reuses the raw relevance score s_i (NOT divided by tau_r).
     c_i(tau_sel) = sigma( ((log pi_i + g_i^1) - (log(1-pi_i) + g_i^0)) / tau_sel )
@@ -166,13 +173,13 @@ def gumbel_sigmoid_gate(relevance_logit: torch.Tensor, tau: float, training: boo
 
 
 def gumbel_softmax_topk(logits: torch.Tensor, tau: float, k: int,
-                         training: bool, valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """Sec. 3.8.2 (A12): hop selection. k=1 is the exact boxed ST Gumbel-Softmax
+                        training: bool, valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """(A12): hop selection. k=1 is the exact boxed ST Gumbel-Softmax
     (beta^hard = one-hot(argmax_l(z_l+g_l))); k>1 is the "Gumbel-top-k" variant
     that lets more than one hop distance stay active.
     """
     if valid_mask is not None:
-        logits = logits.masked_fill(~valid_mask, float('-inf'))
+        logits = logits.masked_fill(~valid_mask, _NEG_INF)
 
     if training:
         u = torch.rand_like(logits).clamp(_EPS, 1 - _EPS)
@@ -187,11 +194,19 @@ def gumbel_softmax_topk(logits: torch.Tensor, tau: float, k: int,
     _, top_idx = perturbed.topk(topk, dim=-1)
     hard = torch.zeros_like(logits).scatter_(-1, top_idx, 1.0)
 
+    if valid_mask is not None:
+        # If fewer than `k` slots are valid (e.g. only 1 hop has any local
+        # anchor but k_hop=2), top-k is forced to also pick a masked slot to
+        # fill out k -- strip any such invalid pick rather than letting it
+        # receive real (if small) weight; this may leave fewer than k active
+        # hops for that query, which is the correct, conservative outcome.
+        hard = hard * valid_mask.to(hard.dtype)
+
     return hard + soft - soft.detach()
 
 
 def gumbel_sigmoid_slot_gate(zeta: torch.Tensor, tau: float, training: bool) -> torch.Tensor:
-    """Sec. 3.8.3 (A13): per-slot prototype activation gate omega_k.
+    """(A13): per-slot prototype activation gate omega_k.
 
     omega_k(tau_proto) = sigma( ((zeta_k+g_k^1) - (-zeta_k+g_k^0)) / tau_proto )
     omega_k^hard = 1[zeta_k > 0]           (deterministic threshold, as specified)

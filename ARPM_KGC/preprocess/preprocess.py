@@ -1,10 +1,4 @@
 """Data preprocessing for ARPM-KGC.
-
-This file is intentionally unchanged from Baseline/preprocess/preprocess.py:
-ARPM-KGC consumes exactly the same train/valid/test/entities JSON format as the
-baseline (Example(head_id, head, relation, tail_id, tail)), so preprocessed data
-can be shared between the two pipelines for a like-for-like comparison -- there
-is no need to preprocess a dataset twice.
 """
 import argparse
 import json
@@ -306,7 +300,7 @@ def preprocess_wn18rr(path, num_workers: int, train_path: str):
     pool.join()
 
     _normalize_relations(examples, normalize_fn=lambda rel: rel.replace('_', ' ').strip(),
-                          train_path=train_path if train_path == path else None)
+                         train_path=train_path if train_path == path else None)
 
     out_path = path + '.json'
     json.dump(examples, open(out_path, 'w', encoding='utf-8'), ensure_ascii=False, indent=4)
@@ -322,7 +316,7 @@ def _normalize_fb15k237_relation(relation: str) -> str:
             dedup_tokens.append(token)
     relation_tokens = dedup_tokens[::-1]
     relation = ' '.join([t for idx, t in enumerate(relation_tokens)
-                          if idx == 0 or relation_tokens[idx] != relation_tokens[idx - 1]])
+                         if idx == 0 or relation_tokens[idx] != relation_tokens[idx - 1]])
     return relation
 
 
@@ -342,7 +336,7 @@ def preprocess_fb15k237(path, num_workers: int, train_path: str):
     pool.join()
 
     _normalize_relations(examples, normalize_fn=_normalize_fb15k237_relation,
-                          train_path=train_path if train_path == path else None)
+                         train_path=train_path if train_path == path else None)
 
     out_path = path + '.json'
     json.dump(examples, open(out_path, 'w', encoding='utf-8'), ensure_ascii=False, indent=4)
@@ -373,7 +367,7 @@ def preprocess_wiki5m(path: str, num_workers: int, train_path: str) -> List[dict
     pool.join()
 
     _normalize_relations(examples, normalize_fn=lambda rel_id: wiki5m_id2rel.get(rel_id, None),
-                          train_path=train_path if train_path == path else None)
+                         train_path=train_path if train_path == path else None)
 
     invalid_examples = [ex for ex in examples if _has_none_value(ex)]
     print('Find {} invalid examples in {}'.format(len(invalid_examples), path))

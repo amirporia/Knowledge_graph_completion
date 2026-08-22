@@ -14,14 +14,7 @@ CURRENT_TASK_NAME = "wn18rr"
 
 
 def parse_args():
-    """Parse command line arguments.
-
-    This mirrors Baseline/setting/config.py 1:1 for every flag that controls the
-    shared pipeline (data, encoders, optimizer, checkpointing, evaluation), so that
-    ARPM-KGC and the baseline can be trained/evaluated with the same commands and
-    compared fairly. Everything under the 'ARPM-KGC Memory' and 'Gumbel Extensions'
-    groups is new and implements the proposal in ARPM_KGC_Proposal.tex.
-    """
+    """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='ARPM-KGC arguments')
 
     # Model settings
@@ -82,7 +75,7 @@ def parse_args():
                             choices=['mrr', 'hit@1', 'hit@3', 'hit@10', 'hit@50'],
                             help='Metric used to pick the best checkpoint. Computed via the SAME '
                                  'filtered-ranking protocol as final evaluation (forward+backward '
-                                 'averaged S(t|h,r) ranking against the full entity set, Sec. 4.2 '
+                                 'averaged S(t|h,r) ranking against the full entity set '
                                  '/ evaluation/evaluate.py) -- NOT the cheap in-batch accuracy that '
                                  'is also logged every epoch purely as a training diagnostic.')
     mgmt_group.add_argument('--full-eval-every-n-epochs', default=1, type=int,
@@ -95,7 +88,7 @@ def parse_args():
                             help='Batch size used only for the full filtered-ranking validation '
                                  '(query-vs-full-entity-set scoring), independent of --batch-size')
 
-    # Loss and optimization (shared InfoNCE machinery, same defaults as baseline)
+    # Loss and optimization (shared InfoNCE machinery)
     loss_group = parser.add_argument_group('Loss and Optimization')
     loss_group.add_argument('--t', default=0.05, type=float,
                             help='Temperature parameter (used only to scale CE logits; the '
@@ -111,30 +104,34 @@ def parse_args():
     graph_group.add_argument('--disable-link-graph', dest='use_link_graph', action='store_false',
                              default=True,
                              help='By default the link graph is BUILT and USED, both for entity-'
-                                  'description text augmentation (as in Baseline) and, more '
+                                  'description text augmentation and, more '
                                   'importantly for ARPM-KGC, as the source of local structural '
                                   'candidate anchors A_local(h,r) and adaptive structural memory '
-                                  '(Sec. 3.2/3.5) -- unlike the Baseline, where the link graph is '
-                                  'optional context, here it is core to RQ3. Pass this flag to '
+                                  ', here it is core to RQ3. Pass this flag to '
                                   'disable it, which reduces the candidate pool to A_global(r) '
                                   'only and is equivalent to ablation A7 (no local structural '
                                   'memory).')
 
     # ------------------------------------------------------------------
-    # ARPM-KGC Memory (core model, ARPM_KGC_Proposal.tex Sec. 3)
+    # ARPM-KGC Memory (core model)
     # ------------------------------------------------------------------
     arpm_group = parser.add_argument_group('ARPM-KGC Memory')
     arpm_group.add_argument('--num-hops', default=2, type=int, dest='num_hops',
-                            help='L: number of structural hop distances for local candidates '
-                                 'and adaptive structural memory (Sec. 3.5)')
+                            help='N: max graph distance for local candidate retrieval and '
+                                 'adaptive structural memory, beyond the same-head '
+                                 '& relation category. Yields N+1 local hop categories total: '
+                                 'hop-0 (same head & relation, graph distance 0), hop-1 '
+                                 '(graph distance 1), ..., hop-N (graph distance N) -- e.g. '
+                                 '--num-hops 2 gives hop-0, hop-1, AND hop-2.')
     arpm_group.add_argument('--num-prototypes', default=4, type=int, dest='num_prototypes',
-                            help='K: number of semantic prototypes (Sec. 3.4), one of {1,2,4,8}')
+                            help='K: number of semantic prototypes, one of {1,2,4,8}')
     arpm_group.add_argument('--local-per-hop-budget', default=5, type=int, dest='local_per_hop_budget',
-                            help='Max local candidate anchors sampled per hop distance')
+                            help='Max local candidate anchors sampled per hop slot, including '
+                                 'hop 0 (same head & relation, different tail)')
     arpm_group.add_argument('--global-budget', default=10, type=int, dest='global_budget',
                             help='Max global candidate anchors sampled from T_r before capping')
     arpm_group.add_argument('--anchor-budget', default=20, type=int, dest='anchor_budget',
-                            help='M: total candidate-pool budget after merging local+global (Sec. 3.2)')
+                            help='M: total candidate-pool budget after merging local+global')
     arpm_group.add_argument('--retrieval-temperature', default=0.1, type=float, dest='retrieval_temperature',
                             help='tau_r: softmax temperature for query-conditioned anchor weights alpha_i')
     arpm_group.add_argument('--proto-temperature', default=0.1, type=float, dest='proto_temperature',
@@ -151,9 +148,9 @@ def parse_args():
                             help='Use head entity as an additional negative for S_q only')
 
     # ------------------------------------------------------------------
-    # Ablation overrides -- Table "Planned ARPM-KGC ablation study". A1-A13 are
+    # Ablation overrides. A1-A13 are
     # each reachable from the core model via one of these flags (or a plain
-    # hyperparameter already listed above), with no code changes required:
+    # hyperparameter already listed above):
     #   A1  Random anchors           --random-anchor-selection
     #   A2  No diversity reg.        --eta-div 0
     #   A3  Single prototype         --num-prototypes 1
@@ -172,36 +169,36 @@ def parse_args():
     # ------------------------------------------------------------------
     ablation_group = parser.add_argument_group('Ablation Overrides')
     ablation_group.add_argument('--random-anchor-selection', action='store_true', dest='random_anchor_selection',
-                                help='A1: replace query-conditioned alpha_i (Sec. 3.3) with a uniform '
+                                help='A1: replace query-conditioned alpha_i with a uniform '
                                      'distribution over valid candidates')
     ablation_group.add_argument('--uniform-hop-weighting', action='store_true', dest='uniform_hop_weighting',
-                                help='A5: replace the learned beta_l = softmax(G_hop(q)) (Sec. 3.5) '
+                                help='A5: replace the learned beta_l = softmax(G_hop(q)) '
                                      'with a fixed uniform beta_l = 1/L')
     ablation_group.add_argument('--fixed-lambda-p', default=None, type=float, dest='fixed_lambda_p',
-                                help='A8/A9: override the learned lambda_p (Sec. 3.6) with this '
+                                help='A8/A9: override the learned lambda_p with this '
                                      'constant for every query; 0.0 drops the S_p term entirely (A9)')
     ablation_group.add_argument('--fixed-lambda-s', default=None, type=float, dest='fixed_lambda_s',
-                                help='A8/A10: override the learned lambda_s (Sec. 3.6) with this '
+                                help='A8/A10: override the learned lambda_s with this '
                                      'constant for every query; 0.0 drops the S_struct term entirely (A10)')
 
     # ------------------------------------------------------------------
     # Optional discrete (Gumbel-Softmax / Gumbel-Sigmoid) extensions,
-    # ARPM_KGC_Proposal.tex Sec. 3.8 (ablations A11-A13). Off by default;
+    # (ablations A11-A13). Off by default;
     # the paper explicitly treats the dense mechanisms above as the core model.
     # ------------------------------------------------------------------
     gumbel_group = parser.add_argument_group('Gumbel Extensions (optional, ablations A11-A13)')
     gumbel_group.add_argument('--use-gumbel-anchor', action='store_true', dest='use_gumbel_anchor',
-                              help='A11: Gumbel-Sigmoid hard keep/drop gate per anchor (Sec. 3.8.1)')
+                              help='A11: Gumbel-Sigmoid hard keep/drop gate per anchor')
     gumbel_group.add_argument('--gumbel-tau-sel', default=0.5, type=float, dest='gumbel_tau_sel',
                               help='tau_sel: temperature for the anchor keep/drop gate')
     gumbel_group.add_argument('--use-gumbel-hop', action='store_true', dest='use_gumbel_hop',
-                              help='A12: Gumbel-Softmax (top-k) hard hop selection (Sec. 3.8.2)')
+                              help='A12: Gumbel-Softmax (top-k) hard hop selection')
     gumbel_group.add_argument('--gumbel-tau-hop', default=0.5, type=float, dest='gumbel_tau_hop',
                               help='tau_hop: temperature for hop selection')
     gumbel_group.add_argument('--gumbel-topk-hop', default=1, type=int, dest='gumbel_topk_hop',
                               help='k_hop: number of hop distances kept active per query')
     gumbel_group.add_argument('--use-gumbel-proto', action='store_true', dest='use_gumbel_proto',
-                              help='A13: Gumbel-Sigmoid per-slot prototype activation gates (Sec. 3.8.3)')
+                              help='A13: Gumbel-Sigmoid per-slot prototype activation gates')
     gumbel_group.add_argument('--gumbel-tau-proto', default=0.5, type=float, dest='gumbel_tau_proto',
                               help='tau_proto: temperature for prototype slot activation')
 
@@ -228,7 +225,7 @@ def parse_args():
 
 def generate_paths_from_task(arguments):
     """Generate dynamic paths based on task name. Reuses the exact same data
-    directory layout as Baseline so both pipelines can share preprocessed data."""
+    directory layout so both pipelines can share preprocessed data."""
     task = arguments.task.upper()
 
     if arguments.train_path is None:
@@ -273,7 +270,7 @@ def validate_args(arguments):
     if arguments.num_prototypes not in (1, 2, 4, 8):
         warnings.warn(
             f'--num-prototypes={arguments.num_prototypes} is outside the sweep {{1,2,4,8}} '
-            f'used in the core model (Sec. 3.4); proceeding anyway.'
+            f'used in the core model; proceeding anyway.'
         )
 
     return arguments

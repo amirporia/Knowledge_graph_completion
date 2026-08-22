@@ -58,8 +58,8 @@ def get_entity_dict() -> EntityDict:
 
 
 def get_train_triplet_dict() -> TripletDict:
-    """Training-set triplets. Used both for false-negative masking (Baseline
-    parity) AND as the sole source of candidate anchors for ARPM-KGC's
+    """Training-set triplets. Used both for false-negative masking
+     AND as the sole source of candidate anchors for ARPM-KGC's
     local/global retrieval (utils/candidate_pool.py) -- retrieval always reads
     from the training graph only, regardless of args.is_test, so no validation
     or test labels ever leak into the candidate pool.
