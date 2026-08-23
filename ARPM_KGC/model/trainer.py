@@ -379,11 +379,8 @@ class Trainer:
         every `--eval-every-n-step` steps mid-epoch (step=i+1).
         """
         if self.args.rank == 0:
-            in_batch_metric_dict = self.eval_epoch(epoch)
-            logger.info(
-                f'Epoch {epoch} in-batch diagnostic (NOT used for checkpoint '
-                f'selection): {json.dumps(in_batch_metric_dict)}'
-            )
+            # in_batch_metric_dict = self.eval_epoch(epoch) logger.info(f'Epoch {epoch} in-batch diagnostic (NOT used
+            # for checkpoint selection): {json.dumps(in_batch_metric_dict)}')
 
             is_epoch_boundary = (step == 0)
             due_for_full_eval = (epoch + 1) % max(self.args.full_eval_every_n_epochs, 1) == 0
