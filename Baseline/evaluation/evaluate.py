@@ -7,7 +7,7 @@ from typing import List, Tuple, Dict
 import torch
 import tqdm
 
-from predict import BertPredictor
+from Baseline.evaluation.predict import BertPredictor
 from Baseline.setting.config import args
 from Baseline.setting.logger_config import logger
 from Baseline.utils.dict_hub import get_entity_dict, get_all_triplet_dict

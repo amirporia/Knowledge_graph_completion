@@ -222,7 +222,7 @@ def parse_args():
 
     # Evaluation flags
     eval_group = parser.add_argument_group('Evaluation')
-    eval_group.add_argument('--is-test', action='store_true', default=False,
+    eval_group.add_argument('--is-test', action='store_true', default=True,
                             help='Run in test mode')
 
     return parser.parse_args()
