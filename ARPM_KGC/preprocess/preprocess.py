@@ -417,7 +417,7 @@ def dump_all_entities(examples, out_path, id2text: dict):
 def get_entity_mapping(task: str) -> Dict:
     mappings = {
         'wn18rr': lambda: {k: v[2] for k, v in wn18rr_id2ent.items()},
-        'FB15K237': lambda: {k: v[2] for k, v in fb15k_id2ent.items()},
+        'fb15k237': lambda: {k: v[2] for k, v in fb15k_id2ent.items()},
         'wiki5m_trans': lambda: wiki5m_id2text,
         'wiki5m_ind': lambda: wiki5m_id2text,
     }
