@@ -21,7 +21,7 @@ DATASET_VARS = {
     'WN18RR': {
         'id2ent': {}
     },
-    'fb15k237': {
+    'FB15k237': {
         'id2ent': {},
         'id2desc': {}
     },
@@ -33,13 +33,13 @@ DATASET_VARS = {
 }
 
 wn18rr_id2ent = DATASET_VARS['WN18RR']['id2ent']
-fb15k_id2ent = DATASET_VARS['fb15k237']['id2ent']
-fb15k_id2desc = DATASET_VARS['fb15k237']['id2desc']
+fb15k_id2ent = DATASET_VARS['FB15k237']['id2ent']
+fb15k_id2desc = DATASET_VARS['FB15k237']['id2desc']
 wiki5m_id2rel = DATASET_VARS['WiKi5m']['id2rel']
 wiki5m_id2ent = DATASET_VARS['WiKi5m']['id2ent']
 wiki5m_id2text = DATASET_VARS['WiKi5m']['id2text']
 
-SUPPORTED_TASKS = {'wn18rr', 'fb15k237', 'wiki5m_trans', 'wiki5m_ind'}
+SUPPORTED_TASKS = {'wn18rr', 'FB15k237', 'wiki5m_trans', 'wiki5m_ind'}
 
 
 # ============================================================================
@@ -278,7 +278,7 @@ def _process_line_wn18rr(line: str, id2ent: dict) -> dict:
 
 
 def _process_line_fb15k237(line: str, id2ent: dict) -> dict:
-    return _process_line(line, id2ent, "fb15k237")
+    return _process_line(line, id2ent, "FB15k237")
 
 
 def _process_line_wiki5m(line: str, id2ent: dict) -> dict:
@@ -417,7 +417,7 @@ def dump_all_entities(examples, out_path, id2text: dict):
 def get_entity_mapping(task: str) -> Dict:
     mappings = {
         'wn18rr': lambda: {k: v[2] for k, v in wn18rr_id2ent.items()},
-        'fb15k237': lambda: {k: v[2] for k, v in fb15k_id2ent.items()},
+        'FB15k237': lambda: {k: v[2] for k, v in fb15k_id2ent.items()},
         'wiki5m_trans': lambda: wiki5m_id2text,
         'wiki5m_ind': lambda: wiki5m_id2text,
     }
@@ -451,7 +451,7 @@ def load_and_preprocess_data(args: Any):
 
     TASK_PREPROCESSORS = {
         'wn18rr': preprocess_wn18rr,
-        'fb15k237': preprocess_fb15k237,
+        'FB15k237': preprocess_fb15k237,
         'wiki5m_trans': preprocess_wiki5m,
         'wiki5m_ind': preprocess_wiki5m,
     }
