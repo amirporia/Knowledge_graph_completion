@@ -39,7 +39,7 @@ wiki5m_id2rel = DATASET_VARS['WiKi5m']['id2rel']
 wiki5m_id2ent = DATASET_VARS['WiKi5m']['id2ent']
 wiki5m_id2text = DATASET_VARS['WiKi5m']['id2text']
 
-SUPPORTED_TASKS = {'wn18rr', 'FB15K237', 'wiki5m_trans', 'wiki5m_ind'}
+SUPPORTED_TASKS = {'wn18rr', 'fb15k237', 'wiki5m_trans', 'wiki5m_ind'}
 
 
 # ============================================================================
@@ -278,7 +278,7 @@ def _process_line_wn18rr(line: str, id2ent: dict) -> dict:
 
 
 def _process_line_fb15k237(line: str, id2ent: dict) -> dict:
-    return _process_line(line, id2ent, "FB15K237")
+    return _process_line(line, id2ent, "fb15k237")
 
 
 def _process_line_wiki5m(line: str, id2ent: dict) -> dict:

@@ -42,7 +42,7 @@ wiki5m_id2ent = DATASET_VARS['WiKi5m']['id2ent']
 wiki5m_id2text = DATASET_VARS['WiKi5m']['id2text']
 
 # Constants
-SUPPORTED_TASKS = {'wn18rr', 'FB15K237', 'wiki5m_trans', 'wiki5m_ind'}
+SUPPORTED_TASKS = {'wn18rr', 'fb15k237', 'wiki5m_trans', 'wiki5m_ind'}
 
 
 # ============================================================================
@@ -314,7 +314,7 @@ def _process_line(line: str, id2ent: dict, dataset: str = "wn18rr") -> dict:
     Args:
         line: Tab-separated string with head, relation, tail
         id2ent: Mapping from entity IDs to entity information
-        dataset: Dataset name ("wn18rr", "FB15K237", or "wiki5m")
+        dataset: Dataset name ("wn18rr", "fb15k237", or "wiki5m")
 
     Returns:
         Dictionary with head_id, head, relation, tail_id, tail
@@ -332,7 +332,7 @@ def _process_line(line: str, id2ent: dict, dataset: str = "wn18rr") -> dict:
             'tail_id': tail_id,
             'tail': id2ent.get(tail_id, None)
         }
-    else:  # wn18rr or FB15K237
+    else:  # wn18rr or fb15k237
         _, head, _ = id2ent[head_id]
         _, tail, _ = id2ent[tail_id]
         return {
@@ -350,7 +350,7 @@ def _process_line_wn18rr(line: str, id2ent: dict) -> dict:
 
 
 def _process_line_fb15k237(line: str, id2ent: dict) -> dict:
-    return _process_line(line, id2ent, "FB15K237")
+    return _process_line(line, id2ent, "fb15k237")
 
 
 def _process_line_wiki5m(line: str, id2ent: dict) -> dict:

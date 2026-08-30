@@ -31,7 +31,7 @@ def parse_args():
     # Data settings
     data_group = parser.add_argument_group('Data')
     data_group.add_argument('--task', default=CURRENT_TASK_NAME, type=str,
-                            choices=['wn18rr', 'FB15K237', 'wiki5m_ind', 'wiki5m_trans'],
+                            choices=['wn18rr', 'fb15k237', 'wiki5m_ind', 'wiki5m_trans'],
                             help='Dataset name')
     data_group.add_argument('--train-path', default=None, type=str,
                             help='Path to training data (auto-generated from task if not specified)')
