@@ -7,7 +7,7 @@ from typing import List, Tuple, Dict
 import torch
 import tqdm
 
-from ARPM_KGC.evaluation.predict import ARPMPredictor
+from .predict import ARPMPredictor
 from ..setting.config import args
 from ..setting.logger_config import logger
 from ..utils.dict_hub import get_entity_dict, get_all_triplet_dict
