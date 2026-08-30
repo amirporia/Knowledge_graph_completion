@@ -451,7 +451,7 @@ def load_and_preprocess_data(args: Any):
 
     TASK_PREPROCESSORS = {
         'wn18rr': preprocess_wn18rr,
-        'FB15k237': preprocess_fb15k237,
+        'fb15k237': preprocess_fb15k237,
         'wiki5m_trans': preprocess_wiki5m,
         'wiki5m_ind': preprocess_wiki5m,
     }
