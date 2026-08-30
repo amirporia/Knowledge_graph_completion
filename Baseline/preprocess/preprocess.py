@@ -22,7 +22,7 @@ DATASET_VARS = {
     'WN18RR': {
         'id2ent': {}
     },
-    'FB15k237': {
+    'FB15K237': {
         'id2ent': {},
         'id2desc': {}
     },
@@ -35,14 +35,14 @@ DATASET_VARS = {
 
 # Backward compatibility references
 wn18rr_id2ent = DATASET_VARS['WN18RR']['id2ent']
-fb15k_id2ent = DATASET_VARS['FB15k237']['id2ent']
-fb15k_id2desc = DATASET_VARS['FB15k237']['id2desc']
+fb15k_id2ent = DATASET_VARS['FB15K237']['id2ent']
+fb15k_id2desc = DATASET_VARS['FB15K237']['id2desc']
 wiki5m_id2rel = DATASET_VARS['WiKi5m']['id2rel']
 wiki5m_id2ent = DATASET_VARS['WiKi5m']['id2ent']
 wiki5m_id2text = DATASET_VARS['WiKi5m']['id2text']
 
 # Constants
-SUPPORTED_TASKS = {'wn18rr', 'FB15k237', 'wiki5m_trans', 'wiki5m_ind'}
+SUPPORTED_TASKS = {'wn18rr', 'FB15K237', 'wiki5m_trans', 'wiki5m_ind'}
 
 
 # ============================================================================
@@ -314,7 +314,7 @@ def _process_line(line: str, id2ent: dict, dataset: str = "wn18rr") -> dict:
     Args:
         line: Tab-separated string with head, relation, tail
         id2ent: Mapping from entity IDs to entity information
-        dataset: Dataset name ("wn18rr", "FB15k237", or "wiki5m")
+        dataset: Dataset name ("wn18rr", "FB15K237", or "wiki5m")
 
     Returns:
         Dictionary with head_id, head, relation, tail_id, tail
@@ -332,7 +332,7 @@ def _process_line(line: str, id2ent: dict, dataset: str = "wn18rr") -> dict:
             'tail_id': tail_id,
             'tail': id2ent.get(tail_id, None)
         }
-    else:  # wn18rr or FB15k237
+    else:  # wn18rr or FB15K237
         _, head, _ = id2ent[head_id]
         _, tail, _ = id2ent[tail_id]
         return {
@@ -350,7 +350,7 @@ def _process_line_wn18rr(line: str, id2ent: dict) -> dict:
 
 
 def _process_line_fb15k237(line: str, id2ent: dict) -> dict:
-    return _process_line(line, id2ent, "FB15k237")
+    return _process_line(line, id2ent, "FB15K237")
 
 
 def _process_line_wiki5m(line: str, id2ent: dict) -> dict:
@@ -499,7 +499,7 @@ def get_entity_mapping(task: str) -> Dict:
     """Get the entity to text mapping for the given task."""
     mappings = {
         'wn18rr': lambda: {k: v[2] for k, v in wn18rr_id2ent.items()},
-        'FB15k237': lambda: {k: v[2] for k, v in fb15k_id2ent.items()},
+        'FB15K237': lambda: {k: v[2] for k, v in fb15k_id2ent.items()},
         'wiki5m_trans': lambda: wiki5m_id2text,
         'wiki5m_ind': lambda: wiki5m_id2text,
     }
