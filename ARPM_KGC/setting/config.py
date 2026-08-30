@@ -231,7 +231,7 @@ def parse_args():
 def generate_paths_from_task(arguments):
     """Generate dynamic paths based on task name. Reuses the exact same data
     directory layout so both pipelines can share preprocessed data."""
-    task = arguments.task.upper()
+    task = arguments.task.lower()
 
     if arguments.train_path is None:
         arguments.train_path = str(SCRIPT_DIR / 'data' / task / 'train.txt.json')

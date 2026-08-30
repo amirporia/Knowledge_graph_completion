@@ -119,7 +119,7 @@ def parse_args():
 
 def generate_paths_from_task(arguments):
     """Generate dynamic paths based on task name."""
-    task = arguments.task.upper()  # Convert to uppercase for folder naming
+    task = arguments.task.lower()  # Convert to uppercase for folder naming
 
     # Generate data paths
     if arguments.train_path is None:

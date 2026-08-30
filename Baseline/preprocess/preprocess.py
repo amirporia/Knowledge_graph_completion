@@ -12,14 +12,14 @@ from typing import List, Dict, Any
 # ============================================================================
 
 # Current task name
-CURRENT_TASK_NAME = "WN18RR"
+CURRENT_TASK_NAME = "wn18rr"
 
 # Get the script's directory (works everywhere)
 SCRIPT_DIR = Path(__file__).parent.parent.parent.absolute()
 
 # Dataset global variables (initialized lazily or as empty dicts)
 DATASET_VARS = {
-    'WN18RR': {
+    'wn18rr': {
         'id2ent': {}
     },
     'fb15k237': {
@@ -34,7 +34,7 @@ DATASET_VARS = {
 }
 
 # Backward compatibility references
-wn18rr_id2ent = DATASET_VARS['WN18RR']['id2ent']
+wn18rr_id2ent = DATASET_VARS['wn18rr']['id2ent']
 fb15k_id2ent = DATASET_VARS['fb15k237']['id2ent']
 fb15k_id2desc = DATASET_VARS['fb15k237']['id2desc']
 wiki5m_id2rel = DATASET_VARS['WiKi5m']['id2rel']
