@@ -228,7 +228,7 @@ class Trainer:
 
             if i % self.args.print_freq == 0 and self.args.rank == 0:
                 progress.display(i)
-            if (i + 1) % self.args.eval_every_n_step == 0:
+            if self.args.eval_every_n_step > 0 and (i + 1) % self.args.eval_every_n_step == 0:
                 self._run_eval(epoch=epoch, step=i + 1)
 
         if self.args.rank == 0:

@@ -2,6 +2,7 @@ import torch
 import json
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
+import datetime
 
 from Baseline.setting.config import args
 from Baseline.model.trainer import Trainer
@@ -18,6 +19,7 @@ def main():
         dist.init_process_group(
             backend=args.dist_backend, init_method='env://',
             device_id=torch.device(f'cuda:{args.local_rank}'),
+            timeout=datetime.timedelta(minutes=60),
         )
         logger.info(
             f'Distributed training: rank {args.rank}/{args.world_size} '
