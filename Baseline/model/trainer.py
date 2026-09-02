@@ -339,13 +339,15 @@ class Trainer:
         is still evaluating/saving.
         """
         if self.args.rank == 0:
-            metric_dict = self.eval_epoch(epoch)
-            is_best = self._check_best_metric(metric_dict)
-
-            if is_best:
-                self.best_metric = metric_dict
-
-            self._save_checkpoint(epoch, step, is_best)
+            # TODO: just for fb15k237 dataset
+            # metric_dict = self.eval_epoch(epoch)
+            # is_best = self._check_best_metric(metric_dict)
+            #
+            # if is_best:
+            #     self.best_metric = metric_dict
+            #
+            # self._save_checkpoint(epoch, step, is_best)
+            self._save_checkpoint(epoch, step, False)
 
         if self.args.distributed:
             dist.barrier()
