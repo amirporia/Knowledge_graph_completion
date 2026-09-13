@@ -22,7 +22,7 @@ python3 -u main.py \
 --train-path "${DATA_DIR}/train.txt.json" \
 --valid-path "${DATA_DIR}/valid.txt.json" \
 --task ${TASK} \
---batch-size 16 \
+--batch-size 8 \
 --print-freq 50 \
 --num-negatives 5 \
 --margin 1.0 \

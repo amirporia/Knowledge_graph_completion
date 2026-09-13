@@ -88,7 +88,7 @@ class BertPredictor:
         data_loader = torch.utils.data.DataLoader(
             Dataset(path='', examples=examples, task=args.task),
             num_workers=2,
-            batch_size=max(args.batch_size, 1024),
+            batch_size=args.batch_size,
             collate_fn=collate,
             shuffle=False)
 

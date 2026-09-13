@@ -63,7 +63,7 @@ class _LiveModelAdapter:
         data_loader = torch.utils.data.DataLoader(
             Dataset(path='', examples=examples, task=self.task),
             num_workers=2,
-            batch_size=max(self.batch_size, 512),
+            batch_size=self.batch_size,
             collate_fn=collate,
             shuffle=False)
 
