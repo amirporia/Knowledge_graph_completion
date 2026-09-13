@@ -179,9 +179,35 @@ forward+backward MRR on `valid_path`; that MRR now drives early stopping
 (default 1 — raise it on wiki5m, expensive full-corpus MRR there),
 `--mrr-eval-batch-size`.
 
-Train/eval commands are identical to plain `SimKGC/` (see §3 below — StAR's and
-HaSa's train/eval scripts are literal copies of SimKGC's), just run from
-`SimKGC/` instead of `StAR/`/`HaSa/`.
+### Train — WN18RR / FB15k-237
+
+```bash
+cd SimKGC
+./scripts/train_wn.sh          # bert-base-uncased, lr 5e-5, batch 1024, 50 epochs
+./scripts/train_fb.sh          # bert-base-uncased, lr 1e-5, batch 1024, 10 epochs
+```
+
+Checkpoints (best by full validation MRR, with early stopping once the patch is
+applied) land in `checkpoint/WN18RR_<timestamp>/model_best.mdl` and
+`checkpoint/FB15k237_<timestamp>/model_best.mdl`.
+
+### Evaluate on the test set
+
+```bash
+cd SimKGC
+./scripts/eval.sh checkpoint/WN18RR_<timestamp>/model_best.mdl   WN18RR
+./scripts/eval.sh checkpoint/FB15k237_<timestamp>/model_best.mdl FB15k237
+```
+
+`eval.sh` sets `--is-test` and points `--valid-path` at `test.txt.json`, so this
+runs the filtered forward+backward protocol on the **test** split and writes
+`metrics_test.txt.json_model_best.mdl.json` plus per-direction predictions
+(`eval_test.txt.json_{forward,backward}_model_best.mdl.json`) next to the
+checkpoint. `WN18RR` uses `--rerank-n-hop 5` (sparser graph); `FB15k237` and
+`wiki5m_ind` use `--neighbor-weight 0.0` / defaults as set inside the script.
+
+`StAR/` and `HaSa/` (§3, §4) reuse this exact `eval.sh` unchanged, so the same
+command shape applies there too.
 
 ### Bug fixed in all three copies (StAR / HaSa / SimKGC_patch)
 
