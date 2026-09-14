@@ -33,7 +33,7 @@ parser.add_argument('--t', default=0.05, type=float,
                     help='temperature parameter')
 parser.add_argument('--use-link-graph', action='store_true',
                     help='use neighbors from link graph as context')
-parser.add_argument('--eval-every-n-step', default=10000, type=int,
+parser.add_argument('--eval-every-n-step', default=0, type=int,
                     help='evaluate every n steps')
 parser.add_argument('--pre-batch', default=0, type=int,
                     help='number of pre-batch used for negatives')

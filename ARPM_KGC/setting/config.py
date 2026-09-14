@@ -63,7 +63,7 @@ def parse_args():
                             help='Path to save model checkpoints (auto-generated from task if not specified)')
     mgmt_group.add_argument('--max-to-keep', default=4, type=int,
                             help='Max number of checkpoints to keep')
-    mgmt_group.add_argument('--eval-every-n-step', default=10000, type=int,
+    mgmt_group.add_argument('--eval-every-n-step', default=0, type=int,
                             help='Evaluate every n steps')
     mgmt_group.add_argument('--eval-model-path', default=None, type=str,
                             help='Path to model for evaluation (auto-generated from task if not specified)')

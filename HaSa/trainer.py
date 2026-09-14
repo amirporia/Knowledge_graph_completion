@@ -374,7 +374,7 @@ class Trainer:
 
             if i % self.args.print_freq == 0:
                 progress.display(i)
-            if (i + 1) % self.args.eval_every_n_step == 0:
+            if self.args.eval_every_n_step > 0 and (i + 1) % self.args.eval_every_n_step == 0:
                 self._save_periodic_checkpoint(epoch=epoch, step=i + 1)
         logger.info('Learning rate: {}'.format(self.scheduler.get_last_lr()[0]))
 
