@@ -26,7 +26,7 @@ python3 -u main.py \
 --train-path "${DATA_DIR}/train.txt.json" \
 --valid-path "${DATA_DIR}/valid.txt.json" \
 --task ${TASK} \
---batch-size 256 \
+--batch-size 8 \
 --print-freq 20 \
 --tau 2e-5 \
 --num-false-neg-samples 4 \
