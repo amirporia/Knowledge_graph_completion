@@ -52,7 +52,7 @@ parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers')
 parser.add_argument('--epochs', default=20, type=int, metavar='N',
                     help='number of total epochs to run')
-parser.add_argument('-b', '--batch-size', default=32, type=int,
+parser.add_argument('-b', '--batch-size', default=8, type=int,
                     metavar='N',
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
@@ -70,7 +70,7 @@ parser.add_argument('--seed', default=None, type=int,
                     help='seed for initializing training. ')
 
 # only used for evaluation
-parser.add_argument('--is-test', default=True, action='store_true',
+parser.add_argument('--is-test', default=False, action='store_true',
                     help='is in test mode or not')
 parser.add_argument('--rerank-n-hop', default=2, type=int,
                     help='use n-hops node for re-ranking entities, only used during evaluation')
@@ -78,6 +78,17 @@ parser.add_argument('--neighbor-weight', default=0.05, type=float,
                     help='weight for re-ranking entities')
 parser.add_argument('--eval-model-path', default='WN18RR/checkpoint_runtime/model_best.mdl', type=str, metavar='N',
                     help='path to model, only used for evaluation')
+
+# --- NEW: early stopping / MRR-based best-model selection -----------------------
+parser.add_argument('--early-stop-patience', default=5, type=int,
+                    help='stop training after this many full-MRR evals with no improvement')
+parser.add_argument('--full-eval-every-n-epoch', default=1, type=int,
+                    help='run the expensive full-corpus filtered-MRR eval (used for '
+                         'early stopping / best-checkpoint selection) every N epochs. '
+                         'Increase this on large graphs like wiki5m to control cost.')
+parser.add_argument('--mrr-eval-batch-size', default=256, type=int,
+                    help='batch size used only for the full-corpus MRR eval')
+# ----------------------------------------------------------------------------------
 
 args = parser.parse_args()
 
