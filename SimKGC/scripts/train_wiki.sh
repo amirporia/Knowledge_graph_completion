@@ -5,18 +5,20 @@ set -e
 
 TASK="wiki5m_ind"
 if [[ $# -ge 1 && ! "$1" == "--"* ]]; then
-    TASK=$1
+    TASK=$(echo "$1" | tr '[:upper:]' '[:lower:]')
     shift
 fi
 
 DIR="$( cd "$( dirname "$0" )" && cd .. && pwd )"
+REPO_ROOT="$( cd "$DIR/.." && pwd )"
+cd "$DIR"
 echo "working directory: ${DIR}"
 
 if [ -z "$OUTPUT_DIR" ]; then
   OUTPUT_DIR="${DIR}/checkpoint/${TASK}_$(date +%F-%H%M.%S)"
 fi
 if [ -z "$DATA_DIR" ]; then
-  DATA_DIR="${DIR}/data/${TASK}"
+  DATA_DIR="${REPO_ROOT}/data/${TASK}"
 fi
 
 python3 -u main.py \

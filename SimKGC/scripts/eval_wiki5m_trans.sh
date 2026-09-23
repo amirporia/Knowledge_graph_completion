@@ -6,9 +6,12 @@ set -e
 model_path="bert"
 task="wiki5m_trans"
 DIR="$( cd "$( dirname "$0" )" && cd .. && pwd )"
+REPO_ROOT="$( cd "$DIR/.." && pwd )"
+cd "$DIR"
 echo "working directory: ${DIR}"
 if [ -z "$DATA_DIR" ]; then
-  DATA_DIR="${DIR}/data/${task}"
+  # Shared with HaSa, StAR and ARPM_KGC
+  DATA_DIR="${REPO_ROOT}/data/${task}"
 fi
 
 if [[ $# -ge 1 && ! "$1" == "--"* ]]; then

@@ -4,19 +4,29 @@ import torch
 import argparse
 import warnings
 
+from pathlib import Path
+
 import torch.backends.cudnn as cudnn
 
-parser = argparse.ArgumentParser(description='SimKGC arguments')
+# Repository root shared by every pipeline (ARPM_KGC, HaSa, SimKGC, StAR): this
+# file lives at <repo_root>/StAR/config.py, so its parent's parent is
+# <repo_root>. All four pipelines read/write the SAME preprocessed data under
+# <repo_root>/data/<task>/ (e.g. F:\KGC\Knowledge_graph_completion\data\wn18rr)
+# -- there is no separate StAR/data copy.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+PIPELINE_DIR = Path(__file__).resolve().parent
+
+parser = argparse.ArgumentParser(description='StAR arguments')
 parser.add_argument('--pretrained-model', default='bert-base-uncased', type=str, metavar='N',
                     help='path to pretrained model')
 parser.add_argument('--task', default='wn18rr', type=str, metavar='N',
                     help='dataset name')
-parser.add_argument('--train-path', default='WN18RR/train.txt.json', type=str, metavar='N',
-                    help='path to training data')
-parser.add_argument('--valid-path', default='WN18RR/test.txt.json', type=str, metavar='N',
-                    help='path to valid data')
-parser.add_argument('--model-dir', default='WN18RR/checkpoint_runtime/', type=str, metavar='N',
-                    help='path to model dir')
+parser.add_argument('--train-path', default=None, type=str, metavar='N',
+                    help='path to training data (default: <repo_root>/data/<task>/train.txt.json)')
+parser.add_argument('--valid-path', default=None, type=str, metavar='N',
+                    help='path to valid data (default: <repo_root>/data/<task>/valid.txt.json)')
+parser.add_argument('--model-dir', default=None, type=str, metavar='N',
+                    help='path to model dir (default: <this_pipeline>/checkpoint_runtime/<task>)')
 parser.add_argument('--warmup', default=400, type=int, metavar='N',
                     help='warmup steps')
 parser.add_argument('--max-to-keep', default=5, type=int, metavar='N',
@@ -45,8 +55,16 @@ parser.add_argument('--finetune-t', action='store_true',
                     help='make temperature as a trainable parameter or not')
 parser.add_argument('--max-num-tokens', default=50, type=int,
                     help='maximum number of tokens')
-parser.add_argument('--use-self-negative', default=True, action='store_true',
+parser.add_argument('--use-self-negative', dest='use_self_negative', action='store_true', default=True,
                     help='use head entity as negative')
+parser.add_argument('--no-self-negative', dest='use_self_negative', action='store_false',
+                    help='BUGFIX: disable head-entity-as-negative. The old --use-self-negative '
+                         'flag was declared as action=\'store_true\' with default=True, which '
+                         'means it could never actually be turned off from the command line '
+                         '(passing it or not passing it both leave it True) -- this flag is '
+                         'the fix, and --use-self-negative keeps working exactly as before. '
+                         '(Not actually read anywhere in StAR\'s own loss -- kept only for '
+                         'CLI/config compatibility with SimKGC/HaSa.)')
 
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers')
@@ -76,8 +94,8 @@ parser.add_argument('--rerank-n-hop', default=2, type=int,
                     help='use n-hops node for re-ranking entities, only used during evaluation')
 parser.add_argument('--neighbor-weight', default=0.05, type=float,
                     help='weight for re-ranking entities')
-parser.add_argument('--eval-model-path', default='WN18RR/checkpoint_runtime/model_best.mdl', type=str, metavar='N',
-                    help='path to model, only used for evaluation')
+parser.add_argument('--eval-model-path', default=None, type=str, metavar='N',
+                    help='path to model, only used for evaluation (default: <model-dir>/model_best.mdl)')
 
 # --- StAR-specific (Wang et al. 2021, WWW'21) — matches paper's §3.1-3.3 -------
 # u = Pool(Enc([h;r])), v = Pool(Enc([t])) with a *tied* (Siamese) encoder (§3.1).
@@ -94,20 +112,9 @@ parser.add_argument('--margin', default=1.0, type=float,
 parser.add_argument('--structure-loss-weight', default=1.0, type=float,
                     help='gamma in Eq. 14: weight of the spatial structure-learning loss L^d '
                          'relative to the classification loss L^c')
-# Note: ranking at inference uses s^d (= -||u-v||_2), not s^c (Eq. 10) as in the paper's
-# default. Since u, v are L2-normalized, ranking by s^d is *rank-equivalent* to ranking by
-# the u.v dot product (||u-v||^2 = 2 - 2*u.v for unit vectors), which is what the shared,
-# unmodified evaluate.py/compute_metrics already computes. The paper's own ablation (Table 7)
-# shows s^d alone is close to the full s^c-based model (Hits@10 .701 vs .709, MRR .406 vs
-# .401 — s^d is actually slightly *better* on MRR), so this keeps the evaluation pipeline
-# identical across every baseline in this repo at a negligible-to-nil accuracy cost, and avoids
-# having to re-run the O(|E|) interaction MLP over the full candidate set at eval time. The
-# self-adaptive RotatE ensemble (§3.4) is not implemented — flag if you want that added, it
-# needs a trained RotatE checkpoint (see Baselines/embedding_models/rotate.py) plugged in as
-# a second scorer.
 # ----------------------------------------------------------------------------------
 
-# --- NEW: early stopping / MRR-based best-model selection -----------------------
+# --- early stopping / MRR-based best-model selection -----------------------------
 parser.add_argument('--early-stop-patience', default=5, type=int,
                     help='stop training after this many full-MRR evals with no improvement')
 parser.add_argument('--full-eval-every-n-epoch', default=1, type=int,
@@ -118,18 +125,54 @@ parser.add_argument('--mrr-eval-batch-size', default=256, type=int,
                     help='batch size used only for the full-corpus MRR eval')
 # ----------------------------------------------------------------------------------
 
+# --- NEW: resume training ---------------------------------------------------------
+parser.add_argument('--resume', action='store_true',
+                    help='Resume training from a checkpoint (model, optimizer, scheduler, '
+                         'AMP scaler, epoch, best-metric and early-stopping state)')
+parser.add_argument('--resume-path', default=None, type=str,
+                    help='Checkpoint to resume from (default: <model-dir>/model_last.mdl)')
+# ----------------------------------------------------------------------------------
+
 args = parser.parse_args()
 
-assert not args.train_path or os.path.exists(args.train_path)
+# ------------------------------------------------------------------------------
+# Resolve the shared data directory. HaSa, SimKGC, StAR and ARPM_KGC all read the
+# SAME preprocessed files -- there is one `data/` folder at the repo root
+# (e.g. F:\KGC\Knowledge_graph_completion\data), laid out as data/<task>/{train,
+# valid,test}.txt.json + entities.json, with <task> lower-cased (wn18rr,
+# fb15k237, wiki5m_trans, wiki5m_ind) to match ARPM_KGC/Baselines' convention.
+# --train-path/--valid-path only fall back to this shared location if not given
+# explicitly (scripts/*.sh normally pass them explicitly, and have been fixed to
+# point at this same shared folder instead of a StAR-local data/ copy).
+# ------------------------------------------------------------------------------
+_task_lower = args.task.lower()
+if args.train_path is None:
+    args.train_path = str(REPO_ROOT / 'data' / _task_lower / 'train.txt.json')
+if args.valid_path is None:
+    args.valid_path = str(REPO_ROOT / 'data' / _task_lower / 'valid.txt.json')
+
+assert not args.train_path or os.path.exists(args.train_path), \
+    'Training data not found: {}'.format(args.train_path)
 assert args.pooling in ['cls', 'mean', 'max']
 assert args.task.lower() in ['wn18rr', 'fb15k237', 'wiki5m_ind', 'wiki5m_trans']
 assert args.lr_scheduler in ['linear', 'cosine']
+
+if args.model_dir is None:
+    args.model_dir = str(PIPELINE_DIR / 'checkpoint_runtime' / _task_lower)
+if args.eval_model_path is None:
+    args.eval_model_path = str(Path(args.model_dir) / 'model_best.mdl')
 
 if args.model_dir:
     os.makedirs(args.model_dir, exist_ok=True)
 else:
     assert os.path.exists(args.eval_model_path), 'One of args.model_dir and args.eval_model_path should be valid path'
     args.model_dir = os.path.dirname(args.eval_model_path)
+
+if args.resume:
+    if args.resume_path is None:
+        args.resume_path = os.path.join(args.model_dir, 'model_last.mdl')
+    if not os.path.exists(args.resume_path):
+        raise FileNotFoundError('Resume checkpoint not found: {}'.format(args.resume_path))
 
 if args.seed is not None:
     random.seed(args.seed)

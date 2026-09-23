@@ -111,8 +111,21 @@ class Trainer:
         logger.info(self.model)
         self._setup_training()
 
-        # define loss function (criterion) and optimizer
-        self.criterion = nn.CrossEntropyLoss().cuda()
+        # AMP scaler now lives on the trainer for the whole run (previously it
+        # was only created inside train_loop()) so it can be saved to / restored
+        # from a checkpoint -- needed for --resume to reproduce the exact
+        # training state, not just the model weights.
+        self.scaler = torch.cuda.amp.GradScaler() if self.args.use_amp else None
+        self.start_epoch = 0
+
+        # define loss function (criterion) and optimizer.
+        # BUGFIX: this was previously `nn.CrossEntropyLoss().cuda()` -- an
+        # *unconditional* CUDA call that crashes with
+        # "AssertionError: Torch not compiled with CUDA enabled" / "No CUDA
+        # GPUs are available" on any CPU-only machine, even though
+        # `_setup_training()` right above it already picks CPU as a fallback.
+        # `.to(self.device)` matches that fallback.
+        self.criterion = nn.CrossEntropyLoss().to(self.device)
 
         self.optimizer = AdamW([p for p in self.model.parameters() if p.requires_grad],
                                lr=args.lr,
@@ -146,17 +159,45 @@ class Trainer:
                 num_workers=args.workers,
                 pin_memory=True)
 
-        # --- NEW: MRR-based early stopping / best-model selection ---------------
+        # --- MRR-based early stopping / best-model selection ---------------------
         self.early_stopping = EarlyStopping(patience=getattr(args, 'early_stop_patience', 5))
         self.full_eval_every_n_epoch = getattr(args, 'full_eval_every_n_epoch', 1)
         self.mrr_eval_batch_size = getattr(args, 'mrr_eval_batch_size', 256)
         # --------------------------------------------------------------------------
 
-    def train_loop(self):
-        if self.args.use_amp:
-            self.scaler = torch.cuda.amp.GradScaler()
+        self._maybe_resume()
 
-        for epoch in range(self.args.epochs):
+    def _maybe_resume(self):
+        """Restore model/optimizer/scheduler/AMP-scaler state, the best-metric seen
+        so far, and the early-stopping counter from `--resume-path` (default
+        <model-dir>/model_last.mdl), and continue training at the following epoch.
+        A no-op unless `--resume` was passed.
+        """
+        if not self.args.resume:
+            return
+
+        checkpoint = torch.load(self.args.resume_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint['state_dict'])
+
+        if checkpoint.get('optimizer') is not None:
+            self.optimizer.load_state_dict(checkpoint['optimizer'])
+        if checkpoint.get('scheduler') is not None:
+            self.scheduler.load_state_dict(checkpoint['scheduler'])
+        if self.args.use_amp and self.scaler is not None and checkpoint.get('scaler') is not None:
+            self.scaler.load_state_dict(checkpoint['scaler'])
+
+        self.best_metric = checkpoint.get('best_metric')
+        early_stopping_state = checkpoint.get('early_stopping') or {}
+        self.early_stopping.best = early_stopping_state.get('best')
+        self.early_stopping.counter = early_stopping_state.get('counter', 0)
+
+        self.start_epoch = checkpoint.get('epoch', -1) + 1
+        logger.info(
+            'Resumed from {} (checkpoint epoch {}, resuming at epoch {})'.format(
+                self.args.resume_path, checkpoint.get('epoch'), self.start_epoch))
+
+    def train_loop(self):
+        for epoch in range(self.start_epoch, self.args.epochs):
             # train for one epoch
             self.train_epoch(epoch)
             stop = self._run_epoch_end_eval(epoch)
@@ -231,28 +272,55 @@ class Trainer:
                 epoch, json.dumps(mrr_metrics), self.early_stopping.best))
 
         filename = '{}/checkpoint_epoch{}.mdl'.format(self.args.model_dir, epoch)
-        save_checkpoint({
+        model_state = self.model.state_dict()
+        # Full state -> checkpoint_epoch{N}.mdl and model_last.mdl: everything
+        # needed to resume training exactly (--resume).
+        full_state = {
             'epoch': epoch,
             'args': self.args.__dict__,
-            'state_dict': self.model.state_dict(),
+            'state_dict': model_state,
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.scheduler.state_dict(),
+            'scaler': self.scaler.state_dict() if (self.args.use_amp and self.scaler is not None) else None,
+            'best_metric': self.best_metric,
+            'early_stopping': {
+                'best': self.early_stopping.best,
+                'counter': self.early_stopping.counter,
+            },
             'light_metrics': light_metric_dict,
             'mrr_metrics': mrr_metrics,
-        }, is_best=is_best, filename=filename)
+        }
+        # Light state -> model_best.mdl only: all predict.py/evaluate.py ever read.
+        eval_state = {
+            'epoch': epoch,
+            'args': self.args.__dict__,
+            'state_dict': model_state,
+        }
+        save_checkpoint(full_state, is_best=is_best, filename=filename, eval_state=eval_state)
         delete_old_ckt(path_pattern='{}/checkpoint_*.mdl'.format(self.args.model_dir),
                        keep=self.args.max_to_keep)
 
         return run_full_eval and self.early_stopping.should_stop
 
     def _save_periodic_checkpoint(self, epoch, step):
-        """Mid-epoch checkpoint (from --eval-every-n-step). Kept cheap on purpose: no
-        full-corpus MRR eval here, only best-checkpoint/early-stopping happens at
-        epoch boundaries via `_run_epoch_end_eval`.
+        """Mid-epoch checkpoint (from --eval-every-n-step). Records `epoch - 1`
+        (the last fully-completed epoch) as this checkpoint's resume point,
+        since the current epoch hasn't finished -- so --resume re-runs the
+        interrupted epoch in full rather than silently skipping it.
         """
         filename = '{}/checkpoint_{}_{}.mdl'.format(self.args.model_dir, epoch, step)
         save_checkpoint({
-            'epoch': epoch,
+            'epoch': epoch - 1,
             'args': self.args.__dict__,
             'state_dict': self.model.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.scheduler.state_dict(),
+            'scaler': self.scaler.state_dict() if (self.args.use_amp and self.scaler is not None) else None,
+            'best_metric': self.best_metric,
+            'early_stopping': {
+                'best': self.early_stopping.best,
+                'counter': self.early_stopping.counter,
+            },
         }, is_best=False, filename=filename)
         delete_old_ckt(path_pattern='{}/checkpoint_*.mdl'.format(self.args.model_dir),
                        keep=self.args.max_to_keep)
@@ -355,14 +423,8 @@ class Trainer:
         logger.info('Learning rate: {}'.format(self.scheduler.get_last_lr()[0]))
 
     def _setup_training(self):
-        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-        self.model.to(device)
-        # if torch.cuda.device_count() > 1:
-        #     self.model = torch.nn.DataParallel(self.model).cuda()
-        # elif torch.cuda.is_available():
-        #     self.model.cuda()
-        # else:
-        #     logger.info('No gpu will be used')
+        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        self.model.to(self.device)
 
     def _create_lr_scheduler(self, num_training_steps):
         if self.args.lr_scheduler == 'linear':
@@ -374,4 +436,10 @@ class Trainer:
                                                    num_warmup_steps=self.args.warmup,
                                                    num_training_steps=num_training_steps)
         else:
-            assert False, 'Unknown lr scheduler: {}'.format(self.args.scheduler)
+            # BUGFIX: was `self.args.scheduler`, which doesn't exist -- the
+            # field is `self.args.lr_scheduler` (see config.py). Unreachable
+            # today since config.py already asserts lr_scheduler is 'linear'
+            # or 'cosine' before Trainer is constructed, but would have raised
+            # an unrelated AttributeError instead of this assertion message if
+            # that guard were ever removed or this method called directly.
+            assert False, 'Unknown lr scheduler: {}'.format(self.args.lr_scheduler)

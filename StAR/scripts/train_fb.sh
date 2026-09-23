@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
 # Hyperparameters follow the paper's Appendix A / Table 11 (RoBERTa init, FB15k-237).
+#
+# Resuming: append --resume (and, if not resuming from the default
+# <model-dir>/model_last.mdl, --resume-path /path/to/checkpoint.mdl) to continue
+# training from the last saved epoch.
 set -x
 set -e
 
-TASK="FB15k237"
+TASK="fb15k237"
 
 DIR="$( cd "$( dirname "$0" )" && cd .. && pwd )"
+REPO_ROOT="$( cd "$DIR/.." && pwd )"
+cd "$DIR"
 echo "working directory: ${DIR}"
 
 if [ -z "$OUTPUT_DIR" ]; then
   OUTPUT_DIR="${DIR}/checkpoint/${TASK}_$(date +%F-%H%M.%S)"
 fi
 if [ -z "$DATA_DIR" ]; then
-  DATA_DIR="${DIR}/data/${TASK}"
+  DATA_DIR="${REPO_ROOT}/data/${TASK}"
 fi
 
 python3 -u main.py \

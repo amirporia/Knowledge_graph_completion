@@ -1,23 +1,28 @@
 #!/usr/bin/env bash
-
 set -x
 set -e
 
 model_path="bert"
-task="WN18RR"
+task="wn18rr"
 if [[ $# -ge 1 && ! "$1" == "--"* ]]; then
     model_path=$1
     shift
 fi
 if [[ $# -ge 1 && ! "$1" == "--"* ]]; then
-    task=$1
+    task=$(echo "$1" | tr '[:upper:]' '[:lower:]')
     shift
 fi
 
 DIR="$( cd "$( dirname "$0" )" && cd .. && pwd )"
+REPO_ROOT="$( cd "$DIR/.." && pwd )"
+cd "$DIR"
 echo "working directory: ${DIR}"
 if [ -z "$DATA_DIR" ]; then
-  DATA_DIR="${DIR}/data/${task}"
+  # Shared with the other pipelines and ARPM_KGC (previously this pointed at
+  # "${DIR}/data/${task}", a pipeline-local copy, and compared `task` against
+  # the mixed-case literal "WN18RR" below, which never matched once `task`
+  # comes from user input in whatever case they typed it).
+  DATA_DIR="${REPO_ROOT}/data/${task}"
 fi
 
 test_path="${DATA_DIR}/test.txt.json"
@@ -28,7 +33,7 @@ fi
 
 neighbor_weight=0.05
 rerank_n_hop=2
-if [ "${task}" = "WN18RR" ]; then
+if [ "${task}" = "wn18rr" ]; then
 # WordNet is a sparse graph, use more neighbors for re-rank
   rerank_n_hop=5
 fi
