@@ -8,7 +8,7 @@ import torch.utils.data
 
 from typing import Dict, List, Optional
 from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
-from transformers import AdamW
+from torch.optim import AdamW
 
 from doc import Dataset, collate, Example, load_data
 from utils import AverageMeter, ProgressMeter
