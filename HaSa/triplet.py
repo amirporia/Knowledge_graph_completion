@@ -118,6 +118,18 @@ class LinkGraph:
                         seen_eids.add(node)
                         if len(seen_eids) > max_nodes:
                             return set()
+        # BUGFIX (Bug 3): `entity_id` is seeded into `seen_eids` above only so the
+        # BFS doesn't re-queue/revisit it as if it were its own neighbour; it was
+        # never meant to be part of the *returned* set. Eq. 9 defines alpha(t|e_hr)
+        # over N1(h) union N2(h) only -- nodes at shortest-path distance exactly 1
+        # or 2 from h -- and explicitly excludes d(h,h)=0. Leaving `entity_id` in
+        # the returned set let the head entity itself be sampled as a "false
+        # negative tail" candidate for its own query (trainer.py::
+        # _sample_false_negative_candidates) and slightly inflated the effective
+        # |N1(h)|+|N2(h)| normalizer used there and in rerank.py. Drop it here,
+        # after the BFS is done, rather than never adding it (that would let the
+        # BFS re-visit/re-queue the head as if it were a fresh neighbour).
+        seen_eids.discard(entity_id)
         return set([entity_dict.entity_to_idx(e_id) for e_id in seen_eids])
 
 

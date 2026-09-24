@@ -305,6 +305,11 @@ class Trainer:
         neighbourhood. Candidates are de-duplicated and encoded once per batch; each
         row then samples `num_false_neg_samples` positions from its own neighbourhood
         (with replacement if the neighbourhood is smaller than that).
+
+        NOTE: as of the Bug 3 fix in triplet.py::LinkGraph.get_n_hop_entity_indices,
+        the returned neighbourhood no longer includes the head entity itself, so rows
+        drawn here are strictly N1(h) union N2(h), matching Eq. 9's definition of
+        alpha(t|e_hr).
         """
         M = self.num_false_neg_samples
         rows = [
@@ -375,11 +380,32 @@ class Trainer:
             cand_vec = get_model_obj(self.model).encode_text(
                 candidates['tail_token_ids'], candidates['tail_mask'], candidates['tail_token_type_ids'])
             cand_sim = torch.clamp(e_hr.mm(cand_vec.t()) * inv_t, min=-30.0, max=30.0)
-            cand_exp = torch.exp(cand_sim)                                # (B, num_unique_candidates)
+            # BUGFIX (Bug 2): Eq. 13 is a *self-normalized importance-sampling*
+            # estimate of E_{t~p-(t|e_hr,fact)}[exp(e_hr.e_t)], not a plain Monte
+            # Carlo mean. Candidates s_m are drawn from the *proposal*
+            # alpha(t|e_hr) (uniform over the <=2-hop neighbourhood), not from the
+            # true target p-(t|e_hr, l=fact); since Eq. 8 gives
+            # p-(t|e_hr,fact) proportional to exp(e_hr.e_t) * alpha(t|e_hr), the
+            # importance weight for each Monte Carlo sample is proportional to
+            # exp(e_hr.e_t). That is why Eq. 13's numerator uses the *squared*
+            # weight exp(2 e_hr.e_t) and the denominator is the *sum* of the raw
+            # weights exp(e_hr.e_t) (self-normalizing, since p- is only known up to
+            # a constant) rather than a division by the sample count M:
+            #     FalseNeg = sum_m exp(2 e_hr.e_tm) / sum_m exp(e_hr.e_tm)
+            # The previous code computed a plain unweighted mean
+            # `cand_exp[i].index_select(0, idx).mean()`, i.e. an estimate of
+            # E_alpha[exp(e_hr.e_t)] with no importance-weighting correction at
+            # all -- silently changing what NegHasa computes rather than crashing,
+            # since this term is exactly what distinguishes HaSa from Hard InfoNCE.
+            cand_exp = torch.exp(cand_sim)                                # (B, num_unique_candidates), exp(e_hr.e_t)
+            cand_exp_sq = torch.exp(2.0 * cand_sim)                       # exp(2 e_hr.e_t), Eq. 13 numerator term
             for i, positions in enumerate(candidates['row_samples']):
                 if positions:
                     idx = torch.tensor(positions, device=device, dtype=torch.long)
-                    false_neg_mean[i] = cand_exp[i].index_select(0, idx).mean()
+                    weights = cand_exp[i].index_select(0, idx)            # (M,) unnormalized importance weights
+                    numerator = cand_exp_sq[i].index_select(0, idx).sum()
+                    denominator = weights.sum().clamp_min(1e-12)
+                    false_neg_mean[i] = numerator / denominator
 
         # NegHasa = K * ( Neg/(1-tau) - tau*FalseNeg ) (Algorithm 1). Clamped to stay
         # positive -- a numerical safety net not spelled out in the paper, needed

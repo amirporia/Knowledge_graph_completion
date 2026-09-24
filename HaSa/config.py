@@ -57,6 +57,17 @@ parser.add_argument('--pre-batch-weight', default=0.5, type=float,
                     help='the weight for logits from pre-batch negatives')
 parser.add_argument('--additive-margin', default=0.0, type=float, metavar='N',
                     help='additive margin for InfoNCE loss function')
+# BUGFIX (Bug 1): models.py::HaSaBertModel.__init__ has always read `args.t`
+#     self.log_inv_t = nn.Parameter(torch.tensor(1.0 / args.t).log(), requires_grad=True)
+# but no `--t` argument was ever declared in this parser, so build_model(args) --
+# called immediately in Trainer.__init__ and in BertPredictor.load() -- crashed
+# on the very first run with:
+#     AttributeError: 'Namespace' object has no attribute 't'
+# before any training or evaluation could happen. 0.05 matches the default
+# temperature SimKGC/StAR use elsewhere in this repo.
+parser.add_argument('--t', default=0.05, type=float, metavar='N',
+                    help='initial temperature used to initialize the learnable log_inv_t '
+                         '(see models.py::HaSaBertModel.log_inv_t); inv_t = 1/t at init')
 parser.add_argument('--finetune-t', action='store_true',
                     help='make temperature as a trainable parameter or not')
 parser.add_argument('--max-num-tokens', default=50, type=int,
