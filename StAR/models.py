@@ -22,6 +22,12 @@ Deliberately not implemented (documented in config.py and the top-level README):
     dot-product ranking for L2-normalized embeddings, and is very close in the
     paper's own ablation (Table 7: Hits@10 .701 vs .709 full model; MRR .406 vs
     .401 for s^d alone).
+
+BUGFIX (this file): --pooling was declared in config.py with choices
+['cls', 'mean', 'max'] but _encode() hardcoded CLS pooling regardless of the
+flag's value, so passing --pooling mean/max silently had no effect. _pool()
+now actually dispatches on args.pooling; default behavior (args.pooling='cls',
+matching the paper) is unchanged.
 """
 
 from abc import ABC
@@ -71,11 +77,31 @@ class StarBertModel(nn.Module, ABC):
             dropout=args.dropout,
         )
 
+    def _pool(self, last_hidden_state: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Applies args.pooling ('cls' / 'mean' / 'max') to the encoder's
+        token-level outputs. `mask` is the attention mask (1 = valid position,
+        0 = padding), used to exclude padded positions from mean/max pooling.
+        """
+        if self.args.pooling == 'cls':
+            return last_hidden_state[:, 0, :]
+
+        mask_expanded = mask.unsqueeze(-1).expand(last_hidden_state.size()).to(last_hidden_state.dtype)
+        if self.args.pooling == 'mean':
+            sum_embeddings = torch.sum(last_hidden_state * mask_expanded, dim=1)
+            sum_mask = mask_expanded.sum(dim=1).clamp(min=1e-9)
+            return sum_embeddings / sum_mask
+        elif self.args.pooling == 'max':
+            # Push padded positions to a large negative value so they never win the max.
+            masked = last_hidden_state.masked_fill(mask_expanded == 0, -1e4)
+            return torch.max(masked, dim=1)[0]
+        else:
+            raise ValueError('Unknown pooling mode: {}'.format(self.args.pooling))
+
     def _encode(self, encoder, token_ids, mask, token_type_ids) -> torch.Tensor:
         outputs = encoder(input_ids=token_ids, attention_mask=mask,
                           token_type_ids=token_type_ids, return_dict=True)
-        cls_output = outputs.last_hidden_state[:, 0, :]
-        return nn.functional.normalize(cls_output, dim=1)
+        pooled_output = self._pool(outputs.last_hidden_state, mask)
+        return nn.functional.normalize(pooled_output, dim=1)
 
     def encode(self, hr_token_ids, hr_mask, hr_token_type_ids,
                tail_token_ids, tail_mask, tail_token_type_ids):
