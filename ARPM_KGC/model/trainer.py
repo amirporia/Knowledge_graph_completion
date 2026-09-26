@@ -220,8 +220,9 @@ class Trainer:
             outputs, loss_components = self._forward_and_compute_losses(batch_dict)
 
             self._update_meters(meters, loss_components)
-            self._backward_pass(loss_components['total_loss'])
-            self.scheduler.step()
+            optimizer_stepped = self._backward_pass(loss_components['total_loss'])
+            if optimizer_stepped:
+                self.scheduler.step()
 
             if i % self.args.print_freq == 0 and self.args.rank == 0:
                 progress.display(i)
@@ -411,14 +412,19 @@ class Trainer:
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.args.grad_clip
             )
+            scale_before = self.scaler.get_scale()
             self.scaler.step(self.optimizer)
             self.scaler.update()
+            optimizer_stepped = self.scaler.get_scale() >= scale_before
         else:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.args.grad_clip
             )
             self.optimizer.step()
+            optimizer_stepped = True
+
+        return optimizer_stepped
 
     @torch.no_grad()
     def _run_eval(self, epoch, step=0):
