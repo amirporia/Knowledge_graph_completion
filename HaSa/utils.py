@@ -77,7 +77,21 @@ def move_to_cuda(sample):
 
     def _move_to_cuda(maybe_tensor):
         if torch.is_tensor(maybe_tensor):
-            device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+            # BUGFIX (multi-GPU / DistributedDataParallel correctness): this used to
+            # hardcode `torch.device('cuda:0')`, which is fine for a single-process
+            # (single-GPU) run but WRONG under DDP: every process shares this same
+            # module-level function, so rank 1's process would also move its batch to
+            # GPU 0 instead of its own GPU 1, causing a device-mismatch crash (or
+            # worse, silent cross-device copies) the moment the model -- already
+            # placed on GPU 1 for that process, see trainer.py::Trainer._setup_training
+            # -- runs forward() on tensors sitting on GPU 0.
+            # `torch.cuda.current_device()` instead resolves to whichever device THIS
+            # process called `torch.cuda.set_device(...)` on, which _setup_training
+            # already does once at startup -- so this is a no-op behavior change for
+            # single-GPU/CPU runs (current device is always 0 when there's one GPU)
+            # and the correct fix for multi-GPU runs.
+            device = torch.device(f'cuda:{torch.cuda.current_device()}') if torch.cuda.is_available() \
+                else torch.device('cpu')
             return maybe_tensor.to(device)
         elif isinstance(maybe_tensor, dict):
             return {key: _move_to_cuda(value) for key, value in maybe_tensor.items()}

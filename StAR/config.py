@@ -72,9 +72,10 @@ parser.add_argument('--epochs', default=20, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('-b', '--batch-size', default=32, type=int,
                     metavar='N',
-                    help='mini-batch size (default: 256), this is the total '
-                         'batch size of all GPUs on the current node when '
-                         'using Data Parallel or Distributed Data Parallel')
+                    help='mini-batch size. Under DistributedDataParallel (multi-GPU, see '
+                         '--dist-backend / scripts/train_*.sh) this is the PER-GPU batch '
+                         'size: each process pulls this many examples per step, so the '
+                         'effective global batch size is --batch-size * (number of GPUs).')
 parser.add_argument('--lr', '--learning-rate', default=2e-5, type=float,
                     metavar='LR', help='initial learning rate', dest='lr')
 parser.add_argument('--lr-scheduler', default='linear', type=str,
@@ -86,6 +87,11 @@ parser.add_argument('-p', '--print-freq', default=50, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--seed', default=None, type=int,
                     help='seed for initializing training. ')
+parser.add_argument('--dist-backend', default='nccl', type=str, choices=['nccl', 'gloo'],
+                    help='torch.distributed backend for multi-GPU (DistributedDataParallel) '
+                         'training. Only used when this process was itself launched via '
+                         '`torchrun --nproc_per_node=N ...` (see the auto-detection in '
+                         'scripts/train_wn.sh / train_fb.sh, mirroring ARPM_KGC/main.py).')
 
 # only used for evaluation
 parser.add_argument('--is-test', default=False, action='store_true',
@@ -190,3 +196,18 @@ if not torch.cuda.is_available():
     args.use_amp = False
     args.print_freq = 1
     warnings.warn('GPU is not available, set use_amp=False and print_freq=1')
+
+# ------------------------------------------------------------------------------
+# Distributed (DDP) setup -- mirrors ARPM_KGC/setting/config.py::setup_distributed.
+# When this process is launched via `torchrun --nproc_per_node=N ...` (see the
+# NPROC_PER_NODE auto-detection added to scripts/train_wn.sh / train_fb.sh),
+# torchrun populates WORLD_SIZE/RANK/LOCAL_RANK in the environment for every
+# spawned process, each of which re-runs this whole script (argparse included)
+# independently. A plain `python3 main.py` (WORLD_SIZE unset) leaves
+# args.distributed False and every training code path behaves exactly as it did
+# as a single-process script.
+# ------------------------------------------------------------------------------
+args.world_size = int(os.environ.get('WORLD_SIZE', '1'))
+args.rank = int(os.environ.get('RANK', '0'))
+args.local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+args.distributed = args.world_size > 1

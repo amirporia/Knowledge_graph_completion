@@ -25,6 +25,22 @@ under the shared, unmodified evaluate.py's dot-product scoring — which matches
 paper's own exp(e_hr^T e_t) — is unaffected by this choice since it's applied
 uniformly to the query and every candidate. HaSa+'s (Section 6) extra "negative
 query" loss term is not implemented; flag if you want it added.
+
+BUGFIX (multi-GPU / DistributedDataParallel correctness): `log_inv_t` used to be
+read only in trainer.py::_hasa_loss, via `get_model_obj(self.model).log_inv_t` --
+entirely outside `forward()`. Under DistributedDataParallel, a parameter's
+gradient is only reliably synchronized across GPUs if it's reachable from the
+tensors `forward()` itself returns, at the moment `forward()` returns (DDP walks
+that graph right then to know which parameters to expect a gradient for).
+`log_inv_t` is a bare `nn.Parameter`, never combined with anything inside
+`forward()`, so DDP would treat it as "unused" every iteration and stop
+synchronizing it across replicas -- each GPU's copy would then silently drift to
+a different temperature over the course of multi-GPU training, with no error
+raised. `forward()` now returns `log_inv_t` directly alongside `hr_vector`/
+`tail_vector`/`head_vector`, making it part of the same tracked graph; trainer.py
+reads it from `outputs['log_inv_t']` instead of the module directly. (This is
+exactly the same class of bug as StAR's `interaction_logits`, see StAR/models.py's
+module docstring for a fuller explanation of the underlying DDP mechanism.)
 """
 
 from abc import ABC
@@ -97,8 +113,11 @@ class HaSaBertModel(nn.Module, ABC):
 
         # Key names kept as 'hr_vector' / 'tail_vector' so the shared, unmodified
         # predict.py / evaluate.py (dot-product filtered-MRR ranking, matching the
-        # paper's exp(e_hr^T e_t) scoring) work without changes.
-        return {'hr_vector': e_hr, 'tail_vector': e_t, 'head_vector': e_h}
+        # paper's own exp(e_hr^T e_t) scoring) work without changes.
+        # 'log_inv_t' is returned here (rather than read directly off the module
+        # later) purely for DDP correctness -- see the module docstring's BUGFIX note.
+        return {'hr_vector': e_hr, 'tail_vector': e_t, 'head_vector': e_h,
+               'log_inv_t': self.log_inv_t}
 
     @torch.no_grad()
     def predict_ent_embedding(self, tail_token_ids, tail_mask, tail_token_type_ids, **kwargs) -> dict:

@@ -3,6 +3,8 @@ import torch
 
 import torch.nn as nn
 import torch.utils.data
+import torch.utils.data.distributed
+import torch.distributed as dist
 
 from typing import Dict, List, Optional
 from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
@@ -100,9 +102,11 @@ class Trainer:
         self.ngpus_per_node = ngpus_per_node
         build_tokenizer(args)
 
-        logger.info("=> creating model")
+        if self.args.rank == 0:
+            logger.info("=> creating model")
         self.model = build_model(self.args)
-        logger.info(self.model)
+        if self.args.rank == 0:
+            logger.info(self.model)
         self._setup_training()
 
         # AMP scaler now lives on the trainer for the whole run (previously it
@@ -112,33 +116,50 @@ class Trainer:
         self.scaler = torch.cuda.amp.GradScaler() if self.args.use_amp else None
         self.start_epoch = 0
 
-        self.bce_criterion = nn.BCEWithLogitsLoss(reduction='none').cuda() \
-            if torch.cuda.is_available() else nn.BCEWithLogitsLoss(reduction='none')
+        self.bce_criterion = nn.BCEWithLogitsLoss(reduction='none').to(self.device)
 
         self.optimizer = AdamW([p for p in self.model.parameters() if p.requires_grad],
                                lr=args.lr,
                                weight_decay=args.weight_decay)
-        report_num_trainable_parameters(self.model)
+        if self.args.rank == 0:
+            report_num_trainable_parameters(get_model_obj(self.model))
 
         # Section 3.3.1: K explicit negatives per positive triple (not in-batch
         # contrastive negatives), resampled fresh every epoch by StarDataset.__getitem__.
         train_dataset = StarDataset(path=args.train_path, num_negatives=args.num_negatives)
-        num_training_steps = args.epochs * len(train_dataset) // max(args.batch_size, 1)
+
+        # Multi-GPU (torchrun --nproc_per_node=N): each process trains on its own
+        # 1/world_size shard of the dataset per epoch, matching
+        # ARPM_KGC/model/trainer.py::_create_data_loader.
+        self.train_sampler = (
+            torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=True)
+            if self.args.distributed else None
+        )
+
+        world_size = self.args.world_size if self.args.distributed else 1
+        num_training_steps = args.epochs * (len(train_dataset) // world_size) // max(args.batch_size, 1)
         args.warmup = min(args.warmup, num_training_steps // 10)
-        logger.info('Total training steps: {}, warmup steps: {}'.format(num_training_steps, args.warmup))
+        if self.args.rank == 0:
+            logger.info('Total training steps: {}, warmup steps: {}'.format(num_training_steps, args.warmup))
         self.scheduler = self._create_lr_scheduler(num_training_steps)
         self.best_metric = None
 
         self.train_loader = torch.utils.data.DataLoader(
             train_dataset,
             batch_size=args.batch_size,
-            shuffle=True,
+            shuffle=(self.train_sampler is None),
+            sampler=self.train_sampler,
             collate_fn=collate_star,
             num_workers=args.workers,
             pin_memory=True,
             drop_last=True)
 
-        # --- MRR-based early stopping / best-model selection ---------------------
+        # --- MRR-based early stopping / best-model selection -----------------------
+        # The expensive full-corpus pass and every checkpoint write happen on rank 0
+        # only (see _run_epoch_end_eval); the resulting stop/don't-stop decision is
+        # then broadcast to every rank so `train_loop` breaks out together, rather
+        # than a non-zero rank hanging on the next epoch's DDP collectives after
+        # rank 0 has already stopped issuing them.
         self.early_stopping = EarlyStopping(patience=getattr(args, 'early_stop_patience', 5))
         self.full_eval_every_n_epoch = getattr(args, 'full_eval_every_n_epoch', 1)
         self.mrr_eval_batch_size = getattr(args, 'mrr_eval_batch_size', 256)
@@ -156,7 +177,10 @@ class Trainer:
             return
 
         checkpoint = torch.load(self.args.resume_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['state_dict'])
+        # Checkpoints are always saved from the UNWRAPPED model (get_model_obj), so
+        # they never carry a 'module.' prefix; load into the unwrapped model here too
+        # regardless of whether self.model is currently DDP-wrapped.
+        get_model_obj(self.model).load_state_dict(checkpoint['state_dict'])
 
         if checkpoint.get('optimizer') is not None:
             self.optimizer.load_state_dict(checkpoint['optimizer'])
@@ -171,18 +195,20 @@ class Trainer:
         self.early_stopping.counter = early_stopping_state.get('counter', 0)
 
         self.start_epoch = checkpoint.get('epoch', -1) + 1
-        logger.info(
-            'Resumed from {} (checkpoint epoch {}, resuming at epoch {})'.format(
-                self.args.resume_path, checkpoint.get('epoch'), self.start_epoch))
+        if self.args.rank == 0:
+            logger.info(
+                'Resumed from {} (checkpoint epoch {}, resuming at epoch {})'.format(
+                    self.args.resume_path, checkpoint.get('epoch'), self.start_epoch))
 
     def train_loop(self):
         for epoch in range(self.start_epoch, self.args.epochs):
             self.train_epoch(epoch)
             stop = self._run_epoch_end_eval(epoch)
             if stop:
-                logger.info('Early stopping: no MRR improvement for {} full evals, '
-                            'best MRR={:.4f}. Stopping at epoch {}.'
-                            .format(self.args.early_stop_patience, self.early_stopping.best, epoch))
+                if self.args.rank == 0:
+                    logger.info('Early stopping: no MRR improvement for {} full evals, '
+                                'best MRR={:.4f}. Stopping at epoch {}.'
+                                .format(self.args.early_stop_patience, self.early_stopping.best, epoch))
                 break
 
     @torch.no_grad()
@@ -190,21 +216,26 @@ class Trainer:
         """Filtered forward+backward MRR/Hits@k on args.valid_path via evaluate.py's
         own compute_metrics — the same routine used for final test-set reporting.
         Drives early stopping and which checkpoint becomes model_best.mdl.
+
+        Rank-0-only (see _run_epoch_end_eval): runs on this process's single GPU,
+        using the plain (unwrapped) model, exactly like a single-process run would --
+        the full-eval pass itself is never distributed across GPUs.
         """
-        was_training = self.model.training
-        self.model.eval()
+        model_obj = get_model_obj(self.model)
+        was_training = model_obj.training
+        model_obj.eval()
         # Temporarily flag "test mode" so doc.py's collate() skips building unused
         # negative-sampling masks for this pure inference/embedding pass (mirrors
         # what predict.py's BertPredictor does when loading a checkpoint for eval).
         was_is_test = self.args.is_test
         self.args.is_test = True
 
-        adapter = _LiveModelAdapter(get_model_obj(self.model), task=self.args.task,
+        adapter = _LiveModelAdapter(model_obj, task=self.args.task,
                                     batch_size=self.args.batch_size,
                                     use_cuda=torch.cuda.is_available())
         entity_tensor = adapter.predict_by_entities(entity_dict.entity_exs)
         if torch.cuda.is_available():
-            entity_tensor = entity_tensor.cuda()
+            entity_tensor = entity_tensor.to(self.device)
 
         direction_metrics = []
         for eval_forward in (True, False):
@@ -225,64 +256,84 @@ class Trainer:
 
         self.args.is_test = was_is_test
         if was_training:
-            self.model.train()
+            model_obj.train()
         return avg_metrics
 
     def _run_epoch_end_eval(self, epoch: int) -> bool:
-        run_full_eval = (
-            (epoch + 1) % self.full_eval_every_n_epoch == 0
-            or epoch == self.args.epochs - 1
-        ) and self.args.valid_path
+        """Rank-0-only full-corpus MRR eval + checkpointing; the resulting
+        stop-or-continue decision is broadcast to every rank (see the
+        `dist.broadcast` call below) so distributed training always breaks out
+        of `train_loop` in lockstep."""
+        stop_flag = False
 
-        is_best = False
-        mrr_metrics = None
-        if run_full_eval:
-            mrr_metrics = self._compute_full_mrr()
-            is_best = self.early_stopping.step(mrr_metrics['mrr'])
-            self.best_metric = mrr_metrics if is_best else self.best_metric
-            logger.info('Epoch {} full MRR metrics: {} (best so far: {:.4f})'.format(
-                epoch, json.dumps(mrr_metrics), self.early_stopping.best))
+        if self.args.rank == 0:
+            run_full_eval = (
+                (epoch + 1) % self.full_eval_every_n_epoch == 0
+                or epoch == self.args.epochs - 1
+            ) and self.args.valid_path
 
-        filename = '{}/checkpoint_epoch{}.mdl'.format(self.args.model_dir, epoch)
-        model_state = self.model.state_dict()
-        # Full state -> checkpoint_epoch{N}.mdl and model_last.mdl: everything
-        # needed to resume training exactly (--resume).
-        full_state = {
-            'epoch': epoch,
-            'args': self.args.__dict__,
-            'state_dict': model_state,
-            'optimizer': self.optimizer.state_dict(),
-            'scheduler': self.scheduler.state_dict(),
-            'scaler': self.scaler.state_dict() if (self.args.use_amp and self.scaler is not None) else None,
-            'best_metric': self.best_metric,
-            'early_stopping': {
-                'best': self.early_stopping.best,
-                'counter': self.early_stopping.counter,
-            },
-            'mrr_metrics': mrr_metrics,
-        }
-        # Light state -> model_best.mdl only: all predict.py/evaluate.py ever read.
-        eval_state = {
-            'epoch': epoch,
-            'args': self.args.__dict__,
-            'state_dict': model_state,
-        }
-        save_checkpoint(full_state, is_best=is_best, filename=filename, eval_state=eval_state)
-        delete_old_ckt(path_pattern='{}/checkpoint_*.mdl'.format(self.args.model_dir),
-                       keep=self.args.max_to_keep)
+            is_best = False
+            mrr_metrics = None
+            if run_full_eval:
+                mrr_metrics = self._compute_full_mrr()
+                is_best = self.early_stopping.step(mrr_metrics['mrr'])
+                self.best_metric = mrr_metrics if is_best else self.best_metric
+                logger.info('Epoch {} full MRR metrics: {} (best so far: {:.4f})'.format(
+                    epoch, json.dumps(mrr_metrics), self.early_stopping.best))
 
-        return run_full_eval and self.early_stopping.should_stop
+            filename = '{}/checkpoint_epoch{}.mdl'.format(self.args.model_dir, epoch)
+            model_state = get_model_obj(self.model).state_dict()
+            # Full state -> checkpoint_epoch{N}.mdl and model_last.mdl: everything
+            # needed to resume training exactly (--resume).
+            full_state = {
+                'epoch': epoch,
+                'args': self.args.__dict__,
+                'state_dict': model_state,
+                'optimizer': self.optimizer.state_dict(),
+                'scheduler': self.scheduler.state_dict(),
+                'scaler': self.scaler.state_dict() if (self.args.use_amp and self.scaler is not None) else None,
+                'best_metric': self.best_metric,
+                'early_stopping': {
+                    'best': self.early_stopping.best,
+                    'counter': self.early_stopping.counter,
+                },
+                'mrr_metrics': mrr_metrics,
+            }
+            # Light state -> model_best.mdl only: all predict.py/evaluate.py ever read.
+            eval_state = {
+                'epoch': epoch,
+                'args': self.args.__dict__,
+                'state_dict': model_state,
+            }
+            save_checkpoint(full_state, is_best=is_best, filename=filename, eval_state=eval_state)
+            delete_old_ckt(path_pattern='{}/checkpoint_*.mdl'.format(self.args.model_dir),
+                           keep=self.args.max_to_keep)
+
+            stop_flag = run_full_eval and self.early_stopping.should_stop
+
+        if self.args.distributed:
+            # Only rank 0 ran the (expensive) full eval / checkpointing above -- every
+            # rank needs the SAME stop decision, otherwise a rank that kept looping
+            # would hang forever waiting for the DDP forward/backward collectives that
+            # a rank which already broke out of train_loop never issues again.
+            stop_tensor = torch.tensor([1 if stop_flag else 0], device=self.device)
+            dist.broadcast(stop_tensor, src=0)
+            stop_flag = bool(stop_tensor.item())
+            dist.barrier()
+
+        return stop_flag
 
     def _save_periodic_checkpoint(self, epoch, step):
         # Saved mid-epoch (--eval-every-n-step), so the current epoch hasn't
         # finished yet -- record `epoch - 1` (the last fully-completed epoch) as
         # this checkpoint's resume point, so --resume re-runs the interrupted
-        # epoch in full rather than silently skipping it.
+        # epoch in full rather than silently skipping it. Rank-0-only, see the
+        # call site in train_epoch().
         filename = '{}/checkpoint_{}_{}.mdl'.format(self.args.model_dir, epoch, step)
         save_checkpoint({
             'epoch': epoch - 1,
             'args': self.args.__dict__,
-            'state_dict': self.model.state_dict(),
+            'state_dict': get_model_obj(self.model).state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict(),
             'scaler': self.scaler.state_dict() if (self.args.use_amp and self.scaler is not None) else None,
@@ -296,6 +347,9 @@ class Trainer:
                        keep=self.args.max_to_keep)
 
     def train_epoch(self, epoch):
+        if self.args.distributed:
+            self.train_sampler.set_epoch(epoch)
+
         losses = AverageMeter('Loss', ':.4')
         cls_losses = AverageMeter('L^c', ':.4')
         struct_losses = AverageMeter('L^d', ':.4')
@@ -322,10 +376,14 @@ class Trainer:
             u = outputs['hr_vector'].view(batch_size, group, -1)
             v = outputs['tail_vector'].view(batch_size, group, -1)
 
-            # L^c (Eq. 8-9, 12): classification objective over [u; u*v; u-v; v]
-            logits_c = get_model_obj(self.model).interaction_logits(
-                u.reshape(batch_size * group, -1), v.reshape(batch_size * group, -1)
-            ).view(batch_size, group)
+            # L^c (Eq. 8-9, 12): classification objective over [u; u*v; u-v; v].
+            # `interaction_logits` is now computed inside forward() itself (see
+            # models.py's module docstring) rather than via a separate call to
+            # get_model_obj(self.model).interaction_logits(...) afterwards, so that
+            # `classifier`'s parameters are part of the same DDP-tracked forward graph
+            # as hr_bert/tail_bert and get synchronized across GPUs like everything
+            # else under multi-GPU training.
+            logits_c = outputs['interaction_logits'].view(batch_size, group)
             labels_c = torch.zeros_like(logits_c)
             labels_c[:, 0] = 1.0
             # Eq. 12's 1/(1+|N(tp)|) weighting per triple group, then averaged over the batch
@@ -362,15 +420,37 @@ class Trainer:
                 self.optimizer.step()
             self.scheduler.step()
 
-            if i % self.args.print_freq == 0:
+            if i % self.args.print_freq == 0 and self.args.rank == 0:
                 progress.display(i)
-            if self.args.eval_every_n_step > 0 and (i + 1) % self.args.eval_every_n_step == 0:
+            if self.args.eval_every_n_step > 0 and (i + 1) % self.args.eval_every_n_step == 0 \
+                    and self.args.rank == 0:
                 self._save_periodic_checkpoint(epoch=epoch, step=i + 1)
-        logger.info('Learning rate: {}'.format(self.scheduler.get_last_lr()[0]))
+
+        if self.args.rank == 0:
+            logger.info('Learning rate: {}'.format(self.scheduler.get_last_lr()[0]))
 
     def _setup_training(self):
-        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        """Resolves this process's device and, when launched under
+        `torchrun --nproc_per_node=N` (args.distributed True), wraps the model in
+        DistributedDataParallel -- mirrors ARPM_KGC/model/trainer.py::_setup_device.
+        """
+        if self.args.distributed:
+            self.device = torch.device(f'cuda:{self.args.local_rank}')
+            torch.cuda.set_device(self.device)
+        elif torch.cuda.is_available():
+            self.device = torch.device('cuda:0')
+            torch.cuda.set_device(self.device)
+        else:
+            self.device = torch.device('cpu')
+
         self.model.to(self.device)
+
+        if self.args.distributed:
+            self.model = nn.parallel.DistributedDataParallel(
+                self.model, device_ids=[self.args.local_rank], output_device=self.args.local_rank,
+                broadcast_buffers=False,
+                find_unused_parameters=True,
+            )
 
     def _create_lr_scheduler(self, num_training_steps):
         if self.args.lr_scheduler == 'linear':

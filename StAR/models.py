@@ -23,11 +23,28 @@ Deliberately not implemented (documented in config.py and the top-level README):
     paper's own ablation (Table 7: Hits@10 .701 vs .709 full model; MRR .406 vs
     .401 for s^d alone).
 
-BUGFIX (this file): --pooling was declared in config.py with choices
+BUGFIX (--pooling): --pooling was declared in config.py with choices
 ['cls', 'mean', 'max'] but _encode() hardcoded CLS pooling regardless of the
 flag's value, so passing --pooling mean/max silently had no effect. _pool()
 now actually dispatches on args.pooling; default behavior (args.pooling='cls',
 matching the paper) is unchanged.
+
+BUGFIX (multi-GPU / DistributedDataParallel correctness): `interaction_logits`
+used to be computed by trainer.py via
+`get_model_obj(self.model).interaction_logits(u, v)` -- called *outside*
+`forward()`, after `self.model(**batch_dict)` had already returned. Under
+DistributedDataParallel, a submodule's parameters are only reliably
+gradient-synchronized across GPUs if they're reachable from the tensors
+`forward()` itself returns, at the moment `forward()` returns (DDP walks that
+graph right then to know which parameters to expect a gradient for). Since
+`classifier` was never called inside `forward()`, DDP would treat its weights
+as "unused" every iteration and stop synchronizing them across replicas --
+each GPU's copy of `classifier` would then silently drift to a different set
+of weights over the course of multi-GPU training, with no error raised.
+`forward()` now always computes `interaction_logits` itself (classifier is a
+per-example MLP, so this needs no extra reshaping/context) and returns it
+alongside `hr_vector`/`tail_vector`, making it part of the same tracked graph
+as everything else. See trainer.py::train_epoch for the corresponding change.
 """
 
 from abc import ABC
@@ -117,11 +134,23 @@ class StarBertModel(nn.Module, ABC):
 
         u, v = self.encode(hr_token_ids, hr_mask, hr_token_type_ids,
                            tail_token_ids, tail_mask, tail_token_type_ids)
+
+        # DDP correctness (see module docstring): classifier is called HERE, inside
+        # forward(), rather than separately by the trainer afterwards, so its
+        # parameters are part of the same tracked output graph as hr_bert/tail_bert
+        # and get their gradients synchronized across GPUs like everything else.
+        logits_c = self.classifier(u, v)
+
         # Keep the 'hr_vector' / 'tail_vector' key names so predict.py / evaluate.py
         # (unchanged from SimKGC) work without modification.
-        return {'hr_vector': u, 'tail_vector': v}
+        return {'hr_vector': u, 'tail_vector': v, 'interaction_logits': logits_c}
 
     def interaction_logits(self, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Kept as a standalone method for convenience (e.g. ad-hoc analysis on a
+        plain, non-DDP-wrapped model). Training itself now reads the
+        'interaction_logits' key from forward()'s output instead -- see the
+        module docstring for why calling this directly bypasses DDP's gradient
+        tracking for `classifier` under multi-GPU training."""
         return self.classifier(u, v)
 
     @torch.no_grad()
