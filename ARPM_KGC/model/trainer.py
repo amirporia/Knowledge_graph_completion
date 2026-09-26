@@ -217,8 +217,7 @@ class Trainer:
             self.model.train()
             batch_dict = self._move_batch_to_device(batch_dict)
 
-            outputs = self._forward_pass(batch_dict)
-            loss_components = self._compute_losses(outputs, batch_dict)
+            outputs, loss_components = self._forward_and_compute_losses(batch_dict)
 
             self._update_meters(meters, loss_components)
             self._backward_pass(loss_components['total_loss'])
@@ -250,13 +249,34 @@ class Trainer:
             return move_to_cuda(batch_dict)
         return batch_dict
 
-    def _forward_pass(self, batch_dict):
+    def _forward_and_compute_losses(self, batch_dict):
+        """Forward pass AND loss computation together, inside the SAME autocast
+        region when AMP is enabled.
+
+        `_compute_losses` matmuls tensors produced inside the model's forward
+        pass against each other (score_query/score_prototypes/score_struct/
+        combined_score). Under autocast, `nn.functional.normalize` (used in
+        model/models.py::_pool_output for q/tail_vector/head_vector) is always
+        run in fp32 -- autocast's fixed policy for norm-family ops, for
+        numerical stability -- while prototypes/m_struct (pure einsum/matmul
+        output) get cast to fp16, autocast's fixed policy for matmul-family ops.
+        Inside forward(), that's fine: everything is still inside one active
+        autocast region, which keeps reconciling dtypes as needed. Splitting
+        forward (autocast) from loss computation (no autocast, as this used to
+        do) means that reconciliation stops at the `with` block's exit, so
+        score_prototypes's einsum('bkd,ed->bke', prototypes[fp16],
+        tail_vector[fp32]) fails with "expected scalar type Half but found
+        Float" instead of being silently promoted. Loss computation is exactly
+        the matmul-heavy code AMP is meant to speed up anyway, so this isn't a
+        workaround -- only backward()/optimizer.step() (via GradScaler) belong
+        outside autocast.
+        """
         model_kwargs = {k: v for k, v in batch_dict.items()
                         if k not in ('triplet_mask', 'self_negative_mask', 'batch_data', 'test_forward')}
-        if self.args.use_amp:
-            with torch.cuda.amp.autocast():
-                return self.model(**model_kwargs)
-        return self.model(**model_kwargs)
+        with torch.amp.autocast('cuda', enabled=self.args.use_amp):
+            outputs = self.model(**model_kwargs)
+            loss_components = self._compute_losses(outputs, batch_dict)
+        return outputs, loss_components
 
     def _compute_losses(self, outputs, batch_dict) -> Dict:
         """In-batch negatives (batch tail vectors act as the candidate entity set).
@@ -485,8 +505,7 @@ class Trainer:
             self.model.eval()
             batch_dict = self._move_batch_to_device(batch_dict)
 
-            outputs = self._forward_pass(batch_dict)
-            loss_components = self._compute_losses(outputs, batch_dict)
+            outputs, loss_components = self._forward_and_compute_losses(batch_dict)
 
             batch_size = self.args.batch_size
             meters['losses'].update(loss_components['total_loss'].item(), batch_size)
