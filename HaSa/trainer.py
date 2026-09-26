@@ -420,10 +420,14 @@ class Trainer:
         pseudocode for the same quantity).
 
         `inv_t` is passed in by the caller (train_epoch), read from
-        `outputs['log_inv_t']`, rather than fetched here via
-        `get_model_obj(self.model).log_inv_t`. See models.py's module docstring for
-        why: under DistributedDataParallel, log_inv_t must be reachable from
-        forward()'s own return value to stay gradient-synchronized across GPUs.
+        `outputs['inv_t']` -- already exponentiated inside HaSaBertModel.forward()
+        -- rather than fetched here via `get_model_obj(self.model).log_inv_t` (or
+        exponentiated a second time in this file). See models.py's module docstring
+        for why: under DistributedDataParallel, a forward() output built by applying
+        an op (here `.exp()`) to `log_inv_t` must be what's returned, not the raw
+        leaf parameter itself, or DDP's own reducer hook and its output-reachability
+        hook collide on the same AccumulateGrad node and backward() raises
+        "Expected to mark a variable ready only once".
 
         BUGFIX (DDP "Expected to mark a variable ready only once"): `cand_vector`
         is now passed in already-encoded (as `outputs['cand_vector']` from the same
@@ -532,9 +536,12 @@ class Trainer:
 
             e_hr, e_t = outputs['hr_vector'], outputs['tail_vector']
             cand_vector = outputs.get('cand_vector')
-            # Read from outputs (DDP-tracked), not get_model_obj(self.model).log_inv_t
-            # -- see models.py's module docstring and _hasa_loss's docstring above.
-            inv_t = outputs['log_inv_t'].exp()
+            # Read from outputs (DDP-tracked), already exponentiated inside
+            # forward() -- do NOT call get_model_obj(self.model).log_inv_t or
+            # .exp() a second time here. See models.py's module docstring and
+            # _hasa_loss's docstring above for why returning the raw leaf
+            # parameter (or re-deriving it off the unwrapped module) breaks DDP.
+            inv_t = outputs['inv_t']
             loss, pos, neg, false_neg = self._hasa_loss(e_hr, e_t, cand_vector, row_samples, inv_t)
 
             losses.update(loss.item(), batch_size)

@@ -26,22 +26,29 @@ paper's own exp(e_hr^T e_t) — is unaffected by this choice since it's applied
 uniformly to the query and every candidate. HaSa+'s (Section 6) extra "negative
 query" loss term is not implemented; flag if you want it added.
 
-BUGFIX (multi-GPU / DistributedDataParallel correctness, log_inv_t): `log_inv_t`
-used to be read only in trainer.py::_hasa_loss, via
-`get_model_obj(self.model).log_inv_t` -- entirely outside `forward()`. Under
-DistributedDataParallel, a parameter's gradient is only reliably synchronized
-across GPUs if it's reachable from the tensors `forward()` itself returns, at the
-moment `forward()` returns (DDP walks that graph right then to know which
-parameters to expect a gradient for). `log_inv_t` is a bare `nn.Parameter`, never
-combined with anything inside `forward()`, so DDP would treat it as "unused" every
-iteration and stop synchronizing it across replicas -- each GPU's copy would then
-silently drift to a different temperature over the course of multi-GPU training,
-with no error raised. `forward()` now returns `log_inv_t` directly alongside
-`hr_vector`/`tail_vector`/`head_vector`, making it part of the same tracked graph;
-trainer.py reads it from `outputs['log_inv_t']` instead of the module directly.
-(This is exactly the same class of bug as StAR's `interaction_logits`, see
-StAR/models.py's module docstring for a fuller explanation of the underlying DDP
-mechanism.)
+BUGFIX (multi-GPU / DistributedDataParallel correctness, log_inv_t -- v2): an
+earlier version of this fix returned `self.log_inv_t` (the raw `nn.Parameter`)
+directly as a `forward()` output, reasoning that DDP only reliably synchronizes a
+parameter's gradient if that parameter is reachable from what `forward()` returns.
+That much is true, but returning a *leaf* parameter unmodified is itself broken: a
+leaf tensor has no `grad_fn`, only an `AccumulateGrad` node, and that is exactly the
+same node the DDP reducer's own per-parameter "gradient ready" hook is attached to.
+When DDP's output-reachability walk (needed because `find_unused_parameters=True`)
+sees `log_inv_t` unmodified among the outputs, it attaches its output-tracking hook
+to that *same* `AccumulateGrad` node. At backward time both hooks then fire on it,
+and DDP raises:
+    RuntimeError: Expected to mark a variable ready only once ...
+    Parameter at index 0 with name .log_inv_t has been marked as ready twice.
+(`encoder`/`proj`, by contrast, are reached through `encode_text()`, a real chain of
+ops with their own `grad_fn`s, so DDP's tracking attaches to those op nodes instead
+of to any parameter directly -- which is why only `log_inv_t` triggers this.)
+
+Fix: `forward()` now applies `.exp()` to `log_inv_t` itself, so what's returned is a
+fresh non-leaf tensor (its own `ExpBackward` node) rather than the parameter. This
+still keeps `log_inv_t` reachable from `forward()`'s return value -- so its gradient
+still synchronizes correctly across replicas -- while giving DDP an output tensor to
+attach to that isn't also the reducer's own hook target. `outputs['inv_t']` replaces
+the old `outputs['log_inv_t']` (trainer.py no longer calls `.exp()` itself).
 
 BUGFIX (multi-GPU / DistributedDataParallel correctness, false-negative
 candidates): trainer.py::_hasa_loss used to encode the structure-sampled
@@ -52,14 +59,12 @@ hooks. That created a second autograd path through `encoder`/`proj` that DDP's
 reducer never registered when it set up its per-iteration "expect one gradient per
 parameter" bookkeeping during the single tracked forward() call. When
 `loss.backward()` then walked the merged graph (main batch + candidates), DDP's
-mark-ready accounting desynced and raised:
-    RuntimeError: Expected to mark a variable ready only once ...
-    Parameter at index 0 with name .log_inv_t has been marked as ready twice.
-(log_inv_t is just the parameter whose gradient happens to close out the graph
-first; the underlying cause is the untracked second call through encoder/proj,
-not log_inv_t itself.) `_set_static_graph()` is not a safe workaround here either,
-since some batches have zero false-negative candidates -- a genuinely
-varying graph shape from iteration to iteration.
+mark-ready accounting desynced and raised the same "Expected to mark a variable
+ready only once" error described above (there, on a different parameter, for a
+different reason -- see the note above for why `log_inv_t` specifically is the one
+this repo has hit twice, for two distinct causes). `_set_static_graph()` is not a
+safe workaround here either, since some batches have zero false-negative
+candidates -- a genuinely varying graph shape from iteration to iteration.
 
 Fix: candidate tail tokens are now passed into this single `forward()` call
 (`cand_tail_token_ids` / `cand_tail_mask` / `cand_tail_token_type_ids`) and encoded
@@ -151,13 +156,29 @@ class HaSaBertModel(nn.Module, ABC):
         if cand_tail_token_ids is not None:
             cand_vector = self.encode_text(cand_tail_token_ids, cand_tail_mask, cand_tail_token_type_ids)
 
+        # BUGFIX (DDP "Expected to mark a variable ready only once", log_inv_t v2):
+        # apply .exp() HERE, inside forward(), rather than returning the raw
+        # `self.log_inv_t` parameter and exponentiating it later in trainer.py.
+        # `self.log_inv_t` is a leaf tensor (only an AccumulateGrad node); returning
+        # it unmodified as a forward() output makes DDP's output-reachability hook
+        # attach to that *same* AccumulateGrad node the reducer's own per-parameter
+        # gradient-ready hook already uses, so both fire during backward() and DDP
+        # reports the parameter as "marked ready twice". `.exp()` produces a fresh
+        # non-leaf tensor (its own ExpBackward node) for DDP to attach to instead,
+        # while `log_inv_t` itself remains reachable from forward()'s return value
+        # (via this tensor's grad_fn), so its gradient still synchronizes correctly
+        # across replicas. See the module docstring for the full explanation.
+        inv_t = self.log_inv_t.exp()
+
         # Key names kept as 'hr_vector' / 'tail_vector' so the shared, unmodified
         # predict.py / evaluate.py (dot-product filtered-MRR ranking, matching the
         # paper's own exp(e_hr^T e_t) scoring) work without changes.
-        # 'log_inv_t' is returned here (rather than read directly off the module
-        # later) purely for DDP correctness -- see the module docstring's BUGFIX note.
+        # 'inv_t' (already exponentiated) is returned here -- rather than the raw
+        # 'log_inv_t' parameter -- purely for DDP correctness; see the module
+        # docstring's BUGFIX note. trainer.py reads it directly, with no further
+        # .exp() call needed.
         return {'hr_vector': e_hr, 'tail_vector': e_t, 'head_vector': e_h,
-               'log_inv_t': self.log_inv_t, 'cand_vector': cand_vector}
+               'inv_t': inv_t, 'cand_vector': cand_vector}
 
     @torch.no_grad()
     def predict_ent_embedding(self, tail_token_ids, tail_mask, tail_token_type_ids, **kwargs) -> dict:
