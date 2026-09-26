@@ -82,6 +82,13 @@ class Trainer:
             # in-batch negatives -- numerically equivalent to running the same
             # --batch-size on a single (large-enough-memory) GPU, just splitting the
             # BERT activations that were causing the OOM.
+            #
+            # Every value returned by ARPMModel.forward() must be a proper (B, ...)
+            # per-example tensor for this to gather correctly -- DataParallel
+            # concatenates per-replica outputs along dim 0. A pre-reduced 0-dim
+            # scalar (e.g. an internal `.mean()`) would instead get stacked into a
+            # length-num_gpus vector; see model/modules.py::diversity_loss, which
+            # returns its per-example (B,) tensor unreduced for exactly this reason.
             logger.info(
                 f'Using nn.DataParallel across {torch.cuda.device_count()} GPUs; '
                 f'global batch size stays {self.args.batch_size} (split evenly for '
@@ -279,8 +286,14 @@ class Trainer:
         m_struct = outputs['m_struct']
         lambda_p = outputs['lambda_p']
         lambda_s = outputs['lambda_s']
-        div_loss = outputs['div_loss']
         slot_gate = outputs.get('slot_gate')
+
+        # outputs['div_loss'] is a per-example (B,) tensor (see
+        # modules.py::diversity_loss), not a pre-reduced scalar -- this is what
+        # lets nn.DataParallel gather it correctly across GPUs (concatenation
+        # along dim 0) instead of stacking two per-GPU scalars into a length-2
+        # vector. Reduce it here, after gathering, not inside the model.
+        div_loss = outputs['div_loss'].mean()
 
         batch_size = q.size(0)
         labels = torch.arange(batch_size, device=q.device)
