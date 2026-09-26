@@ -297,6 +297,7 @@ class Trainer:
         # ---- L_proto, L_struct: inv-temperature scaling only (no margin/self-neg) ----
         p_logits = S_p * inv_t
         s_logits = S_s * inv_t
+
         if triplet_mask is not None:
             p_logits = p_logits.masked_fill(~triplet_mask, model_obj.NEGATIVE_INF)
             s_logits = s_logits.masked_fill(~triplet_mask, model_obj.NEGATIVE_INF)
