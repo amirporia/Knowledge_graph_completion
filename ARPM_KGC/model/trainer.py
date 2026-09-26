@@ -74,27 +74,6 @@ class Trainer:
                 broadcast_buffers=False,
                 find_unused_parameters=True,
             )
-        elif torch.cuda.device_count() > 1:
-            # Single-process multi-GPU (e.g. Kaggle 2xT4, no torchrun). Unlike DDP,
-            # DataParallel scatters only the encoder forward/backward across GPUs and
-            # GATHERS outputs back to self.device before any loss is computed, so
-            # L_query/L_proto/L_struct/L_combined still see the FULL args.batch_size
-            # in-batch negatives -- numerically equivalent to running the same
-            # --batch-size on a single (large-enough-memory) GPU, just splitting the
-            # BERT activations that were causing the OOM.
-            #
-            # Every value returned by ARPMModel.forward() must be a proper (B, ...)
-            # per-example tensor for this to gather correctly -- DataParallel
-            # concatenates per-replica outputs along dim 0. A pre-reduced 0-dim
-            # scalar (e.g. an internal `.mean()`) would instead get stacked into a
-            # length-num_gpus vector; see model/modules.py::diversity_loss, which
-            # returns its per-example (B,) tensor unreduced for exactly this reason.
-            logger.info(
-                f'Using nn.DataParallel across {torch.cuda.device_count()} GPUs; '
-                f'global batch size stays {self.args.batch_size} (split evenly for '
-                f'the encoder pass, gathered before loss computation).'
-            )
-            self.model = nn.DataParallel(self.model)
 
     def _init_optimizer_and_criterion(self):
         self.criterion = nn.CrossEntropyLoss().to(self.device)
@@ -217,7 +196,8 @@ class Trainer:
             self.model.train()
             batch_dict = self._move_batch_to_device(batch_dict)
 
-            outputs, loss_components = self._forward_and_compute_losses(batch_dict)
+            outputs = self._forward_pass(batch_dict)
+            loss_components = self._compute_losses(outputs, batch_dict)
 
             self._update_meters(meters, loss_components)
             self._backward_pass(loss_components['total_loss'])
@@ -249,34 +229,13 @@ class Trainer:
             return move_to_cuda(batch_dict)
         return batch_dict
 
-    def _forward_and_compute_losses(self, batch_dict):
-        """Forward pass AND loss computation together, inside the SAME autocast
-        region when AMP is enabled.
-
-        `_compute_losses` matmuls tensors produced inside the model's forward
-        pass against each other (score_query/score_prototypes/score_struct/
-        combined_score). Under autocast, `nn.functional.normalize` (used in
-        model/models.py::_pool_output for q/tail_vector/head_vector) is always
-        run in fp32 -- autocast's fixed policy for norm-family ops, for
-        numerical stability -- while prototypes/m_struct (pure einsum/matmul
-        output) get cast to fp16, autocast's fixed policy for matmul-family ops.
-        Inside forward(), that's fine: everything is still inside one active
-        autocast region, which keeps reconciling dtypes as needed. Splitting
-        forward (autocast) from loss computation (no autocast, as this used to
-        do) means that reconciliation stops at the `with` block's exit, so
-        score_prototypes's einsum('bkd,ed->bke', prototypes[fp16],
-        tail_vector[fp32]) fails with "expected scalar type Half but found
-        Float" instead of being silently promoted. Loss computation is exactly
-        the matmul-heavy code AMP is meant to speed up anyway, so this isn't a
-        workaround -- only backward()/optimizer.step() (via GradScaler) belong
-        outside autocast.
-        """
+    def _forward_pass(self, batch_dict):
         model_kwargs = {k: v for k, v in batch_dict.items()
                         if k not in ('triplet_mask', 'self_negative_mask', 'batch_data', 'test_forward')}
-        with torch.amp.autocast('cuda', enabled=self.args.use_amp):
-            outputs = self.model(**model_kwargs)
-            loss_components = self._compute_losses(outputs, batch_dict)
-        return outputs, loss_components
+        if self.args.use_amp:
+            with torch.cuda.amp.autocast():
+                return self.model(**model_kwargs)
+        return self.model(**model_kwargs)
 
     def _compute_losses(self, outputs, batch_dict) -> Dict:
         """In-batch negatives (batch tail vectors act as the candidate entity set).
@@ -306,14 +265,8 @@ class Trainer:
         m_struct = outputs['m_struct']
         lambda_p = outputs['lambda_p']
         lambda_s = outputs['lambda_s']
+        div_loss = outputs['div_loss']
         slot_gate = outputs.get('slot_gate')
-
-        # outputs['div_loss'] is a per-example (B,) tensor (see
-        # modules.py::diversity_loss), not a pre-reduced scalar -- this is what
-        # lets nn.DataParallel gather it correctly across GPUs (concatenation
-        # along dim 0) instead of stacking two per-GPU scalars into a length-2
-        # vector. Reduce it here, after gathering, not inside the model.
-        div_loss = outputs['div_loss'].mean()
 
         batch_size = q.size(0)
         labels = torch.arange(batch_size, device=q.device)
@@ -505,7 +458,8 @@ class Trainer:
             self.model.eval()
             batch_dict = self._move_batch_to_device(batch_dict)
 
-            outputs, loss_components = self._forward_and_compute_losses(batch_dict)
+            outputs = self._forward_pass(batch_dict)
+            loss_components = self._compute_losses(outputs, batch_dict)
 
             batch_size = self.args.batch_size
             meters['losses'].update(loss_components['total_loss'].item(), batch_size)
