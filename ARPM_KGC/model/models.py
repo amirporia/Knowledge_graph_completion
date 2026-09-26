@@ -47,6 +47,20 @@ class ARPMModel(nn.Module):
         from copy import deepcopy
         self.tail_bert = deepcopy(self.hr_bert)  # E_1
 
+        # Gradient checkpointing: trades ~15-25% extra backward-pass compute for a
+        # large cut in activation memory, with NO change to any forward-pass math,
+        # loss, or output -- only how intermediate activations are stored/recomputed.
+        # This is the actual OOM lever here: the candidate encode in _build_memory
+        # flattens (batch_size * max_candidates) rows into one BERT forward call,
+        # which dwarfs the query/tail/head encodes and is what exhausts GPU0's
+        # memory under nn.DataParallel (GPU0 additionally carries the master model
+        # copy, AdamW optimizer state, and the gather point for all replicas' outputs,
+        # so it OOMs before GPU1 would). HF's gradient_checkpointing_enable() is a
+        # no-op during .eval()/no_grad(), so evaluation/prediction paths (which use
+        # their own, much smaller --full-eval-batch-size) are unaffected.
+        self.hr_bert.gradient_checkpointing_enable()
+        self.tail_bert.gradient_checkpointing_enable()
+
         # ---- ARPM-KGC memory modules ----
         # `args.num_hops` (N) is the max graph distance considered beyond the
         # same-head/same-relation category: local anchors span hop-0
