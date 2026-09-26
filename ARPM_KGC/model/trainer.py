@@ -74,6 +74,20 @@ class Trainer:
                 broadcast_buffers=False,
                 find_unused_parameters=True,
             )
+        elif torch.cuda.device_count() > 1:
+            # Single-process multi-GPU (e.g. Kaggle 2xT4, no torchrun). Unlike DDP,
+            # DataParallel scatters only the encoder forward/backward across GPUs and
+            # GATHERS outputs back to self.device before any loss is computed, so
+            # L_query/L_proto/L_struct/L_combined still see the FULL args.batch_size
+            # in-batch negatives -- numerically equivalent to running the same
+            # --batch-size on a single (large-enough-memory) GPU, just splitting the
+            # BERT activations that were causing the OOM.
+            logger.info(
+                f'Using nn.DataParallel across {torch.cuda.device_count()} GPUs; '
+                f'global batch size stays {self.args.batch_size} (split evenly for '
+                f'the encoder pass, gathered before loss computation).'
+            )
+            self.model = nn.DataParallel(self.model)
 
     def _init_optimizer_and_criterion(self):
         self.criterion = nn.CrossEntropyLoss().to(self.device)
