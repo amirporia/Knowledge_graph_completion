@@ -26,21 +26,48 @@ paper's own exp(e_hr^T e_t) — is unaffected by this choice since it's applied
 uniformly to the query and every candidate. HaSa+'s (Section 6) extra "negative
 query" loss term is not implemented; flag if you want it added.
 
-BUGFIX (multi-GPU / DistributedDataParallel correctness): `log_inv_t` used to be
-read only in trainer.py::_hasa_loss, via `get_model_obj(self.model).log_inv_t` --
-entirely outside `forward()`. Under DistributedDataParallel, a parameter's
-gradient is only reliably synchronized across GPUs if it's reachable from the
-tensors `forward()` itself returns, at the moment `forward()` returns (DDP walks
-that graph right then to know which parameters to expect a gradient for).
-`log_inv_t` is a bare `nn.Parameter`, never combined with anything inside
-`forward()`, so DDP would treat it as "unused" every iteration and stop
-synchronizing it across replicas -- each GPU's copy would then silently drift to
-a different temperature over the course of multi-GPU training, with no error
-raised. `forward()` now returns `log_inv_t` directly alongside `hr_vector`/
-`tail_vector`/`head_vector`, making it part of the same tracked graph; trainer.py
-reads it from `outputs['log_inv_t']` instead of the module directly. (This is
-exactly the same class of bug as StAR's `interaction_logits`, see StAR/models.py's
-module docstring for a fuller explanation of the underlying DDP mechanism.)
+BUGFIX (multi-GPU / DistributedDataParallel correctness, log_inv_t): `log_inv_t`
+used to be read only in trainer.py::_hasa_loss, via
+`get_model_obj(self.model).log_inv_t` -- entirely outside `forward()`. Under
+DistributedDataParallel, a parameter's gradient is only reliably synchronized
+across GPUs if it's reachable from the tensors `forward()` itself returns, at the
+moment `forward()` returns (DDP walks that graph right then to know which
+parameters to expect a gradient for). `log_inv_t` is a bare `nn.Parameter`, never
+combined with anything inside `forward()`, so DDP would treat it as "unused" every
+iteration and stop synchronizing it across replicas -- each GPU's copy would then
+silently drift to a different temperature over the course of multi-GPU training,
+with no error raised. `forward()` now returns `log_inv_t` directly alongside
+`hr_vector`/`tail_vector`/`head_vector`, making it part of the same tracked graph;
+trainer.py reads it from `outputs['log_inv_t']` instead of the module directly.
+(This is exactly the same class of bug as StAR's `interaction_logits`, see
+StAR/models.py's module docstring for a fuller explanation of the underlying DDP
+mechanism.)
+
+BUGFIX (multi-GPU / DistributedDataParallel correctness, false-negative
+candidates): trainer.py::_hasa_loss used to encode the structure-sampled
+false-negative candidates via a raw `get_model_obj(self.model).encode_text(...)`
+call -- i.e. directly on the *unwrapped* module, outside of and in addition to the
+one `self.model(**batch_dict)` call per iteration that DDP actually wraps and
+hooks. That created a second autograd path through `encoder`/`proj` that DDP's
+reducer never registered when it set up its per-iteration "expect one gradient per
+parameter" bookkeeping during the single tracked forward() call. When
+`loss.backward()` then walked the merged graph (main batch + candidates), DDP's
+mark-ready accounting desynced and raised:
+    RuntimeError: Expected to mark a variable ready only once ...
+    Parameter at index 0 with name .log_inv_t has been marked as ready twice.
+(log_inv_t is just the parameter whose gradient happens to close out the graph
+first; the underlying cause is the untracked second call through encoder/proj,
+not log_inv_t itself.) `_set_static_graph()` is not a safe workaround here either,
+since some batches have zero false-negative candidates -- a genuinely
+varying graph shape from iteration to iteration.
+
+Fix: candidate tail tokens are now passed into this single `forward()` call
+(`cand_tail_token_ids` / `cand_tail_mask` / `cand_tail_token_type_ids`) and encoded
+with the same `encode_text()` call used for everything else, so every use of
+`encoder`/`proj`/`log_inv_t` happens inside the one DDP-tracked forward() per
+iteration. `outputs['cand_vector']` is returned (None when no candidates exist
+for this batch); trainer.py's `_hasa_loss` now just consumes it instead of
+encoding it itself.
 """
 
 from abc import ABC
@@ -61,7 +88,8 @@ class HaSaBertModel(nn.Module, ABC):
         self.config = AutoConfig.from_pretrained(args.pretrained_model)
 
         # Single shared encoder f(.), applied to head / relation / tail text alike
-        # (and to structure-sampled false-negative candidates in trainer.py).
+        # (and to structure-sampled false-negative candidates, encoded within this
+        # same forward() call -- see the module docstring's DDP bugfix note).
         self.encoder = AutoModel.from_pretrained(args.pretrained_model)
 
         self.proj = nn.Sequential(
@@ -102,6 +130,7 @@ class HaSaBertModel(nn.Module, ABC):
     def forward(self, head_token_ids, head_mask, head_token_type_ids,
                 relation_token_ids, relation_mask, relation_token_type_ids,
                 tail_token_ids, tail_mask, tail_token_type_ids,
+                cand_tail_token_ids=None, cand_tail_mask=None, cand_tail_token_type_ids=None,
                 only_ent_embedding: bool = False, **kwargs) -> dict:
         if only_ent_embedding:
             return self.predict_ent_embedding(tail_token_ids, tail_mask, tail_token_type_ids)
@@ -111,13 +140,24 @@ class HaSaBertModel(nn.Module, ABC):
         e_t = self.encode_text(tail_token_ids, tail_mask, tail_token_type_ids)
         e_hr = self.aggregate(e_h, e_r)
 
+        # BUGFIX (DDP "Expected to mark a variable ready only once"): encode the
+        # structure-sampled false-negative candidates (Eq. 8-13) here, inside this
+        # single tracked forward() call, instead of via a second, untracked call to
+        # encode_text() from trainer.py after this call returns. See the module
+        # docstring for the full explanation. `cand_tail_token_ids` is None whenever
+        # a batch has no false-negative candidates to sample (e.g. isolated head
+        # entities with no <=2-hop neighbours).
+        cand_vector = None
+        if cand_tail_token_ids is not None:
+            cand_vector = self.encode_text(cand_tail_token_ids, cand_tail_mask, cand_tail_token_type_ids)
+
         # Key names kept as 'hr_vector' / 'tail_vector' so the shared, unmodified
         # predict.py / evaluate.py (dot-product filtered-MRR ranking, matching the
         # paper's own exp(e_hr^T e_t) scoring) work without changes.
         # 'log_inv_t' is returned here (rather than read directly off the module
         # later) purely for DDP correctness -- see the module docstring's BUGFIX note.
         return {'hr_vector': e_hr, 'tail_vector': e_t, 'head_vector': e_h,
-               'log_inv_t': self.log_inv_t}
+               'log_inv_t': self.log_inv_t, 'cand_vector': cand_vector}
 
     @torch.no_grad()
     def predict_ent_embedding(self, tail_token_ids, tail_mask, tail_token_type_ids, **kwargs) -> dict:

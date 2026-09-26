@@ -352,9 +352,18 @@ class Trainer:
 
     def _sample_false_negative_candidates(self, batch_exs: List[Example]) -> Optional[dict]:
         """alpha(t|e_hr) (Eq. 9): uniform over the head entity's <=2-hop link-graph
-        neighbourhood. Candidates are de-duplicated and encoded once per batch; each
-        row then samples `num_false_neg_samples` positions from its own neighbourhood
-        (with replacement if the neighbourhood is smaller than that).
+        neighbourhood. Candidates are de-duplicated and returned as *raw tensors
+        only* -- encoding now happens inside HaSaBertModel.forward() (see
+        models.py's module docstring), not here, so this method must not touch the
+        model at all.
+
+        BUGFIX (perf / OOM): this now samples `num_false_neg_samples` (M) candidates
+        per row FIRST, and only encodes the union of what was actually sampled.
+        Previously the union of every row's FULL <=2-hop neighbourhood was encoded
+        (with gradients) even though only M candidates per example are ever used --
+        on FB15k-237 that could be ~12,000 BERT forward passes for a single batch.
+        Sampling first gives the identical estimator (Eq. 13) with at most
+        batch_size * M unique candidates.
 
         NOTE: as of the Bug 3 fix in triplet.py::LinkGraph.get_n_hop_entity_indices,
         the returned neighbourhood no longer includes the head entity itself, so rows
@@ -369,13 +378,16 @@ class Trainer:
         across GPUs.
         """
         M = self.num_false_neg_samples
-        rows = [
-            list(self.link_graph.get_n_hop_entity_indices(
+        picks_per_row = []
+        for ex in batch_exs:
+            row = list(self.link_graph.get_n_hop_entity_indices(
                 ex.head_id, entity_dict=self.entity_dict, n_hop=2))
-            for ex in batch_exs
-        ]
+            if not row:
+                picks_per_row.append([])
+            else:
+                picks_per_row.append(random.sample(row, M) if len(row) >= M else random.choices(row, k=M))
 
-        unique_idx = sorted({idx for row in rows for idx in row})
+        unique_idx = sorted({idx for picks in picks_per_row for idx in picks})
         if not unique_idx:
             return None
         idx_to_pos = {idx: pos for pos, idx in enumerate(unique_idx)}
@@ -390,22 +402,15 @@ class Trainer:
         tail_token_type_ids = to_indices_and_mask(
             [torch.LongTensor(v['tail_token_type_ids']) for v in vectorized], need_mask=False)
 
-        row_samples = []
-        for row in rows:
-            if not row:
-                row_samples.append([])
-                continue
-            picks = random.sample(row, M) if len(row) >= M else random.choices(row, k=M)
-            row_samples.append([idx_to_pos[p] for p in picks])
-
         return {
             'tail_token_ids': tail_token_ids,
             'tail_mask': tail_mask,
             'tail_token_type_ids': tail_token_type_ids,
-            'row_samples': row_samples,
+            'row_samples': [[idx_to_pos[p] for p in picks] for picks in picks_per_row],
         }
 
-    def _hasa_loss(self, e_hr: torch.Tensor, e_t: torch.Tensor, batch_exs: List[Example],
+    def _hasa_loss(self, e_hr: torch.Tensor, e_t: torch.Tensor,
+                   cand_vector: Optional[torch.Tensor], row_samples: Optional[List[List[int]]],
                    inv_t: torch.Tensor):
         """L_HaSa(h,r,t) = -log( Pos / (Pos + NegHasa) ), Algorithm 1. The paper's
         pseudocode writes L_HaSa(h,r,t) = Pos/(Pos+NegHasa) directly as "the loss";
@@ -414,11 +419,21 @@ class Trainer:
         Eq. 6's actual InfoNCE-style formula (of which Algorithm 1 is presented as
         pseudocode for the same quantity).
 
-        `inv_t` is now passed in by the caller (train_epoch), read from
+        `inv_t` is passed in by the caller (train_epoch), read from
         `outputs['log_inv_t']`, rather than fetched here via
         `get_model_obj(self.model).log_inv_t`. See models.py's module docstring for
         why: under DistributedDataParallel, log_inv_t must be reachable from
         forward()'s own return value to stay gradient-synchronized across GPUs.
+
+        BUGFIX (DDP "Expected to mark a variable ready only once"): `cand_vector`
+        is now passed in already-encoded (as `outputs['cand_vector']` from the same
+        forward() call that produced `e_hr`/`e_t`), instead of this method calling
+        `get_model_obj(self.model).encode_text(...)` on the *unwrapped* module
+        itself. That raw call created a second, DDP-untracked autograd path through
+        `encoder`/`proj`, which desynced DDP's per-parameter "gradient ready" count
+        during backward() and crashed multi-GPU training (see models.py's module
+        docstring for the full explanation). This method now does no model calls at
+        all -- it only consumes tensors it's handed.
         """
         B = e_hr.size(0)
         device = e_hr.device
@@ -436,18 +451,8 @@ class Trainer:
         K = max(B - 1, 1)
 
         false_neg_mean = torch.zeros(B, device=device)
-        candidates = self._sample_false_negative_candidates(batch_exs)
-        if candidates is not None:
-            if torch.cuda.is_available():
-                candidates = move_to_cuda(candidates)
-            # encode_text() reuses `encoder`/`proj`, which were already used (and
-            # therefore already marked "reachable" for DDP) by the main model(...)
-            # forward call above -- calling it again here on new inputs doesn't
-            # introduce any new never-reached-by-forward parameters, unlike
-            # log_inv_t (fixed above) or StAR's classifier (see StAR/models.py).
-            cand_vec = get_model_obj(self.model).encode_text(
-                candidates['tail_token_ids'], candidates['tail_mask'], candidates['tail_token_type_ids'])
-            cand_sim = torch.clamp(e_hr.mm(cand_vec.t()) * inv_t, min=-30.0, max=30.0)
+        if cand_vector is not None and row_samples is not None:
+            cand_sim = torch.clamp(e_hr.mm(cand_vector.t()) * inv_t, min=-30.0, max=30.0)
             # BUGFIX (Bug 2): Eq. 13 is a *self-normalized importance-sampling*
             # estimate of E_{t~p-(t|e_hr,fact)}[exp(e_hr.e_t)], not a plain Monte
             # Carlo mean. Candidates s_m are drawn from the *proposal*
@@ -460,14 +465,13 @@ class Trainer:
             # weights exp(e_hr.e_t) (self-normalizing, since p- is only known up to
             # a constant) rather than a division by the sample count M:
             #     FalseNeg = sum_m exp(2 e_hr.e_tm) / sum_m exp(e_hr.e_tm)
-            # The previous code computed a plain unweighted mean
-            # `cand_exp[i].index_select(0, idx).mean()`, i.e. an estimate of
-            # E_alpha[exp(e_hr.e_t)] with no importance-weighting correction at
+            # The previous code computed a plain unweighted mean, i.e. an estimate
+            # of E_alpha[exp(e_hr.e_t)] with no importance-weighting correction at
             # all -- silently changing what NegHasa computes rather than crashing,
             # since this term is exactly what distinguishes HaSa from Hard InfoNCE.
             cand_exp = torch.exp(cand_sim)                                # (B, num_unique_candidates), exp(e_hr.e_t)
             cand_exp_sq = torch.exp(2.0 * cand_sim)                       # exp(2 e_hr.e_t), Eq. 13 numerator term
-            for i, positions in enumerate(candidates['row_samples']):
+            for i, positions in enumerate(row_samples):
                 if positions:
                     idx = torch.tensor(positions, device=device, dtype=torch.long)
                     weights = cand_exp[i].index_select(0, idx)            # (M,) unnormalized importance weights
@@ -503,6 +507,20 @@ class Trainer:
             batch_exs = batch_dict['batch_data']
             batch_size = len(batch_exs)
 
+            # BUGFIX (DDP "Expected to mark a variable ready only once"): sample the
+            # false-negative candidates and fold their tokenized tensors into the
+            # SAME batch_dict that goes into `self.model(**batch_dict)` below, so
+            # they're encoded inside that one DDP-tracked forward() call (see
+            # models.py's module docstring) instead of via a second, untracked
+            # `encode_text()` call made after the fact.
+            candidates = self._sample_false_negative_candidates(batch_exs)
+            row_samples = None
+            if candidates is not None:
+                batch_dict['cand_tail_token_ids'] = candidates['tail_token_ids']
+                batch_dict['cand_tail_mask'] = candidates['tail_mask']
+                batch_dict['cand_tail_token_type_ids'] = candidates['tail_token_type_ids']
+                row_samples = candidates['row_samples']
+
             if torch.cuda.is_available():
                 batch_dict = move_to_cuda(batch_dict)
 
@@ -513,10 +531,11 @@ class Trainer:
                 outputs = self.model(**batch_dict)
 
             e_hr, e_t = outputs['hr_vector'], outputs['tail_vector']
+            cand_vector = outputs.get('cand_vector')
             # Read from outputs (DDP-tracked), not get_model_obj(self.model).log_inv_t
             # -- see models.py's module docstring and _hasa_loss's docstring above.
             inv_t = outputs['log_inv_t'].exp()
-            loss, pos, neg, false_neg = self._hasa_loss(e_hr, e_t, batch_exs, inv_t)
+            loss, pos, neg, false_neg = self._hasa_loss(e_hr, e_t, cand_vector, row_samples, inv_t)
 
             losses.update(loss.item(), batch_size)
             pos_meter.update(pos.mean().item(), batch_size)
