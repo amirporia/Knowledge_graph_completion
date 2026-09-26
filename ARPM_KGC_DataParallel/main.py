@@ -3,9 +3,9 @@ import json
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 
-from ARPM_KGC.setting.config import args
-from ARPM_KGC.model.trainer import Trainer
-from ARPM_KGC.setting.logger_config import logger
+from ARPM_KGC_DataParallel.setting.config import args
+from ARPM_KGC_DataParallel.model.trainer import Trainer
+from ARPM_KGC_DataParallel.setting.logger_config import logger
 from datetime import timedelta
 
 

@@ -175,7 +175,30 @@ class Trainer:
         if not self.args.resume:
             return
 
-        checkpoint = load_checkpoint(self.args.resume_path, map_location=self.device)
+        # Load onto CPU first -- NOT directly onto the GPU via `map_location=self.device`.
+        #
+        # By this point the model is already resident on the GPU (see `_setup_device`,
+        # which runs before this method). Loading the checkpoint straight to
+        # `self.device` means the checkpoint's full model weights AND the entire AdamW
+        # optimizer state (two extra tensors per parameter -- exp_avg/exp_avg_sq, each
+        # the same size as the parameter itself) get materialized on the GPU all at
+        # once, on top of the model that's already sitting there -- before
+        # `load_state_dict` even runs. For two full BERT encoders (hr_bert + tail_bert)
+        # that transient double allocation is on the order of several GiB.
+        #
+        # This is exactly why a fresh run (nothing to resume, this method returns
+        # immediately) never OOMs while resuming does: the extra memory isn't needed
+        # once loading finishes, but by then the CUDA caching allocator can be left
+        # fragmented enough that the first real allocation in the forward pass
+        # (candidate encoding in `ARPMModel._build_memory`) fails even though the
+        # *total* free memory would otherwise be enough.
+        #
+        # Loading to CPU avoids the spike: `nn.Module.load_state_dict` copies each CPU
+        # tensor into the existing GPU parameter's storage in place (no second
+        # full-size GPU buffer), and `Optimizer.load_state_dict` casts/moves each
+        # state tensor to its parameter's device one at a time rather than assuming
+        # an already-GPU-resident blob.
+        checkpoint = load_checkpoint(self.args.resume_path, map_location='cpu')
 
         get_model_obj(self.model).load_state_dict(checkpoint['state_dict'])
 
@@ -194,6 +217,14 @@ class Trainer:
                 f'Resumed from {self.args.resume_path} '
                 f'(checkpoint epoch {checkpoint.get("epoch")}, resuming at epoch {self.start_epoch})'
             )
+
+        # Drop the CPU checkpoint dict and release any cached CUDA blocks left over
+        # from the load, so the first training batch starts from a clean,
+        # unfragmented allocator state rather than immediately racing the forward
+        # pass against leftover cache pressure from resuming.
+        del checkpoint
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def train_loop(self):
         for epoch in range(self.start_epoch, self.args.epochs):
