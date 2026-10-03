@@ -143,19 +143,15 @@ def compute_metrics(
         batch_size: int = 256,
 ) -> Tuple[List, List, Dict, List]:
     """
-    Compute evaluation metrics for link prediction.
+    Link-prediction metrics with the RAA-KGC inference rule (paper Eq. 9):
+
+        score(t) = phi(h, r, t_a) + phi(h, r, t)
+                 = cos(e^avg_hrta, e_t) + cos(e_hr, e_t)
 
     Args:
-        related_hr_tensor: Embeddings (head-anchor, relation, tail-anchors)
-        hr_tensor: Embeddings (head-anchor, relation)
-        entities_tensor: Embeddings of all tail entities
-        target: Target entity indices
-        examples: Evaluation examples
-        top_k: Number of top predictions to save
-        batch_size: Batch size for processing
-
-    Returns:
-        Tuple of (topk_scores, topk_indices, metrics, ranks)
+        related_hr_tensor: anchor-enhanced query embeddings e^avg_hrta
+        hr_tensor: classic query embeddings e_hr
+        entities_tensor: embeddings e_t of all candidate entities
     """
     assert hr_tensor.size(1) == entities_tensor.size(1), "Embedding dimensions must match"
     assert hr_tensor.size(0) == related_hr_tensor.size(0), "Tensor sizes must match"
@@ -164,6 +160,7 @@ def compute_metrics(
     entity_count = entities_tensor.size(0)
     assert entity_count == len(entity_dict), "Entity count mismatch"
 
+    related_hr_tensor = related_hr_tensor.to(hr_tensor.device)
     target = torch.LongTensor(target).unsqueeze(-1).to(hr_tensor.device)
 
     topk_scores, topk_indices, ranks = [], [], []
@@ -173,23 +170,20 @@ def compute_metrics(
     for start in tqdm.tqdm(range(0, total, batch_size)):
         end = start + batch_size
 
-        # Compute scores via matrix multiplication
-        batch_score = torch.mm(hr_tensor[start:end, :], entities_tensor.t())
-        related_batch_score = torch.mm(related_hr_tensor[start:end, :], entities_tensor.t())
-
-        # Re-rank based on topological structure
-        rerank_by_graph(
-            related_batch_score, batch_score,
-            examples[start:end],
-            entity_dict=entity_dict,
+        # Eq. (9): sum of the two cosine similarities
+        batch_score = (
+            torch.mm(hr_tensor[start:end, :], entities_tensor.t())
+            + torch.mm(related_hr_tensor[start:end, :], entities_tensor.t())
         )
 
-        # Filter known triplets
+        # Optional SimKGC graph re-ranking (off by default, neighbor_weight = 0)
+        rerank_by_graph(batch_score, examples[start:end], entity_dict=entity_dict)
+
+        # Filtered setting
         _filter_known_triplets(
             batch_score, examples, start, entity_dict, all_triplet_dict,
         )
 
-        # Rank scores and get target ranks
         batch_sorted_score, batch_sorted_indices = torch.sort(
             batch_score, dim=-1, descending=True,
         )
@@ -200,12 +194,11 @@ def compute_metrics(
         )
         assert target_rank.size(0) == batch_score.size(0), "Rank size mismatch"
 
-        # Calculate metrics
         for idx in range(batch_score.size(0)):
             idx_rank = target_rank[idx].tolist()
             assert idx_rank[0] == idx, "Index mismatch in ranks"
 
-            current_rank = idx_rank[1] + 1  # Convert to 1-based ranking
+            current_rank = idx_rank[1] + 1  # 1-based
 
             metrics_accumulator['mean_rank'] += current_rank
             metrics_accumulator['mrr'] += 1.0 / current_rank
@@ -216,11 +209,9 @@ def compute_metrics(
 
             ranks.append(current_rank)
 
-        # Store top-k predictions
         topk_scores.extend(batch_sorted_score[:, :top_k].tolist())
         topk_indices.extend(batch_sorted_indices[:, :top_k].tolist())
 
-    # Normalize metrics
     metrics = {
         k: round(v / total, 4) for k, v in metrics_accumulator.items()
     }
@@ -239,37 +230,22 @@ def eval_single_direction(
         eval_forward: bool = True,
         batch_size: int = 64,
 ) -> Dict:
-    """
-    Evaluate model performance in a single direction.
-
-    Args:
-        predictor: Trained BERT predictor model
-        entity_tensor: Pre-computed entity embeddings
-        eval_forward: If True, evaluate forward direction (head->tail)
-        batch_size: Batch size for metric computation
-
-    Returns:
-        Dictionary of evaluation metrics
-    """
+    """Evaluate model performance in a single direction (head->tail or tail->head)."""
     start_time = time()
 
-    # Load evaluation data
     examples = load_data(
         args.valid_path,
         add_forward_triplet=eval_forward,
         add_backward_triplet=not eval_forward,
     )
 
-    # Compute embeddings for head-relation pairs
     hr_tensor, _, related_hr_tensor = predictor.predict_by_examples(examples)
     hr_tensor = hr_tensor.to(entity_tensor.device)
 
-    # Get target entities
     target = [entity_dict.entity_to_idx(ex.tail_id) for ex in examples]
 
     logger.info('Predict tensor done, computing metrics...')
 
-    # Compute evaluation metrics
     topk_scores, topk_indices, metrics, ranks = compute_metrics(
         related_hr_tensor=related_hr_tensor,
         hr_tensor=hr_tensor,
@@ -279,11 +255,9 @@ def eval_single_direction(
         batch_size=batch_size,
     )
 
-    # Log metrics
     direction = 'forward' if eval_forward else 'backward'
     logger.info(f'{direction} metrics: {json.dumps(metrics)}')
 
-    # Save detailed predictions
     _save_prediction_details(
         examples, topk_scores, topk_indices, target, ranks,
         eval_direction=direction,
@@ -309,7 +283,6 @@ def _save_prediction_details(
         current_indices = topk_indices[idx]
         predicted_idx = current_indices[0]
 
-        # Build score info dictionary
         score_info = {
             entity_dict.get_entity_by_idx(topk_idx).entity: round(topk_score, 3)
             for topk_score, topk_idx in zip(current_scores, current_indices)
@@ -327,7 +300,6 @@ def _save_prediction_details(
         )
         pred_infos.append(pred_info)
 
-    # Save to file
     prefix = os.path.dirname(args.eval_model_path)
     basename = os.path.basename(args.eval_model_path)
     split = os.path.basename(args.valid_path)
@@ -338,18 +310,15 @@ def _save_prediction_details(
 
 
 def predict_by_split() -> None:
-    """Run prediction evaluation on train/valid/test splits."""
+    """Run prediction evaluation on the valid/test split."""
     assert os.path.exists(args.valid_path), f"Valid path not found: {args.valid_path}"
     assert os.path.exists(args.train_path), f"Train path not found: {args.train_path}"
 
-    # Load pre-trained model
     predictor = BertPredictor()
     predictor.load(ckt_path=args.eval_model_path)
 
-    # Compute entity embeddings
     entity_tensor = predictor.predict_by_entities(entity_dict.entity_exs)
 
-    # Evaluate both directions
     forward_metrics = eval_single_direction(
         predictor, entity_tensor=entity_tensor, eval_forward=True,
     )
@@ -357,14 +326,12 @@ def predict_by_split() -> None:
         predictor, entity_tensor=entity_tensor, eval_forward=False,
     )
 
-    # Compute average metrics
     averaged_metrics = {
         k: round((forward_metrics[k] + backward_metrics[k]) / 2, 4)
         for k in forward_metrics
     }
     logger.info(f'Averaged metrics: {averaged_metrics}')
 
-    # Save summary
     prefix = os.path.dirname(args.eval_model_path)
     basename = os.path.basename(args.eval_model_path)
     split = os.path.basename(args.valid_path)

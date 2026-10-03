@@ -99,9 +99,12 @@ class Trainer:
         self.valid_dataset = None
         self.valid_loader = None
         if self.args.valid_path and self.args.rank == 0:
-            self.valid_dataset = Dataset(path=self.args.valid_path, test_set=False)
+            # deterministic anchors -> comparable validation numbers between epochs
+            self.valid_dataset = Dataset(
+                path=self.args.valid_path, test_set=False
+            )
             self.valid_loader, _ = self._create_data_loader(
-                self.valid_dataset, shuffle=True, distributed=False
+                self.valid_dataset, shuffle=False, distributed=False
             )
 
     def _create_data_loader(self, dataset, shuffle, drop_last=False, distributed=False):
@@ -125,9 +128,6 @@ class Trainer:
 
     def _init_scheduler(self):
         """Initialize learning rate scheduler."""
-        # Under DDP, each rank only ever sees 1/world_size of the dataset (via the
-        # DistributedSampler), so the scheduler -- which steps once per local optimizer
-        # step -- needs the per-rank step count, not the full dataset's.
         world_size = self.args.world_size if self.args.distributed else 1
         steps_per_epoch = len(self.train_dataset) // world_size // max(self.args.batch_size, 1)
         num_training_steps = self.args.epochs * steps_per_epoch
@@ -164,12 +164,8 @@ class Trainer:
     def _maybe_resume(self):
         """Restore model/optimizer/scheduler/scaler state from a checkpoint if --resume was passed.
 
-        Resumption is at epoch granularity: training continues from the epoch after the
-        one recorded in the checkpoint. If the checkpoint was written mid-epoch (from an
-        --eval-every-n-step save), the remainder of that particular epoch is not replayed;
-        training instead picks up at the start of the next epoch. Optimizer/scheduler/scaler
-        state is still fully restored, so this only affects data coverage for that one epoch,
-        not the learning-rate schedule or optimizer momentum.
+        Resumption is at epoch granularity (see original docstring): training continues from the
+        epoch after the one recorded in the checkpoint.
         """
         if not self.args.resume:
             return
@@ -203,8 +199,6 @@ class Trainer:
     def train_epoch(self, epoch):
         """Train for one epoch."""
         if self.args.distributed:
-            # Reshuffles each rank's shard differently per epoch; without this every
-            # epoch would repeat the same rank->shard assignment.
             self.train_sampler.set_epoch(epoch)
 
         meters = self._init_training_meters()
@@ -259,23 +253,20 @@ class Trainer:
         return self.model(**batch_dict)
 
     def _compute_losses(self, outputs, batch_dict):
-        """Compute total loss and component losses."""
+        """Eq.(6): L_cls = alpha * L_hrta + L_hr."""
         outputs = get_model_obj(self.model).compute_logits(
             output_dict=outputs, batch_dict=batch_dict
         )
         outputs = ModelOutput(**outputs)
 
-        # Compute related loss (head+relation -> tail and tail -> head+relation)
         related_loss = self._compute_bidirectional_loss(
             outputs.related_logits, outputs.related_labels
         )
-
-        # Compute HR loss (head+relation -> tail and tail -> head+relation)
         hr_loss = self._compute_bidirectional_loss(
             outputs.hr_logits, outputs.hr_labels
         )
 
-        total_loss = 0.2 * related_loss + hr_loss
+        total_loss = self.args.alpha * related_loss + hr_loss
 
         return {
             'total_loss': total_loss,
@@ -286,7 +277,7 @@ class Trainer:
         }
 
     def _compute_bidirectional_loss(self, logits, labels):
-        """Compute loss in both directions for relation prediction."""
+        """InfoNCE in both directions (query->tail and tail->query), as in SimKGC."""
         assert logits.size(0) == self.args.batch_size
 
         loss = self.criterion(logits, labels)
@@ -309,6 +300,7 @@ class Trainer:
         meters['hr_losses'].update(loss_components['hr_loss'].item(), batch_size)
         meters['top1'].update(acc1.item(), batch_size)
         meters['top3'].update(acc3.item(), batch_size)
+        meters['inv_t'].update(get_model_obj(self.model).log_inv_t.exp().item(), batch_size)
 
     def _backward_pass(self, loss):
         """Execute backward pass with gradient clipping and optional AMP."""
@@ -323,7 +315,7 @@ class Trainer:
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
-            loss.backward(retain_graph=True)
+            loss.backward()  # retain_graph=True removed: it only wasted memory
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.args.grad_clip
             )
@@ -331,23 +323,18 @@ class Trainer:
 
     @torch.no_grad()
     def _run_eval(self, epoch, step=0):
-        """Run evaluation and handle checkpointing (rank 0 only under DDP).
-
-        Only rank 0 evaluates and writes checkpoint files -- running this on every rank
-        would duplicate work and risk multiple processes writing the same file at once.
-        The barrier keeps other ranks from racing ahead into the next epoch while rank 0
-        is still evaluating/saving.
-        """
+        """Run validation + checkpointing on rank 0; other ranks wait at the barrier."""
         if self.args.rank == 0:
-            # TODO: just for fb15k237 dataset
-            # metric_dict = self.eval_epoch(epoch)
-            # is_best = self._check_best_metric(metric_dict)
-            #
-            # if is_best:
-            #     self.best_metric = metric_dict
-            #
-            # self._save_checkpoint(epoch, step, is_best)
-            self._save_checkpoint(epoch, step, False)
+            if self.args.skip_valid_eval or self.valid_loader is None:
+                # No validation: keep the latest weights as "best" so evaluate.py still finds model_best.mdl
+                is_best = True
+            else:
+                metric_dict = self.eval_epoch(epoch)
+                is_best = self._check_best_metric(metric_dict)
+                if is_best:
+                    self.best_metric = metric_dict
+
+            self._save_checkpoint(epoch, step, is_best)
 
         if self.args.distributed:
             dist.barrier()
@@ -378,9 +365,6 @@ class Trainer:
             'scaler': self.scaler.state_dict() if self.args.use_amp else None,
             'best_metric': self.best_metric,
         }
-        # model_best.mdl is only ever read by eval/predict scripts (BertPredictor.load),
-        # which need just 'args' and 'state_dict' -- keep it free of optimizer/scheduler
-        # tensors so it stays a fraction of the full resume checkpoint's size.
         eval_state = {
             'epoch': epoch,
             'args': self.args.__dict__,
@@ -396,7 +380,7 @@ class Trainer:
 
     @torch.no_grad()
     def eval_epoch(self, epoch) -> Dict:
-        """Evaluate the model on validation set."""
+        """Evaluate the model on the validation set (rank 0 only)."""
         if not self.valid_loader:
             return {}
 
@@ -406,20 +390,22 @@ class Trainer:
             'top3': AverageMeter('Acc@3', ':6.2f')
         }
 
+        # Use the unwrapped module: under DDP only rank 0 runs this, and a DDP forward
+        # on a single rank must not trigger collective communication.
+        model = get_model_obj(self.model)
+        model.eval()
+
         for batch_dict in self.valid_loader:
-            self.model.eval()
             batch_dict = self._move_batch_to_device(batch_dict)
 
-            outputs = self.model(**batch_dict)
-            outputs = get_model_obj(self.model).compute_logits(
-                output_dict=outputs, batch_dict=batch_dict
-            )
+            outputs = model(**batch_dict)
+            outputs = model.compute_logits(output_dict=outputs, batch_dict=batch_dict)
             outputs = ModelOutput(**outputs)
 
             loss = self.criterion(outputs.hr_logits, outputs.hr_labels)
             acc1, acc3 = accuracy(outputs.hr_logits, outputs.hr_labels, topk=(1, 3))
 
-            batch_size = self.args.batch_size
+            batch_size = outputs.hr_logits.size(0)
             meters['losses'].update(loss.item(), batch_size)
             meters['top1'].update(acc1.item(), batch_size)
             meters['top3'].update(acc3.item(), batch_size)

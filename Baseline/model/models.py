@@ -1,7 +1,7 @@
 from abc import ABC
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -25,7 +25,7 @@ class ModelOutput:
 
 
 class CustomBertModel(nn.Module, ABC):
-    """Custom BERT model for relation prediction tasks."""
+    """RAA-KGC dual-encoder: g1 = hr_bert (queries), g2 = tail_bert (candidate entities)."""
 
     NEGATIVE_INF = -1e4
 
@@ -34,7 +34,7 @@ class CustomBertModel(nn.Module, ABC):
         self.args = args
         self.config = AutoConfig.from_pretrained(args.pretrained_model)
 
-        # Inverse temperature parameter for scaling logits
+        # Inverse temperature parameter for scaling logits (tau is learnable in the paper)
         self.log_inv_t = nn.Parameter(
             torch.tensor(1.0 / args.t).log(),
             requires_grad=args.finetune_t
@@ -47,7 +47,7 @@ class CustomBertModel(nn.Module, ABC):
         # Initialize pre-batch negative samples
         self._init_pre_batch_vectors()
 
-        # Dual encoder architecture
+        # Dual encoder architecture (same init, no parameter sharing)
         self.hr_bert = AutoModel.from_pretrained(args.pretrained_model)
         self._drop_unused_pooler(self.hr_bert)
         self.tail_bert = deepcopy(self.hr_bert)
@@ -89,9 +89,6 @@ class CustomBertModel(nn.Module, ABC):
 
     def forward(
             self,
-            related_h_triple_token_ids_list: List[torch.Tensor],
-            related_h_triple_mask_list: List[torch.Tensor],
-            related_h_triple_token_type_ids_list: List[torch.Tensor],
             h_triple_token_ids: torch.Tensor,
             h_triple_mask: torch.Tensor,
             h_triple_token_type_ids: torch.Tensor,
@@ -102,14 +99,20 @@ class CustomBertModel(nn.Module, ABC):
             head_mask: torch.Tensor,
             head_token_type_ids: torch.Tensor,
             test_forward: bool,
+            anchor_token_ids: Optional[torch.Tensor] = None,
+            anchor_mask: Optional[torch.Tensor] = None,
+            anchor_token_type_ids: Optional[torch.Tensor] = None,
+            anchor_group_ids: Optional[torch.Tensor] = None,
             only_ent_embedding: bool = False,
             **kwargs
     ) -> Dict:
-        """Forward pass for training or inference.
+        """Forward pass.
 
         Args:
-            test_forward: If True, run in inference mode without related triplet processing
-            only_ent_embedding: If True, only compute entity embeddings (inference only)
+            test_forward: True -> entity-embedding / plain inference path (no anchors)
+            only_ent_embedding: True -> only compute candidate entity embeddings
+            anchor_*: all anchor-enhanced queries of the batch, flattened; anchor_group_ids[j]
+                      is the index of the batch example that anchor query j belongs to.
         """
         if test_forward:
             return self._forward_test(
@@ -118,30 +121,21 @@ class CustomBertModel(nn.Module, ABC):
                 head_token_ids, head_mask, head_token_type_ids,
                 only_ent_embedding
             )
-        else:
-            return self._forward_train(
-                related_h_triple_token_ids_list,
-                related_h_triple_mask_list,
-                related_h_triple_token_type_ids_list,
-                h_triple_token_ids, h_triple_mask, h_triple_token_type_ids,
-                tail_token_ids, tail_mask, tail_token_type_ids,
-                head_token_ids, head_mask, head_token_type_ids
-            )
+        return self._forward_train(
+            h_triple_token_ids, h_triple_mask, h_triple_token_type_ids,
+            tail_token_ids, tail_mask, tail_token_type_ids,
+            head_token_ids, head_mask, head_token_type_ids,
+            anchor_token_ids, anchor_mask, anchor_token_type_ids, anchor_group_ids
+        )
 
     def _forward_test(
             self,
-            tail_token_ids: torch.Tensor,
-            tail_mask: torch.Tensor,
-            tail_token_type_ids: torch.Tensor,
-            h_triple_token_ids: torch.Tensor,
-            h_triple_mask: torch.Tensor,
-            h_triple_token_type_ids: torch.Tensor,
-            head_token_ids: torch.Tensor,
-            head_mask: torch.Tensor,
-            head_token_type_ids: torch.Tensor,
+            tail_token_ids, tail_mask, tail_token_type_ids,
+            h_triple_token_ids, h_triple_mask, h_triple_token_type_ids,
+            head_token_ids, head_mask, head_token_type_ids,
             only_ent_embedding: bool
     ) -> Dict:
-        """Forward pass for inference/testing."""
+        """Forward pass for inference/testing without anchors."""
         if only_ent_embedding:
             return self._predict_ent_embedding(
                 tail_token_ids, tail_mask, tail_token_type_ids
@@ -166,21 +160,12 @@ class CustomBertModel(nn.Module, ABC):
 
     def _forward_train(
             self,
-            related_h_triple_token_ids_list: List[torch.Tensor],
-            related_h_triple_mask_list: List[torch.Tensor],
-            related_h_triple_token_type_ids_list: List[torch.Tensor],
-            h_triple_token_ids: torch.Tensor,
-            h_triple_mask: torch.Tensor,
-            h_triple_token_type_ids: torch.Tensor,
-            tail_token_ids: torch.Tensor,
-            tail_mask: torch.Tensor,
-            tail_token_type_ids: torch.Tensor,
-            head_token_ids: torch.Tensor,
-            head_mask: torch.Tensor,
-            head_token_type_ids: torch.Tensor
+            h_triple_token_ids, h_triple_mask, h_triple_token_type_ids,
+            tail_token_ids, tail_mask, tail_token_type_ids,
+            head_token_ids, head_mask, head_token_type_ids,
+            anchor_token_ids, anchor_mask, anchor_token_type_ids, anchor_group_ids
     ) -> Dict:
-        """Forward pass for training with related triplet processing."""
-        # Encode main triplets
+        """Forward pass that also produces the anchor-enhanced query embedding e^avg_hrta."""
         tail_vector = self._encode(
             self.tail_bert, tail_token_ids, tail_mask, tail_token_type_ids
         )
@@ -191,66 +176,65 @@ class CustomBertModel(nn.Module, ABC):
             self.tail_bert, head_token_ids, head_mask, head_token_type_ids
         )
 
-        # Process related triplets
-        final_hr_vector = self._encode_related_triplets(
-            related_h_triple_token_ids_list,
-            related_h_triple_mask_list,
-            related_h_triple_token_type_ids_list
+        anchor_hr_vector = self._encode_anchor_queries(
+            hr_vector, anchor_token_ids, anchor_mask, anchor_token_type_ids, anchor_group_ids
         )
 
         return {
-            'related_hr_vector': final_hr_vector,
-            'hr_vector': hr_vector,
-            'tail_vector': tail_vector,
+            'related_hr_vector': anchor_hr_vector,   # e^avg_hrta
+            'hr_vector': hr_vector,                  # e_hr
+            'tail_vector': tail_vector,              # e_t
             'head_vector': head_vector,
             'related': True
         }
 
-    def _encode_related_triplets(
+    def _encode_anchor_queries(
             self,
-            token_ids_list: List[torch.Tensor],
-            mask_list: List[torch.Tensor],
-            token_type_ids_list: List[torch.Tensor]
+            hr_vector: torch.Tensor,
+            token_ids: Optional[torch.Tensor],
+            mask: Optional[torch.Tensor],
+            token_type_ids: Optional[torch.Tensor],
+            group_ids: Optional[torch.Tensor]
     ) -> torch.Tensor:
-        """Encode related triplets and average their representations."""
-        hr_vectors = []
+        """Eq.(5): e^avg_hrta = average over the k anchor-enhanced query embeddings of each example.
 
-        for token_ids, mask, token_type_ids in zip(token_ids_list, mask_list, token_type_ids_list):
-            hr_vector = self._encode(
-                self.hr_bert, token_ids, mask, token_type_ids
-            )
-            hr_vectors.append(hr_vector)
+        Plain mean (no re-normalisation). Examples without any anchor fall back to e_hr.
+        """
+        if token_ids is None or token_ids.size(0) == 0:
+            return hr_vector
 
-        # Average each group of vectors
-        averaged_vectors = [torch.mean(vec, dim=0, keepdim=True) for vec in hr_vectors]
+        anchor_vectors = self._encode(self.hr_bert, token_ids, mask, token_type_ids)
 
-        return torch.cat(averaged_vectors, dim=0)
+        num_queries = hr_vector.size(0)
+        summed = torch.zeros(
+            num_queries, anchor_vectors.size(1), dtype=anchor_vectors.dtype, device=anchor_vectors.device
+        ).index_add(0, group_ids, anchor_vectors)
+        counts = torch.bincount(group_ids, minlength=num_queries)
+
+        mean = summed / counts.clamp(min=1).unsqueeze(1).to(summed.dtype)
+        avg = mean.to(hr_vector.dtype)
+
+        return torch.where((counts > 0).unsqueeze(1), avg, hr_vector)
 
     def compute_logits(self, output_dict: Dict, batch_dict: Dict) -> Dict:
-        """Compute logits for training/evaluation.
-
-        Args:
-            output_dict: Output from forward pass
-            batch_dict: Batch data dictionary
-        """
+        """Compute logits for training/evaluation."""
         if output_dict['related']:
             return self._compute_related_logits(output_dict, batch_dict)
-        else:
-            return self._compute_standard_logits(output_dict, batch_dict)
+        return self._compute_standard_logits(output_dict, batch_dict)
 
     def _compute_related_logits(self, output_dict: Dict, batch_dict: Dict) -> Dict:
-        """Compute logits including related triplet information."""
-        related_hr_vector = output_dict['related_hr_vector']
+        """Logits for L_hrta (Eq.7) and L_hr (Eq.8)."""
+        anchor_vector = output_dict['related_hr_vector']
         tail_vector = output_dict['tail_vector']
 
-        # Compute related logits
-        related_labels = torch.arange(related_hr_vector.size(0), device=related_hr_vector.device)
+        # --- L_hrta: positive = (e^avg_hrta_i, e_t_i); negatives = IBN ---------
+        related_labels = torch.arange(anchor_vector.size(0), device=anchor_vector.device)
         related_logits = self._compute_similarity_logits(
-            related_hr_vector, tail_vector,
-            batch_dict.get('related_triplet_mask')
+            anchor_vector, tail_vector,
+            batch_dict.get('related_triplet_mask')   # built from the anchor examples (original behaviour)
         )
 
-        # Compute standard HR logits
+        # --- L_hr: positive = (e_hr_i, e_t_i); negatives = IBN + SN ---------------------
         hr_vector = output_dict['hr_vector']
         hr_labels = torch.arange(hr_vector.size(0), device=hr_vector.device)
         hr_logits = self._compute_similarity_logits(
@@ -258,7 +242,6 @@ class CustomBertModel(nn.Module, ABC):
             batch_dict.get('triplet_mask')
         )
 
-        # Add self-negative logits if enabled
         if self.args.use_self_negative and self.training:
             hr_logits = self._add_self_negative_logits(
                 hr_logits, hr_vector, output_dict['head_vector'],
@@ -273,7 +256,7 @@ class CustomBertModel(nn.Module, ABC):
         }
 
     def _compute_standard_logits(self, output_dict: Dict, batch_dict: Dict) -> Dict:
-        """Compute standard logits without related triplet information."""
+        """Standard (SimKGC) logits without anchors."""
         hr_vector = output_dict['hr_vector']
         tail_vector = output_dict['tail_vector']
 
@@ -283,14 +266,12 @@ class CustomBertModel(nn.Module, ABC):
             batch_dict.get('triplet_mask')
         )
 
-        # Add pre-batch negative logits
         if self.pre_batch > 0 and self.training:
             pre_batch_logits = self._compute_pre_batch_logits(
                 hr_vector, tail_vector, batch_dict
             )
             hr_logits = torch.cat([hr_logits, pre_batch_logits], dim=-1)
 
-        # Add self-negative logits if enabled
         if self.args.use_self_negative and self.training:
             hr_logits = self._add_self_negative_logits(
                 hr_logits, hr_vector, output_dict['head_vector'],
@@ -310,17 +291,10 @@ class CustomBertModel(nn.Module, ABC):
             key_vectors: torch.Tensor,
             mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Compute similarity logits with optional margin and masking.
-
-        Args:
-            query_vectors: Query embeddings
-            key_vectors: Key embeddings to compare against
-            mask: Optional mask to apply to logits
-        """
+        """Cosine logits with additive margin gamma on positives, scaled by 1/tau."""
         logits = query_vectors.mm(key_vectors.t())
 
         if self.training:
-            # Apply additive margin to diagonal (positive pairs)
             logits = logits - torch.diag_embed(
                 torch.full((logits.size(0),), self.add_margin, device=logits.device)
             )
@@ -339,7 +313,7 @@ class CustomBertModel(nn.Module, ABC):
             head_vector: torch.Tensor,
             self_negative_mask: torch.Tensor
     ) -> torch.Tensor:
-        """Add self-negative logits to the existing logits."""
+        """Add self-negative (SN) logits to the existing logits."""
         self_neg_logits = torch.sum(hr_vector * head_vector, dim=1) * self.log_inv_t.exp()
         self_neg_logits.masked_fill_(~self_negative_mask, self.NEGATIVE_INF)
 
@@ -351,19 +325,16 @@ class CustomBertModel(nn.Module, ABC):
             tail_vector: torch.Tensor,
             batch_dict: Dict
     ) -> torch.Tensor:
-        """Compute logits against pre-batch negative samples."""
+        """Compute logits against pre-batch negative samples (not used by RAA-KGC)."""
         batch_exs = batch_dict['batch_data']
 
-        # Compute similarity with pre-batch vectors
         pre_batch_logits = hr_vector.mm(self.pre_batch_vectors.clone().t())
         pre_batch_logits *= self.log_inv_t.exp() * self.args.pre_batch_weight
 
-        # Apply triplet mask if available
         if self.pre_batch_exs[-1] is not None:
             pre_triplet_mask = construct_mask(batch_exs, self.pre_batch_exs).to(hr_vector.device)
             pre_batch_logits.masked_fill_(~pre_triplet_mask, self.NEGATIVE_INF)
 
-        # Update pre-batch buffer
         start_idx = self.offset
         end_idx = self.offset + self.batch_size
 
@@ -393,14 +364,7 @@ def _pool_output(
         mask: torch.Tensor,
         last_hidden_state: torch.Tensor
 ) -> torch.Tensor:
-    """Pool the output hidden states according to the specified pooling strategy.
-
-    Args:
-        pooling: Pooling strategy ('cls', 'max', or 'mean')
-        cls_output: CLS token output
-        mask: Attention mask
-        last_hidden_state: Full hidden states from the last layer
-    """
+    """Pool the output hidden states according to the specified pooling strategy."""
     if pooling == 'cls':
         output_vector = cls_output
 

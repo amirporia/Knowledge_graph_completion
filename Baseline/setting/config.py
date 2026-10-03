@@ -12,10 +12,21 @@ SCRIPT_DIR = Path(__file__).parent.parent.parent.absolute()
 # Current task name
 CURRENT_TASK_NAME = "wn18rr"
 
+# Paper Eq.(1): K = 5 is the maximum number of anchors per query
+MAX_ANCHORS = 5
+
+
+def _add_toggle(group, name: str, default: bool, help_text: str) -> None:
+    """Register `--name` / `--no-name` flags that share one boolean destination (py3.7 compatible)."""
+    dest = name.replace('-', '_')
+    group.add_argument(f'--{name}', dest=dest, action='store_true', default=default, help=help_text)
+    group.add_argument(f'--no-{name}', dest=dest, action='store_false', default=default,
+                       help=f'Disable: {help_text}')
+
 
 def parse_args():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='SimKGC arguments')
+    parser = argparse.ArgumentParser(description='RAA-KGC arguments')
 
     # Model settings
     model_group = parser.add_argument_group('Model')
@@ -71,19 +82,30 @@ def parse_args():
                             help='Resume training from a checkpoint (model, optimizer, scheduler, epoch)')
     mgmt_group.add_argument('--resume-path', default=None, type=str,
                             help='Checkpoint to resume from (default: <model-dir>/model_last.mdl)')
+    mgmt_group.add_argument('--skip-valid-eval', action='store_true',
+                            help='Skip validation during training; the latest checkpoint is then '
+                                 'saved as model_best.mdl')
 
     # Loss and optimization
     loss_group = parser.add_argument_group('Loss and Optimization')
     loss_group.add_argument('--t', default=0.05, type=float,
                             help='Temperature parameter')
     loss_group.add_argument('--additive-margin', default=0.02, type=float,
-                            help='Additive margin for InfoNCE loss')
-    loss_group.add_argument('--finetune-t', action='store_true',
-                            help='Make temperature a trainable parameter')
+                            help='Additive margin (gamma) for InfoNCE loss')
+    # Paper: "tau is a learnable temperature parameter" -> trainable by default
+    _add_toggle(loss_group, 'finetune-t', True, 'Make temperature a trainable parameter')
     loss_group.add_argument('--pre-batch', default=0, type=int,
-                            help='Number of pre-batch used for negatives')
+                            help='Number of pre-batch used for negatives (paper: not used)')
     loss_group.add_argument('--pre-batch-weight', default=0.5, type=float,
                             help='Weight for logits from pre-batch negatives')
+    loss_group.add_argument('--alpha', default=0.2, type=float,
+                            help='Trade-off weight alpha of L_hrta in Eq.(6); paper searches {0.1..0.5}')
+
+    # Relation-aware anchor settings (RAA-KGC)
+    anchor_group = parser.add_argument_group('Relation-aware anchors')
+    anchor_group.add_argument('--anchor-num', default=4, type=int,
+                              help=f'Number of anchors k sampled from the relation-aware neighbourhood '
+                                   f'(0 disables anchors, max K={MAX_ANCHORS}; best in paper Table 4: 4)')
 
     # Graph and context settings
     graph_group = parser.add_argument_group('Graph')
@@ -111,15 +133,14 @@ def parse_args():
     eval_group = parser.add_argument_group('Evaluation')
     eval_group.add_argument('--is-test', action='store_true', default=False,
                             help='Run in test mode')
-    eval_group.add_argument('--use-self-negative', action='store_true', default=True,
-                            help='Use head entity as negative sample')
+    _add_toggle(eval_group, 'use-self-negative', True, 'Use head entity as negative sample (SN)')
 
     return parser.parse_args()
 
 
 def generate_paths_from_task(arguments):
     """Generate dynamic paths based on task name."""
-    task = arguments.task.lower()  # Convert to uppercase for folder naming
+    task = arguments.task.lower()
 
     # Generate data paths
     if arguments.train_path is None:
@@ -140,7 +161,6 @@ def generate_paths_from_task(arguments):
 
 def validate_args(arguments):
     """Validate parsed arguments."""
-    # Generate paths from task if not specified
     arguments = generate_paths_from_task(arguments)
 
     # Validate paths
@@ -148,6 +168,12 @@ def validate_args(arguments):
         raise FileNotFoundError(f"Training data not found: {arguments.train_path}")
     if arguments.valid_path and not os.path.exists(arguments.valid_path):
         raise FileNotFoundError(f"Validation data not found: {arguments.valid_path}")
+
+    # Anchor settings (paper Eq.1: k <= K = 5)
+    if not 0 <= arguments.anchor_num <= MAX_ANCHORS:
+        raise ValueError(f'--anchor-num must be in [0, {MAX_ANCHORS}], got {arguments.anchor_num}')
+    if arguments.alpha < 0:
+        raise ValueError('--alpha must be non-negative')
 
     # Setup model directory
     if arguments.model_dir:
@@ -166,7 +192,6 @@ def validate_args(arguments):
         if not os.path.exists(arguments.resume_path):
             raise FileNotFoundError(f"Resume checkpoint not found: {arguments.resume_path}")
 
-    # Validate choices are already handled by argparse choices parameter
     return arguments
 
 
