@@ -94,7 +94,7 @@ def parse_args():
                             help='Temperature parameter (used only to scale CE logits; the '
                                  'reported/ranked S_q, S_p, S_struct, S remain the raw '
                                  'paper-defined similarities, see model/trainer.py)')
-    loss_group.add_argument('--additive-margin', default=0.02, type=float,
+    loss_group.add_argument('--additive-margin', default=0.0, type=float,
                             help='Additive margin for the S_q InfoNCE loss only')
     loss_group.add_argument('--finetune-t', action='store_true',
                             help='Make temperature a trainable parameter')

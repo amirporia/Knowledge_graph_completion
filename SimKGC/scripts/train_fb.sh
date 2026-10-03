@@ -31,7 +31,7 @@ python3 -u main.py \
 --task ${TASK} \
 --batch-size 16 \
 --print-freq 20 \
---additive-margin 0.02 \
+--additive-margin 0 \
 --use-amp \
 --use-self-negative \
 --finetune-t \
