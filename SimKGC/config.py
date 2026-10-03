@@ -49,7 +49,7 @@ parser.add_argument('--pre-batch', default=0, type=int,
                     help='number of pre-batch used for negatives')
 parser.add_argument('--pre-batch-weight', default=0.5, type=float,
                     help='the weight for logits from pre-batch negatives')
-parser.add_argument('--additive-margin', default=0.0, type=float, metavar='N',
+parser.add_argument('--additive-margin', default=0.02, type=float, metavar='N',
                     help='additive margin for InfoNCE loss function')
 parser.add_argument('--finetune-t', action='store_true',
                     help='make temperature as a trainable parameter or not')

@@ -76,7 +76,7 @@ def parse_args():
     loss_group = parser.add_argument_group('Loss and Optimization')
     loss_group.add_argument('--t', default=0.05, type=float,
                             help='Temperature parameter')
-    loss_group.add_argument('--additive-margin', default=0.0, type=float,
+    loss_group.add_argument('--additive-margin', default=0.02, type=float,
                             help='Additive margin for InfoNCE loss')
     loss_group.add_argument('--finetune-t', action='store_true',
                             help='Make temperature a trainable parameter')
