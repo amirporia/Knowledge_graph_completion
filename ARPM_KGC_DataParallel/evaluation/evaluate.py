@@ -10,7 +10,7 @@ import tqdm
 from .predict import ARPMPredictor
 from ..setting.config import args
 from ..setting.logger_config import logger
-from ..utils.dict_hub import get_entity_dict, get_all_triplet_dict
+from ..utils.dict_hub import get_entity_dict, get_all_triplet_dict, get_link_graph
 from ..utils.doc import load_data, Example
 from ..utils.triplet import EntityDict
 
@@ -141,7 +141,7 @@ def compute_metrics(
 
     topk_scores, topk_indices, ranks = [], [], []
     metrics_accumulator = {'mean_rank': 0, 'mrr': 0, 'hit@1': 0,
-                            'hit@3': 0, 'hit@10': 0, 'hit@50': 0}
+                           'hit@3': 0, 'hit@10': 0, 'hit@50': 0}
 
     for start in tqdm.tqdm(range(0, total, batch_size)):
         end = start + batch_size
@@ -156,6 +156,8 @@ def compute_metrics(
         batch_score = model_obj.combined_score(
             S_q, S_p, S_s, lambda_p_tensor[start:end], lambda_s_tensor[start:end]
         )
+
+        _rerank_by_graph(batch_score, examples, start, entity_dict)
 
         _filter_known_triplets(
             batch_score, examples, start, entity_dict, all_triplet_dict,
@@ -352,6 +354,24 @@ def predict_by_split() -> None:
         f.write(f'forward metrics: {json.dumps(forward_metrics)}\n')
         f.write(f'backward metrics: {json.dumps(backward_metrics)}\n')
         f.write(f'average metrics: {json.dumps(averaged_metrics)}\n')
+
+
+def _rerank_by_graph(batch_score, examples, start_idx, entity_dictionary) -> None:
+    """Add `neighbor_weight` to every entity within n hops of the head (train graph only)."""
+    if args.neighbor_weight < 1e-6 or args.task == 'wiki5m_ind':
+        return
+    link_graph = get_link_graph()
+    for idx in range(batch_score.size(0)):
+        head_id = examples[start_idx + idx].head_id
+        nb = link_graph.get_n_hop_entity_indices(
+            head_id, entity_dict=entity_dictionary, n_hop=args.rerank_n_hop)
+        nb.discard(entity_dictionary.entity_to_idx(head_id))  # never boost the head itself
+        if nb:
+            nb_t = torch.LongTensor(sorted(nb)).to(batch_score.device)
+            batch_score[idx].index_add_(
+                0, nb_t,
+                torch.full((nb_t.numel(),), args.neighbor_weight,
+                           device=batch_score.device, dtype=batch_score.dtype))
 
 
 # ---------------------------------------------------------------------------

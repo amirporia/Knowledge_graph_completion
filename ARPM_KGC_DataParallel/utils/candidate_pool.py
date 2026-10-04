@@ -33,6 +33,7 @@ get_link_graph), independent of args.is_test, so no validation/test labels can
 leak into the candidate pool at evaluation time.
 """
 import random
+import zlib
 from collections import defaultdict
 from typing import Dict, List, Tuple
 
@@ -41,9 +42,23 @@ from ..setting.config import args
 from ..setting.logger_config import logger
 
 NO_HOP = -1  # sentinel hop value for global candidates (and, in utils/doc.py's
-             # collate, for padding slots) -- distinct from every valid local
-             # hop slot 0..num_hops (including local hop 0), so it can never
-             # be mistaken for a genuine local anchor.
+
+
+# collate, for padding slots) -- distinct from every valid local
+# hop slot 0..num_hops (including local hop 0), so it can never
+# be mistaken for a genuine local anchor.
+
+def _make_rng(head_id: str, relation: str):
+    """Eval: per-query seeded RNG, so anchors (and MRR) are reproducible.
+    Training: the global `random` module (fresh samples every epoch)."""
+    if args.is_test:
+        return random.Random(zlib.crc32(f'{args.eval_seed}|{head_id}|{relation}'.encode('utf-8')))
+    return random
+
+
+def _ordered(items):
+    """Stable order at eval, independent of PYTHONHASHSEED; cheap list() in training."""
+    return sorted(items) if args.is_test else list(items)
 
 
 class CandidateAnchor:
@@ -53,9 +68,9 @@ class CandidateAnchor:
         self.head_id = head_id
         self.relation = relation
         self.tail_id = tail_id
-        self.hop = hop            # NO_HOP (-1) = global; 0..num_hops = local hop slot
-                                   # (0 = same head & relation, graph distance 0;
-                                   # 1..num_hops = increasing graph distance)
+        self.hop = hop  # NO_HOP (-1) = global; 0..num_hops = local hop slot
+        # (0 = same head & relation, graph distance 0;
+        # 1..num_hops = increasing graph distance)
         self.is_local = is_local
 
 
@@ -90,101 +105,65 @@ class CandidatePoolBuilder:
             f'for global candidate retrieval (num_hops={self.num_hops}, '
             f'anchor_budget={self.total_budget})'
         )
+        for pairs in self._relation2pairs.values():
+            pairs.sort()
 
-    def _same_head_candidates(self, head_id: str, relation: str, tail_id: str) -> List[CandidateAnchor]:
-        """Hop 0: other valid tails for the exact same (h, r) pair (graph
-        distance 0 -- no traversal), excluding the query's own true tail."""
-        candidate_tails = list(self.train_triplet_dict.get_neighbors(head_id, relation))
-        random.shuffle(candidate_tails)
+    def _same_head_candidates(self, head_id, relation, tail_id, rng) -> List[CandidateAnchor]:
+        tails = [t for t in _ordered(self.train_triplet_dict.get_neighbors(head_id, relation))
+                 if t != tail_id]
+        rng.shuffle(tails)
+        budget = max(self.local_per_hop_budget, 0)
+        return [CandidateAnchor(head_id, relation, t, 0, True) for t in tails[:budget]]
 
-        candidates = []
-        found = 0
-        for cand_tail in candidate_tails:
-            if found >= self.local_per_hop_budget:
-                break
-            if cand_tail == tail_id:
-                continue
-            candidates.append(CandidateAnchor(head_id, relation, cand_tail, 0, True))
-            found += 1
-
-        return candidates
-
-    def _local_candidates(self, head_id: str, relation: str, tail_id: str) -> List[CandidateAnchor]:
-        """A_local(h,r) = U_{l=0}^{num_hops} A_local^(l)(h,r): hop 0 is the
-        same-head-and-relation category (see `_same_head_candidates`); hops
-        1..num_hops sample a bounded number of nodes reachable at each exact
-        graph distance and, if they participate in a relation-r training
-        triple, add that triple as a local anchor tagged with its hop slot.
-
-        `--num-hops N` therefore yields N+1 local categories in total:
-        hop-0 (same head & relation), hop-1 (graph distance 1), ...,
-        hop-N (graph distance N) -- e.g. `--num-hops 2` gives hop-0, hop-1,
-        AND hop-2."""
+    def _local_candidates(self, head_id, relation, tail_id, rng, blocked) -> List[CandidateAnchor]:
         if self.link_graph is None:
             return []
 
-        candidates: List[CandidateAnchor] = self._same_head_candidates(head_id, relation, tail_id)
-
-        if self.num_hops < 1:
+        candidates = self._same_head_candidates(head_id, relation, tail_id, rng)
+        if self.num_hops < 1 or self.local_per_hop_budget <= 0:
             return candidates
 
-        # hop_layers[0] = nodes at graph distance 1, ..., hop_layers[num_hops-1]
-        # = nodes at graph distance num_hops -- labeled here as local hop
-        # SLOTS 1..num_hops (enumerate start=1), on top of hop-0 above.
-        hop_layers = self.link_graph.get_hop_layers(head_id, max_hop=self.num_hops)
+        # `blocked` removes the query's own h-t edge during training, so t is not a hop-1
+        # node and nodes reachable only through t do not appear at hop 2.
+        hop_layers = self.link_graph.get_hop_layers(head_id, max_hop=self.num_hops, blocked=blocked)
 
         for hop_slot, layer_nodes in enumerate(hop_layers, start=1):
-            if not layer_nodes or self.local_per_hop_budget <= 0:
+            if not layer_nodes:
                 continue
-            nodes = list(layer_nodes)
-            random.shuffle(nodes)
-
+            nodes = _ordered(layer_nodes)
+            rng.shuffle(nodes)
             found = 0
             for node in nodes:
-                # Check the budget BEFORE adding, not after: with the check
-                # only after append+increment, local_per_hop_budget=0 would
-                # still let exactly one candidate through per non-empty hop.
                 if found >= self.local_per_hop_budget:
                     break
-                cand_tail_ids = self.train_triplet_dict.get_neighbors(node, relation)
-                if not cand_tail_ids:
+                cand_tails = self.train_triplet_dict.get_neighbors(node, relation)
+                if not cand_tails:
                     continue
-                cand_tail = next(iter(cand_tail_ids))
+                cand_tail = rng.choice(_ordered(cand_tails))
                 candidates.append(CandidateAnchor(node, relation, cand_tail, hop_slot, True))
                 found += 1
-
         return candidates
 
-    def _global_candidates(self, head_id: str, tail_id: str, relation: str) -> List[CandidateAnchor]:
-        """A_global(r) subset of T_r, excluding ground truth triples."""
+    def _global_candidates(self, head_id, relation, rng) -> List[CandidateAnchor]:
+        """A_global(r): a different head from the query (same-head pairs are hop-0)."""
         pool = self._relation2pairs.get(relation, [])
-        if not pool:
+        if not pool or self.global_budget <= 0:
             return []
+        sampled = rng.sample(pool, self.global_budget) if len(pool) > self.global_budget else pool
+        return [CandidateAnchor(h, relation, t, NO_HOP, False)
+                for h, t in sampled if h != head_id]
 
-        sampled = random.sample(pool, self.global_budget) if len(pool) > self.global_budget else pool
-
-        candidates = []
-        for cand_head, cand_tail in sampled:
-            if cand_head == head_id and cand_tail == tail_id:
-                continue
-            candidates.append(CandidateAnchor(cand_head, relation, cand_tail, NO_HOP, False))
-        return candidates
-
-    def build(self, head_id: str, relation: str, tail_id: str) -> List[CandidateAnchor]:
-        """A(h,r) = A_local(h,r) U A_global(r), capped at `total_budget`.
-
-        May legitimately return an empty list (isolated head with no graph
-        neighbors, no other tail for the same (h,r) pair, and a relation seen
-        nowhere else) -- callers must handle a query with zero candidate
-        anchors gracefully rather than falling back to the query's own true
-        triple, which would leak the label.
-        """
-        candidates = self._local_candidates(head_id, relation, tail_id) + \
-            self._global_candidates(head_id, tail_id, relation)
-
+    def build(self, head_id: str, relation: str, tail_id: str = None, blocked=None) -> List[CandidateAnchor]:
+        """`tail_id` is passed ONLY in training (None at eval: no label use at test time).
+        `blocked=(h, t)` removes the query's own edge from the graph (training only)."""
+        rng = _make_rng(head_id, relation)
+        local = self._local_candidates(head_id, relation, tail_id, rng, blocked)
+        seen = {(c.head_id, c.tail_id) for c in local}
+        glob = [c for c in self._global_candidates(head_id, relation, rng)
+                if (c.head_id, c.tail_id) not in seen]  # true set union
+        candidates = local + glob
         if len(candidates) > self.total_budget:
-            candidates = random.sample(candidates, self.total_budget)
-
+            candidates = rng.sample(candidates, max(self.total_budget, 0))
         return candidates
 
 

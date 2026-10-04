@@ -98,19 +98,26 @@ class Trainer:
 
     def _init_optimizer_and_criterion(self):
         self.criterion = nn.CrossEntropyLoss().to(self.device)
+        model_obj = get_model_obj(self.model)
+        new_prefixes = ('proto_gen.', 'hop_scorer.', 'memory_gate.', 'proto_activation.')
+        base_params, new_params = [], []
+        for name, p in model_obj.named_parameters():
+            if p.requires_grad:
+                (new_params if name.startswith(new_prefixes) else base_params).append(p)
+
         self.optimizer = AdamW(
-            [p for p in self.model.parameters() if p.requires_grad],
-            lr=self.args.lr,
-            weight_decay=self.args.weight_decay
+            [{'params': base_params, 'lr': self.args.lr},
+             {'params': new_params, 'lr': self.args.new_module_lr}],
+            lr=self.args.lr, weight_decay=self.args.weight_decay
         )
         if self.args.rank == 0:
-            report_num_trainable_parameters(get_model_obj(self.model))
+            report_num_trainable_parameters(model_obj)
 
     def _init_data_loaders(self):
         self.train_dataset = Dataset(path=self.args.train_path, test_set=False)
 
         self.train_loader, self.train_sampler = self._create_data_loader(
-            self.train_dataset, shuffle=True, drop_last=True, distributed=self.args.distributed
+            self.train_dataset, shuffle=True, drop_last=True, distributed=self.args.distributed, persistent=True
         )
 
         self.valid_dataset = None
@@ -121,21 +128,15 @@ class Trainer:
                 self.valid_dataset, shuffle=True, distributed=False
             )
 
-    def _create_data_loader(self, dataset, shuffle, drop_last=False, distributed=False):
-        sampler = (
-            torch.utils.data.distributed.DistributedSampler(dataset, shuffle=shuffle)
-            if distributed else None
-        )
-
+    def _create_data_loader(self, dataset, shuffle, drop_last=False, distributed=False, persistent=False):
+        sampler = (torch.utils.data.distributed.DistributedSampler(dataset, shuffle=shuffle)
+                   if distributed else None)
+        extra = dict(persistent_workers=True, prefetch_factor=4) if (persistent and self.args.workers > 0) else {}
         loader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=self.args.batch_size,
-            shuffle=shuffle if sampler is None else False,
-            sampler=sampler,
-            collate_fn=collate,
-            num_workers=self.args.workers,
-            pin_memory=False,
-            drop_last=drop_last
+            dataset, batch_size=self.args.batch_size,
+            shuffle=shuffle if sampler is None else False, sampler=sampler,
+            collate_fn=collate, num_workers=self.args.workers,
+            pin_memory=False, drop_last=drop_last, **extra
         )
         return loader, sampler
 
@@ -175,29 +176,6 @@ class Trainer:
         if not self.args.resume:
             return
 
-        # Load onto CPU first -- NOT directly onto the GPU via `map_location=self.device`.
-        #
-        # By this point the model is already resident on the GPU (see `_setup_device`,
-        # which runs before this method). Loading the checkpoint straight to
-        # `self.device` means the checkpoint's full model weights AND the entire AdamW
-        # optimizer state (two extra tensors per parameter -- exp_avg/exp_avg_sq, each
-        # the same size as the parameter itself) get materialized on the GPU all at
-        # once, on top of the model that's already sitting there -- before
-        # `load_state_dict` even runs. For two full BERT encoders (hr_bert + tail_bert)
-        # that transient double allocation is on the order of several GiB.
-        #
-        # This is exactly why a fresh run (nothing to resume, this method returns
-        # immediately) never OOMs while resuming does: the extra memory isn't needed
-        # once loading finishes, but by then the CUDA caching allocator can be left
-        # fragmented enough that the first real allocation in the forward pass
-        # (candidate encoding in `ARPMModel._build_memory`) fails even though the
-        # *total* free memory would otherwise be enough.
-        #
-        # Loading to CPU avoids the spike: `nn.Module.load_state_dict` copies each CPU
-        # tensor into the existing GPU parameter's storage in place (no second
-        # full-size GPU buffer), and `Optimizer.load_state_dict` casts/moves each
-        # state tensor to its parameter's device one at a time rather than assuming
-        # an already-GPU-resident blob.
         checkpoint = load_checkpoint(self.args.resume_path, map_location='cpu')
 
         get_model_obj(self.model).load_state_dict(checkpoint['state_dict'])
@@ -428,6 +406,7 @@ class Trainer:
         meters['query_losses'].update(loss_components['query_loss'].item(), batch_size)
         meters['proto_losses'].update(loss_components['proto_loss'].item(), batch_size)
         meters['struct_losses'].update(loss_components['struct_loss'].item(), batch_size)
+        meters['inv_t'].update(get_model_obj(self.model).log_inv_t.exp().item(), batch_size)
         meters['div_losses'].update(loss_components['div_loss'].item(), batch_size)
         meters['combined_losses'].update(loss_components['combined_loss'].item(), batch_size)
         meters['top1'].update(acc1.item(), batch_size)

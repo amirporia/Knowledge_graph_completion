@@ -5,7 +5,7 @@ from typing import Optional, List, Tuple
 import torch
 import torch.utils.data.dataset
 
-from .candidate_pool import get_candidate_pool_builder, CandidateAnchor, NO_HOP
+from .candidate_pool import get_candidate_pool_builder, NO_HOP
 from .dict_hub import get_entity_dict, get_link_graph, get_tokenizer
 from .triplet import reverse_triplet
 from .triplet_mask import construct_mask, construct_self_negative_mask
@@ -20,8 +20,8 @@ if args.use_link_graph:
 
 
 def _custom_tokenize(text: str,
-                      text_pair: Optional[str] = None,
-                      text_triplet: Optional[str] = None) -> dict:
+                     text_pair: Optional[str] = None,
+                     text_triplet: Optional[str] = None) -> dict:
     tokenizer = get_tokenizer()
 
     if text_triplet:
@@ -63,15 +63,11 @@ def _concat_name_desc(entity: str, entity_desc: str) -> str:
     return entity
 
 
-def get_neighbor_desc(head_id: str, tail_id: str = None) -> str:
-    """Get neighbor descriptions for a given entity."""
-    neighbor_ids = get_link_graph().get_neighbor_ids(head_id)
-
+def get_neighbor_desc(head_id: str, tail_id: str = None, blocked=None) -> str:
+    neighbor_ids = get_link_graph().get_neighbor_ids(head_id, blocked=blocked)
     if not args.is_test and tail_id is not None:
         neighbor_ids = [n_id for n_id in neighbor_ids if n_id != tail_id]
-
     entities = [_parse_entity_name(entity_dict.get_entity_by_id(n_id).entity) for n_id in neighbor_ids]
-
     return ' '.join(entities)
 
 
@@ -115,38 +111,24 @@ class Example:
             return ''
         return entity_dict.get_entity_by_id(self.tail_id).entity
 
-    def vectorize(self, test=False) -> dict:
-        """Convert example to tokenized tensors."""
-        head_desc, tail_desc = self.head_desc, self.tail_desc
+    @staticmethod
+    def _entity_text(entity_id, name, desc, partner_id, blocked) -> str:
+        if args.use_link_graph and len(desc.split()) < 20:
+            desc += ' ' + get_neighbor_desc(head_id=entity_id, tail_id=partner_id, blocked=blocked)
+        return _concat_name_desc(_parse_entity_name(name), desc)
 
-        if args.use_link_graph:
-            if len(head_desc.split()) < 20:
-                head_desc += ' ' + get_neighbor_desc(
-                    head_id=self.head_id, tail_id=self.tail_id
-                )
-            if len(tail_desc.split()) < 20:
-                tail_desc += ' ' + get_neighbor_desc(
-                    head_id=self.tail_id, tail_id=self.head_id
-                )
+    def vectorize(self, test=False, blocked=None) -> dict:
+        head_text = self._entity_text(self.head_id, self.head, self.head_desc, self.tail_id, blocked)
+        tail_text = self._entity_text(self.tail_id, self.tail, self.tail_desc, self.head_id, blocked)
 
-        head_word = _parse_entity_name(self.head)
-        head_text = _concat_name_desc(head_word, head_desc)
         head_encoded_inputs = _custom_tokenize(text=head_text)
-
-        tail_word = _parse_entity_name(self.tail)
-        tail_text = _concat_name_desc(tail_word, tail_desc)
         tail_encoded_inputs = _custom_tokenize(text=tail_text)
 
         if test:
-            h_triple_encoded_inputs = _custom_tokenize(
-                text=head_text, text_pair=self.relation
-            )
+            h_triple_encoded_inputs = _custom_tokenize(text=head_text, text_pair=self.relation)
         else:
             h_triple_encoded_inputs = _custom_tokenize(
-                text=head_text,
-                text_pair=self.relation,
-                text_triplet=tail_text
-            )
+                text=head_text, text_pair=self.relation, text_triplet=tail_text)
 
         return {
             'h_triple_token_ids': h_triple_encoded_inputs['input_ids'],
@@ -158,11 +140,18 @@ class Example:
             'obj': self
         }
 
+    def vectorize_triple(self, blocked=None) -> dict:
+        """Anchor encoding E_0(h_i, r, t_i) only: 1 tokenization instead of 3."""
+        head_text = self._entity_text(self.head_id, self.head, self.head_desc, self.tail_id, blocked)
+        tail_text = self._entity_text(self.tail_id, self.tail, self.tail_desc, self.head_id, blocked)
+        enc = _custom_tokenize(text=head_text, text_pair=self.relation, text_triplet=tail_text)
+        return {
+            'h_triple_token_ids': enc['input_ids'],
+            'h_triple_token_type_ids': enc['token_type_ids'],
+            'obj': self
+        }
 
-# A single reusable "empty" candidate used to pad every example's candidate list
-# up to the batch's max candidate count. Its embedding is always masked out
-# downstream (candidate_valid_mask=False), so its exact content never influences
-# any score -- it only exists to keep every tensor in a batch the same shape.
+
 _DUMMY_CANDIDATE_VECTORIZED = None
 
 
@@ -170,7 +159,7 @@ def _get_dummy_candidate_vectorized() -> dict:
     global _DUMMY_CANDIDATE_VECTORIZED
     if _DUMMY_CANDIDATE_VECTORIZED is None:
         dummy = Example(head_id='', relation='', tail_id='')
-        _DUMMY_CANDIDATE_VECTORIZED = dummy.vectorize(test=False)
+        _DUMMY_CANDIDATE_VECTORIZED = dummy.vectorize_triple()
     return _DUMMY_CANDIDATE_VECTORIZED
 
 
@@ -200,25 +189,24 @@ class Dataset(torch.utils.data.dataset.Dataset):
     def __len__(self):
         return len(self.examples)
 
-    def _build_candidates(self, example: Example) -> Tuple[List[dict], List[int], List[bool]]:
-        """Retrieve A(h,r) for `example` and vectorize every candidate
-        as an anchor encoding a_i = E_0(h_i, r, t_i)."""
-        candidates: List[CandidateAnchor] = self.pool_builder.build(
-            example.head_id, example.relation, example.tail_id
-        )
+    def _build_candidates(self, example: Example):
+        # Training: hide the query's own edge (h-t) everywhere in the anchor pipeline.
+        # Eval: nothing hidden, and the gold tail is NOT passed (no label use at test time).
+        blocked = None if args.is_test else (example.head_id, example.tail_id)
+        tail_for_pool = None if args.is_test else example.tail_id
 
+        candidates = self.pool_builder.build(
+            example.head_id, example.relation, tail_for_pool, blocked=blocked
+        )
         if not candidates:
             return [], [], []
 
-        candidates_vectorized = []
-        hops = []
-        is_local = []
+        candidates_vectorized, hops, is_local = [], [], []
         for cand in candidates:
             cand_example = Example(head_id=cand.head_id, relation=cand.relation, tail_id=cand.tail_id)
-            candidates_vectorized.append(cand_example.vectorize(test=False))
+            candidates_vectorized.append(cand_example.vectorize_triple(blocked=blocked))
             hops.append(cand.hop)
             is_local.append(cand.is_local)
-
         return candidates_vectorized, hops, is_local
 
     def __getitem__(self, index):
@@ -346,9 +334,11 @@ def collate(batch_data: List[dict]) -> dict:
             else:
                 flat_candidates.append(dummy_candidate)
 
-    candidate_token_ids, candidate_mask_tok, candidate_token_type_ids = _pad_triple_fields(
-        flat_candidates, 'h_triple'
-    )
+    cand_ids, cand_mask, cand_types = _pad_triple_fields(flat_candidates, 'h_triple')  # (B*N, Lc)
+    seq_len = cand_ids.size(1)
+    candidate_token_ids = cand_ids.view(batch_size, max_candidates, seq_len)
+    candidate_mask_tok = cand_mask.view(batch_size, max_candidates, seq_len)
+    candidate_token_type_ids = cand_types.view(batch_size, max_candidates, seq_len)
 
     batch_exs = [ex['obj'] for ex in example_vecs]
 

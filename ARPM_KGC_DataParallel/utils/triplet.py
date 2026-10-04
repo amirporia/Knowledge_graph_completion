@@ -118,10 +118,20 @@ class LinkGraph:
 
         logger.info(f'Done build link graph with {len(self.graph)} nodes')
 
-    def get_neighbor_ids(self, entity_id: str, max_to_keep: int = 10) -> List[str]:
-        """Returns sorted list of neighbor IDs (deterministic order)."""
-        neighbor_ids = self.graph.get(entity_id, set())
-        return sorted(neighbor_ids)[:max_to_keep]
+    def _neighbors(self, node: str, blocked=None) -> Set[str]:
+        """Neighbors of `node`, with the undirected edge `blocked=(a, b)` removed."""
+        nbrs = self.graph.get(node, set())
+        if blocked is not None:
+            a, b = blocked
+            if node == a:
+                return nbrs - {b}
+            if node == b:
+                return nbrs - {a}
+        return nbrs
+
+    def get_neighbor_ids(self, entity_id: str, max_to_keep: int = 10, blocked=None) -> List[str]:
+        """Sorted neighbor IDs (deterministic order). `blocked` removes one edge (training leakage control)."""
+        return sorted(self._neighbors(entity_id, blocked))[:max_to_keep]
 
     def get_n_hop_entity_indices(
             self,
@@ -153,16 +163,7 @@ class LinkGraph:
         return {entity_dict.entity_to_idx(e_id) for e_id in seen_eids}
 
     def get_hop_layers(self, entity_id: str, max_hop: int = 2,
-                        max_nodes_per_hop: int = 2000) -> List[Set[str]]:
-        """Layer-wise BFS: returns a list of length `max_hop`, where element l-1 is
-        the set of entity IDs at EXACT graph distance l from `entity_id` (l = 1..max_hop).
-
-        This is the structural-distance primitive used to build the local candidate
-        pools A_local^(l)(h,r), and (via the anchors'
-        stored hop labels) the hop-specific memories m^(l). Unlike
-        `get_n_hop_entity_indices`, hops are kept separate rather than merged into a
-        single cumulative n-hop neighborhood.
-        """
+                       max_nodes_per_hop: int = 2000, blocked=None) -> List[Set[str]]:
         layers: List[Set[str]] = []
         seen = {entity_id}
         frontier = {entity_id}
@@ -170,7 +171,7 @@ class LinkGraph:
         for _ in range(max_hop):
             next_frontier = set()
             for node in frontier:
-                for neighbor in self.graph.get(node, set()):
+                for neighbor in self._neighbors(node, blocked):
                     if neighbor not in seen:
                         next_frontier.add(neighbor)
                         if len(next_frontier) >= max_nodes_per_hop:
@@ -181,13 +182,11 @@ class LinkGraph:
             seen |= next_frontier
             layers.append(next_frontier)
             frontier = next_frontier
-
             if not frontier:
                 break
 
         while len(layers) < max_hop:
             layers.append(set())
-
         return layers
 
 

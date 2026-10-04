@@ -160,17 +160,15 @@ class ARPMPredictor:
 
         return torch.cat(ent_tensors, dim=0)
 
-    def _create_dataloader(self, examples: List[Example], is_test: bool) -> torch.utils.data.DataLoader:
+    def _create_dataloader(self, examples, is_test: bool):
         dataset = Dataset(path='', examples=examples, test_set=is_test)
         collate_fn = collate_entity if is_test else collate
+        # Entity encoding wants a big batch; query+candidate encoding multiplies it by ~N anchors.
+        batch_size = self.batch_size if is_test else min(self.batch_size, args.full_eval_batch_size)
 
         return torch.utils.data.DataLoader(
-            dataset,
-            num_workers=4,
-            batch_size=self.batch_size,
-            collate_fn=collate_fn,
-            shuffle=False,
-            pin_memory=self.use_cuda
+            dataset, num_workers=4, batch_size=batch_size,
+            collate_fn=collate_fn, shuffle=False, pin_memory=self.use_cuda
         )
 
     def _move_to_device(self, batch_dict: dict) -> dict:

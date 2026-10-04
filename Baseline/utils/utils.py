@@ -1,16 +1,15 @@
 import glob
 import os
-import shutil
 from typing import Any, Dict, List
 
 import torch
 import torch.nn as nn
 
-from ..setting.logger_config import logger
-from ..setting.config import args
 from .dict_hub import get_link_graph
 from .doc import Example
 from .triplet import EntityDict
+from ..setting.config import args
+from ..setting.logger_config import logger
 
 
 class AttrDict(dict):
@@ -22,7 +21,7 @@ class AttrDict(dict):
 
 
 def save_checkpoint(state: Dict[str, Any], is_best: bool, filename: str,
-                     eval_state: Dict[str, Any] = None) -> None:
+                    eval_state: Dict[str, Any] = None) -> None:
     """Persist a full training checkpoint, and mirror to `model_last.mdl` /
     (if `is_best`) `model_best.mdl`. `eval_state` -- when given -- is the
     lightweight subset (config + weights only) written to model_best.mdl so
@@ -167,52 +166,22 @@ class ProgressMeter:
         return '[' + fmt + '/' + fmt.format(num_batches) + ']'
 
 
-def rerank_by_graph(related_batch_score: torch.tensor,
-                    batch_score: torch.tensor,
+def rerank_by_graph(batch_score: torch.tensor,
                     examples: List[Example],
                     entity_dict: EntityDict) -> None:
-    """
-    Rerank batch scores using graph neighborhood information.
-
-    Args:
-        related_batch_score: Scores from related batch
-        batch_score: Batch scores to be reranked
-        examples: List of examples to process
-        entity_dict: Entity dictionary for mapping
-    """
-    # Validate inductive setting
+    """Optional SimKGC re-ranking (off when --neighbor-weight 0)."""
     if args.task == 'wiki5m_ind':
         assert args.neighbor_weight < 1e-6, 'Inductive setting cannot use re-rank strategy'
 
-    # Early return if neighbor weight is negligible
     if args.neighbor_weight < 1e-6:
         return
 
-    # Process each example in the batch
     for idx in range(batch_score.size(0)):
-        current_example = examples[idx]
-
-        # Get n-hop neighbor indices for the current head entity
         neighbor_indices = get_link_graph().get_n_hop_entity_indices(
-            current_example.head_id,
-            entity_dict=entity_dict,
-            n_hop=args.rerank_n_hop
+            examples[idx].head_id, entity_dict=entity_dict, n_hop=args.rerank_n_hop
         )
-
-        # Add neighbor weight to batch scores
         if neighbor_indices:
-            delta_weights = torch.tensor(
-                [args.neighbor_weight for _ in neighbor_indices],
-                device=batch_score.device
-            )
             neighbor_tensor = torch.LongTensor(list(neighbor_indices)).to(batch_score.device)
-            batch_score[idx].index_add_(0, neighbor_tensor, delta_weights)
-
-            # Sort related batch scores
-            _, related_sorted_indices = torch.sort(
-                related_batch_score, dim=-1, descending=True
-            )
-            # Weight adjustment for related neighbors (currently zero - placeholder)
-            top_related_indices = related_sorted_indices[idx][:len(neighbor_indices)]
-            zero_weights = torch.zeros(len(top_related_indices), device=batch_score.device)
-            batch_score[idx].index_add_(0, top_related_indices, zero_weights)
+            delta = torch.full((len(neighbor_indices),), args.neighbor_weight,
+                               device=batch_score.device, dtype=batch_score.dtype)
+            batch_score[idx].index_add_(0, neighbor_tensor, delta)

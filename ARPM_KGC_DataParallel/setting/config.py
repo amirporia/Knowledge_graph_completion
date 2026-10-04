@@ -13,6 +13,14 @@ SCRIPT_DIR = Path(__file__).parent.parent.parent.absolute()
 CURRENT_TASK_NAME = "wn18rr"
 
 
+
+def _add_toggle(group, name: str, default: bool, help_text: str) -> None:
+    dest = name.replace('-', '_')
+    group.add_argument(f'--{name}', dest=dest, action='store_true', default=default, help=help_text)
+    group.add_argument(f'--no-{name}', dest=dest, action='store_false', default=default,
+                       help=f'Disable: {help_text}')
+
+
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='ARPM-KGC arguments')
@@ -56,6 +64,9 @@ def parse_args():
                              help='Gradient clipping value')
     train_group.add_argument('--seed', default=None, type=int,
                              help='Seed for training initialization')
+    train_group.add_argument('--new-module-lr', default=5e-4, type=float, dest='new_module_lr',
+                             help='LR for ProtoGen/HopScorer/MemoryGate/PrototypeActivationScorer '
+                                  '(randomly initialised, so far above the BERT LR)')
 
     # Model management
     mgmt_group = parser.add_argument_group('Model Management')
@@ -96,9 +107,8 @@ def parse_args():
                                  'paper-defined similarities, see model/trainer.py)')
     loss_group.add_argument('--additive-margin', default=0.02, type=float,
                             help='Additive margin for the S_q InfoNCE loss only')
-    loss_group.add_argument('--finetune-t', action='store_true',
-                            help='Make temperature a trainable parameter')
-    loss_group.add_argument('--eta-combined', default=0.1, type=float, dest='eta_combined',
+    _add_toggle(loss_group, 'finetune-t', True, 'Make temperature a trainable parameter')
+    loss_group.add_argument('--eta-combined', default=0.5, type=float, dest='eta_combined',
                             help='eta_c: weight of the auxiliary combined-score loss L_combined. '
                                  'This is the ONLY loss term that backprops through the memory '
                                  'gate G_lambda (lambda_p, lambda_s) -- without it MemoryGate '
@@ -116,6 +126,10 @@ def parse_args():
                                   'disable it, which reduces the candidate pool to A_global(r) '
                                   'only and is equivalent to ablation A7 (no local structural '
                                   'memory).')
+    graph_group.add_argument('--rerank-n-hop', default=2, type=int, dest='rerank_n_hop',
+                             help='n-hop neighborhood for eval-time re-ranking')
+    graph_group.add_argument('--neighbor-weight', default=0.02, type=float, dest='neighbor_weight',
+                             help='Eval-time bonus for entities within n hops of the head (0 = off)')
 
     # ------------------------------------------------------------------
     # ARPM-KGC Memory (core model)
@@ -143,14 +157,19 @@ def parse_args():
                             help='tau_p: log-sum-exp pooling temperature for S_p(t)')
     arpm_group.add_argument('--eps-struct', default=1e-6, type=float, dest='eps_struct',
                             help='epsilon: numerical-stability constant for empty-hop structural memory')
-    arpm_group.add_argument('--eta-proto', default=0.1, type=float, dest='eta_proto',
+    arpm_group.add_argument('--eta-proto', default=0.2, type=float, dest='eta_proto',
                             help='eta_p: weight of the auxiliary prototype-memory loss L_proto')
     arpm_group.add_argument('--eta-struct', default=0.1, type=float, dest='eta_struct',
                             help='eta_s: weight of the auxiliary structural-memory loss L_struct')
     arpm_group.add_argument('--eta-div', default=0.01, type=float, dest='eta_div',
                             help='eta_div: weight of the anchor diversity regularizer L_div')
-    arpm_group.add_argument('--use-self-negative', action='store_true', default=True,
-                            help='Use head entity as an additional negative for S_q only')
+    arpm_group.add_argument('--gate-max', default=2.0, type=float, dest='gate_max',
+                            help='Upper bound of lambda_p/lambda_s (gate output = gate_max * sigmoid)')
+    arpm_group.add_argument('--gate-init', default=1.0, type=float, dest='gate_init',
+                            help='Initial lambda for every query (1.0 = Baseline anchor weight)')
+
+    _add_toggle(arpm_group, 'use-self-negative', True, 'Use head entity as an additional negative for S_q only')
+
 
     # ------------------------------------------------------------------
     # Ablation overrides. A1-A13 are
@@ -224,6 +243,8 @@ def parse_args():
     eval_group = parser.add_argument_group('Evaluation')
     eval_group.add_argument('--is-test', action='store_true', default=False,
                             help='Run in test mode')
+    eval_group.add_argument('--eval-seed', default=0, type=int, dest='eval_seed',
+                            help='Seed for per-query anchor sampling at eval (reproducible MRR)')
 
     return parser.parse_args()
 

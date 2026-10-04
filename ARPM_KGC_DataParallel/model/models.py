@@ -73,7 +73,7 @@ class ARPMModel(nn.Module):
 
         self.proto_gen = ProtoGen(hidden_size=d, num_prototypes=args.num_prototypes)
         self.hop_scorer = HopScorer(hidden_size=d, num_hops=self.num_hop_slots)
-        self.memory_gate = MemoryGate(hidden_size=d)
+        self.memory_gate = MemoryGate(hidden_size=d, max_value=args.gate_max, init_value=args.gate_init)
 
         self.tau_r = args.retrieval_temperature
         self.tau_p = args.proto_temperature
@@ -198,11 +198,16 @@ class ARPMModel(nn.Module):
 
     def _build_memory(self, q, cand_ids, cand_mask_tok, cand_type_ids,
                       valid_mask, hop_id, is_local, max_candidates) -> Dict:
-        batch_size = q.size(0)
+        batch_size, n_cand, seq_len = cand_ids.shape  # (B, N, L), batch-first
         d = q.size(1)
 
-        cand_emb_flat = self._encode(self.hr_bert, cand_ids, cand_mask_tok, cand_type_ids)
-        cand_emb = cand_emb_flat.view(batch_size, max_candidates, d)
+        cand_emb = self._encode(
+            self.hr_bert,
+            cand_ids.reshape(batch_size * n_cand, seq_len),
+            cand_mask_tok.reshape(batch_size * n_cand, seq_len),
+            cand_type_ids.reshape(batch_size * n_cand, seq_len),
+        ).view(batch_size, n_cand, d)
+
         cand_emb = cand_emb * valid_mask.unsqueeze(-1)  # zero-out padded/invalid slots
 
         # ---- Query-Conditioned Anchor Selection (RQ1) ----

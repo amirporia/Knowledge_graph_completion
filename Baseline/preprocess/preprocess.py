@@ -435,8 +435,7 @@ def preprocess_wiki5m(path: str, num_workers: int, train_path: str) -> List[dict
     lines = open(path, 'r', encoding='utf-8').readlines()
 
     from functools import partial
-    process_func = partial(_process_line_wiki5m,
-                           id2ent=_load_wiki5m_id2ent)
+    process_func = partial(_process_line_wiki5m, id2ent=wiki5m_id2ent)
 
     pool = Pool(processes=num_workers)
     examples = pool.map(process_func, lines)

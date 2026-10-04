@@ -10,7 +10,7 @@
   - gumbel_sigmoid_slot_gate -> (A13, prototype slot gate omega_k)
 """
 from typing import Optional
-
+import math
 import torch
 import torch.nn as nn
 
@@ -87,15 +87,21 @@ class HopScorer(nn.Module):
 
 
 class MemoryGate(nn.Module):
-    """[lambda_p, lambda_s] = G_lambda(q), independent per-source gates
-    in [0, 1] via a linear layer + sigmoid."""
+    """[lambda_p, lambda_s] = G_lambda(q), independent per-source gates in [0, max_value].
+    Initialised so lambda = init_value for every query (default 1.0 = the Baseline's fixed
+    anchor weight), at the sigmoid's steepest point, so gradients are healthy from step 0."""
 
-    def __init__(self, hidden_size: int):
+    def __init__(self, hidden_size: int, max_value: float = 2.0, init_value: float = 1.0):
         super().__init__()
+        assert 0.0 < init_value < max_value
+        self.max_value = max_value
         self.linear = nn.Linear(hidden_size, 2)
+        nn.init.normal_(self.linear.weight, std=0.01)
+        p = init_value / max_value
+        nn.init.constant_(self.linear.bias, math.log(p / (1.0 - p)))
 
     def forward(self, query: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(self.linear(query))  # (B, 2) -> [:,0]=lambda_p, [:,1]=lambda_s
+        return self.max_value * torch.sigmoid(self.linear(query))
 
 
 class PrototypeActivationScorer(nn.Module):
