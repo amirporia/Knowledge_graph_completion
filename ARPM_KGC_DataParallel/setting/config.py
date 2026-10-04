@@ -151,6 +151,24 @@ def parse_args():
                             help='Max global candidate anchors sampled from T_r before capping')
     arpm_group.add_argument('--anchor-budget', default=25, type=int, dest='anchor_budget',
                             help='M: total candidate-pool budget after merging local+global')
+
+    arpm_group.add_argument('--global-anchor-mode', default='facility', type=str, dest='global_anchor_mode',
+                            choices=['facility', 'random'],
+                            help='facility: fixed per-relation anchors chosen once by head-weighted '
+                                 'facility location (cached); random: legacy per-query uniform sampling')
+    arpm_group.add_argument('--global-reserve', default=10, type=int, dest='global_reserve',
+                            help='Extra ranked anchors stored beyond --global-budget. They refill slots lost '
+                                 'to same-head / duplicate filtering and to budget filling.')
+    arpm_group.add_argument('--global-candidate-cap', default=500, type=int, dest='global_candidate_cap',
+                            help='Max pairs per relation entering facility-location selection')
+    arpm_group.add_argument('--global-weight-power', default=1.0, type=float, dest='global_weight_power',
+                            help='Head weight = count_h^-power. 1 = each head counts once, 0 = unweighted')
+    arpm_group.add_argument('--global-select-batch-size', default=128, type=int, dest='global_select_batch_size',
+                            help='Encoder batch size during global anchor selection')
+    _add_toggle(arpm_group, 'fill-anchor-budget', False,
+                'Unused local quota is handed to global anchors so the total reaches --anchor-budget '
+                'when enough candidates exist')
+
     arpm_group.add_argument('--retrieval-temperature', default=0.1, type=float, dest='retrieval_temperature',
                             help='tau_r: softmax temperature for query-conditioned anchor weights alpha_i')
     arpm_group.add_argument('--proto-temperature', default=0.1, type=float, dest='proto_temperature',
