@@ -157,7 +157,7 @@ def compute_metrics(
             S_q, S_p, S_s, lambda_p_tensor[start:end], lambda_s_tensor[start:end]
         )
 
-        _rerank_by_graph(batch_score, examples, start, entity_dict)
+        _rerank_by_graph(batch_score, examples, start, entity_dict, lambda_s_tensor[start:end])
 
         _filter_known_triplets(
             batch_score, examples, start, entity_dict, all_triplet_dict,
@@ -356,22 +356,26 @@ def predict_by_split() -> None:
         f.write(f'average metrics: {json.dumps(averaged_metrics)}\n')
 
 
-def _rerank_by_graph(batch_score, examples, start_idx, entity_dictionary) -> None:
-    """Add `neighbor_weight` to every entity within n hops of the head (train graph only)."""
-    if args.neighbor_weight < 1e-6 or args.task == 'wiki5m_ind':
+def _rerank_by_graph(batch_score, examples, start_idx, entity_dictionary, lambda_s=None) -> None:
+    if args.neighbor_weight < 1e-6 or args.task == 'wiki5m_ind' or args.rerank_mode == 'off':
         return
     link_graph = get_link_graph()
+    gate_max = getattr(args, 'gate_max', 2.0)
     for idx in range(batch_score.size(0)):
+        w = args.neighbor_weight
+        if args.rerank_mode == 'backoff' and lambda_s is not None:
+            w *= 1.0 - float(lambda_s[idx]) / gate_max  # fades out when S_struct is active
+        if w < 1e-6:
+            continue
         head_id = examples[start_idx + idx].head_id
         nb = link_graph.get_n_hop_entity_indices(
             head_id, entity_dict=entity_dictionary, n_hop=args.rerank_n_hop)
-        nb.discard(entity_dictionary.entity_to_idx(head_id))  # never boost the head itself
+        nb.discard(entity_dictionary.entity_to_idx(head_id))
         if nb:
             nb_t = torch.LongTensor(sorted(nb)).to(batch_score.device)
             batch_score[idx].index_add_(
-                0, nb_t,
-                torch.full((nb_t.numel(),), args.neighbor_weight,
-                           device=batch_score.device, dtype=batch_score.dtype))
+                0, nb_t, torch.full((nb_t.numel(),), w,
+                                    device=batch_score.device, dtype=batch_score.dtype))
 
 
 # ---------------------------------------------------------------------------

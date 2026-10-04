@@ -13,7 +13,6 @@ SCRIPT_DIR = Path(__file__).parent.parent.parent.absolute()
 CURRENT_TASK_NAME = "wn18rr"
 
 
-
 def _add_toggle(group, name: str, default: bool, help_text: str) -> None:
     dest = name.replace('-', '_')
     group.add_argument(f'--{name}', dest=dest, action='store_true', default=default, help=help_text)
@@ -188,7 +187,6 @@ def parse_args():
 
     _add_toggle(arpm_group, 'use-self-negative', True, 'Use head entity as an additional negative for S_q only')
 
-
     # ------------------------------------------------------------------
     # Ablation overrides. A1-A13 are
     # each reachable from the core model via one of these flags (or a plain
@@ -263,6 +261,7 @@ def parse_args():
                             help='Run in test mode')
     eval_group.add_argument('--eval-seed', default=0, type=int, dest='eval_seed',
                             help='Seed for per-query anchor sampling at eval (reproducible MRR)')
+    eval_group.add_argument('--rerank-mode', default='backoff', choices=['fixed', 'backoff', 'off'])
 
     return parser.parse_args()
 
