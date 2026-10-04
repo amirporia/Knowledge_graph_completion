@@ -149,7 +149,7 @@ def parse_args():
                                  'hop 0 (same head & relation, different tail)')
     arpm_group.add_argument('--global-budget', default=10, type=int, dest='global_budget',
                             help='Max global candidate anchors sampled from T_r before capping')
-    arpm_group.add_argument('--anchor-budget', default=20, type=int, dest='anchor_budget',
+    arpm_group.add_argument('--anchor-budget', default=25, type=int, dest='anchor_budget',
                             help='M: total candidate-pool budget after merging local+global')
     arpm_group.add_argument('--retrieval-temperature', default=0.1, type=float, dest='retrieval_temperature',
                             help='tau_r: softmax temperature for query-conditioned anchor weights alpha_i')
