@@ -25,7 +25,9 @@ from ..utils.utils import (
     get_model_obj
 )
 
-
+# Keys that must NOT go through nn.DataParallel's scatter (they are (B,B) masks / python objects
+# consumed after the gather, in compute_logits).
+_NON_MODEL_KEYS = ('triplet_mask', 'self_negative_mask', 'batch_data')
 class Trainer:
     """Handles model training, evaluation, and checkpointing."""
 
@@ -74,6 +76,13 @@ class Trainer:
                 self.model, device_ids=[self.args.local_rank], output_device=self.args.local_rank,
                 broadcast_buffers=False,
             )
+        elif torch.cuda.device_count() > 1:
+            # Single-process multi-GPU (e.g. Kaggle 2xT4, no torchrun): encoder forward/backward is split
+            # across GPUs, outputs are gathered on GPU0 before the loss, so the loss still sees the full
+            # --batch-size of in-batch negatives.
+            logger.info(f'Using nn.DataParallel across {torch.cuda.device_count()} GPUs; '
+                        f'global batch size stays {self.args.batch_size}.')
+            self.model = nn.DataParallel(self.model)
 
     def _init_optimizer_and_criterion(self):
         """Initialize loss function, optimizer, and log trainable parameters."""
@@ -173,7 +182,7 @@ class Trainer:
         if not self.args.resume:
             return
 
-        checkpoint = load_checkpoint(self.args.resume_path, map_location=self.device)
+        checkpoint = load_checkpoint(self.args.resume_path, map_location='cpu')
 
         get_model_obj(self.model).load_state_dict(checkpoint['state_dict'])
 
@@ -192,6 +201,10 @@ class Trainer:
                 f'Resumed from {self.args.resume_path} '
                 f'(checkpoint epoch {checkpoint.get("epoch")}, resuming at epoch {self.start_epoch})'
             )
+
+        del checkpoint
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def train_loop(self):
         """Main training loop over epochs."""
@@ -250,10 +263,11 @@ class Trainer:
 
     def _forward_pass(self, batch_dict):
         """Execute forward pass with optional AMP."""
+        model_kwargs = {k: v for k, v in batch_dict.items() if k not in _NON_MODEL_KEYS}
         if self.args.use_amp:
             with torch.cuda.amp.autocast():
-                return self.model(**batch_dict)
-        return self.model(**batch_dict)
+                return self.model(**model_kwargs)
+        return self.model(**model_kwargs)
 
     def _compute_loss(self, outputs, batch_dict, batch_size):
         """Compute the bidirectional InfoNCE loss."""

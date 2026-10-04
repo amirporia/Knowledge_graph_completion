@@ -51,6 +51,8 @@ class CustomBertModel(nn.Module, ABC):
         self.hr_bert = AutoModel.from_pretrained(args.pretrained_model)
         self._drop_unused_pooler(self.hr_bert)
         self.tail_bert = deepcopy(self.hr_bert)
+        self.hr_bert.gradient_checkpointing_enable()
+        self.tail_bert.gradient_checkpointing_enable()
 
     @staticmethod
     def _drop_unused_pooler(encoder: nn.Module) -> None:
@@ -102,7 +104,7 @@ class CustomBertModel(nn.Module, ABC):
             anchor_token_ids: Optional[torch.Tensor] = None,
             anchor_mask: Optional[torch.Tensor] = None,
             anchor_token_type_ids: Optional[torch.Tensor] = None,
-            anchor_group_ids: Optional[torch.Tensor] = None,
+            anchor_valid: Optional[torch.Tensor] = None,
             only_ent_embedding: bool = False,
             **kwargs
     ) -> Dict:
@@ -111,8 +113,7 @@ class CustomBertModel(nn.Module, ABC):
         Args:
             test_forward: True -> entity-embedding / plain inference path (no anchors)
             only_ent_embedding: True -> only compute candidate entity embeddings
-            anchor_*: all anchor-enhanced queries of the batch, flattened; anchor_group_ids[j]
-                      is the index of the batch example that anchor query j belongs to.
+             anchor_*: (B, K, L) padded anchor queries; anchor_valid (B, K) marks real anchors
         """
         if test_forward:
             return self._forward_test(
@@ -125,7 +126,7 @@ class CustomBertModel(nn.Module, ABC):
             h_triple_token_ids, h_triple_mask, h_triple_token_type_ids,
             tail_token_ids, tail_mask, tail_token_type_ids,
             head_token_ids, head_mask, head_token_type_ids,
-            anchor_token_ids, anchor_mask, anchor_token_type_ids, anchor_group_ids
+            anchor_token_ids, anchor_mask, anchor_token_type_ids, anchor_valid
         )
 
     def _forward_test(
@@ -154,8 +155,7 @@ class CustomBertModel(nn.Module, ABC):
         return {
             'hr_vector': hr_vector,
             'tail_vector': tail_vector,
-            'head_vector': head_vector,
-            'related': False
+            'head_vector': head_vector
         }
 
     def _forward_train(
@@ -163,7 +163,7 @@ class CustomBertModel(nn.Module, ABC):
             h_triple_token_ids, h_triple_mask, h_triple_token_type_ids,
             tail_token_ids, tail_mask, tail_token_type_ids,
             head_token_ids, head_mask, head_token_type_ids,
-            anchor_token_ids, anchor_mask, anchor_token_type_ids, anchor_group_ids
+            anchor_token_ids, anchor_mask, anchor_token_type_ids, anchor_valid
     ) -> Dict:
         """Forward pass that also produces the anchor-enhanced query embedding e^avg_hrta."""
         tail_vector = self._encode(
@@ -177,15 +177,14 @@ class CustomBertModel(nn.Module, ABC):
         )
 
         anchor_hr_vector = self._encode_anchor_queries(
-            hr_vector, anchor_token_ids, anchor_mask, anchor_token_type_ids, anchor_group_ids
+            hr_vector, anchor_token_ids, anchor_mask, anchor_token_type_ids, anchor_valid
         )
 
         return {
-            'related_hr_vector': anchor_hr_vector,   # e^avg_hrta
-            'hr_vector': hr_vector,                  # e_hr
-            'tail_vector': tail_vector,              # e_t
+            'related_hr_vector': anchor_hr_vector,  # e^avg_hrta
+            'hr_vector': hr_vector,  # e_hr
+            'tail_vector': tail_vector,  # e_t
             'head_vector': head_vector,
-            'related': True
         }
 
     def _encode_anchor_queries(
@@ -194,18 +193,27 @@ class CustomBertModel(nn.Module, ABC):
             token_ids: Optional[torch.Tensor],
             mask: Optional[torch.Tensor],
             token_type_ids: Optional[torch.Tensor],
-            group_ids: Optional[torch.Tensor]
+            valid: Optional[torch.Tensor]
     ) -> torch.Tensor:
         """Eq.(5): e^avg_hrta = average over the k anchor-enhanced query embeddings of each example.
 
         Plain mean (no re-normalisation). Examples without any anchor fall back to e_hr.
+        Inputs are batch-first (B, K, L) so DataParallel splits them together with the queries.
         """
-        if token_ids is None or token_ids.size(0) == 0:
+        if token_ids is None or valid is None or not valid.any():
             return hr_vector
 
-        anchor_vectors = self._encode(self.hr_bert, token_ids, mask, token_type_ids)
+        num_queries, k, seq_len = token_ids.shape
+        flat_valid = valid.reshape(-1)
 
-        num_queries = hr_vector.size(0)
+        anchor_vectors = self._encode(
+            self.hr_bert,
+            token_ids.reshape(-1, seq_len)[flat_valid],
+            mask.reshape(-1, seq_len)[flat_valid],
+            token_type_ids.reshape(-1, seq_len)[flat_valid],
+        )
+        group_ids = torch.arange(num_queries, device=hr_vector.device).repeat_interleave(k)[flat_valid]
+
         summed = torch.zeros(
             num_queries, anchor_vectors.size(1), dtype=anchor_vectors.dtype, device=anchor_vectors.device
         ).index_add(0, group_ids, anchor_vectors)
@@ -218,7 +226,7 @@ class CustomBertModel(nn.Module, ABC):
 
     def compute_logits(self, output_dict: Dict, batch_dict: Dict) -> Dict:
         """Compute logits for training/evaluation."""
-        if output_dict['related']:
+        if 'related_hr_vector' in output_dict:
             return self._compute_related_logits(output_dict, batch_dict)
         return self._compute_standard_logits(output_dict, batch_dict)
 

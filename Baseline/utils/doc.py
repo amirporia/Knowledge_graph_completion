@@ -1,7 +1,6 @@
 import json
 import os
 import random
-import zlib
 from typing import Optional, List, Tuple
 
 import torch
@@ -311,6 +310,29 @@ def _pad_triple_fields(examples: List[dict], prefix: str) -> Tuple[torch.Tensor,
     return token_ids, mask, token_type_ids
 
 
+def _pad_anchor_fields(anchor_lists: List[List[dict]], max_anchors: int):
+    """Pad anchor queries to batch-first (B, K, L) tensors so nn.DataParallel's dim-0 scatter keeps every
+    example's anchors on the same GPU as the example. `valid[b, k]` marks real (non-padding) anchors."""
+    pad_id = get_tokenizer().pad_token_id
+    batch_size = len(anchor_lists)
+    max_len = max(len(v['h_triple_token_ids']) for vecs in anchor_lists for v in vecs)
+
+    token_ids = torch.full((batch_size, max_anchors, max_len), pad_id, dtype=torch.long)
+    mask = torch.zeros(batch_size, max_anchors, max_len, dtype=torch.uint8)
+    token_type_ids = torch.zeros(batch_size, max_anchors, max_len, dtype=torch.long)
+    valid = torch.zeros(batch_size, max_anchors, dtype=torch.bool)
+
+    for i, vecs in enumerate(anchor_lists):
+        for j, v in enumerate(vecs):
+            n = len(v['h_triple_token_ids'])
+            token_ids[i, j, :n] = torch.LongTensor(v['h_triple_token_ids'])
+            token_type_ids[i, j, :n] = torch.LongTensor(v['h_triple_token_type_ids'])
+            mask[i, j, :n] = 1
+            valid[i, j] = True
+
+    return token_ids, mask, token_type_ids, valid
+
+
 def collate(batch_data: List[dict]) -> dict:
     """Collate function for training / validation batches.
 
@@ -329,17 +351,14 @@ def collate(batch_data: List[dict]) -> dict:
         example_vecs, 'head'
     )
 
-    anchor_vecs, anchor_group_ids = [], []
-    for i, ex in enumerate(batch_data):
-        for anchor_vec in ex['anchor_queries_vectorized']:
-            anchor_vecs.append(anchor_vec)
-            anchor_group_ids.append(i)
-
-    if anchor_vecs:
-        anchor_token_ids, anchor_mask, anchor_token_type_ids = _pad_triple_fields(anchor_vecs, 'h_triple')
-        anchor_group_ids = torch.LongTensor(anchor_group_ids)
+    anchor_lists = [ex['anchor_queries_vectorized'] for ex in batch_data]
+    max_anchors = max(len(a) for a in anchor_lists)
+    if max_anchors > 0:
+        anchor_token_ids, anchor_mask, anchor_token_type_ids, anchor_valid = _pad_anchor_fields(
+            anchor_lists, max_anchors
+        )
     else:  # no example in this batch has anchors -> model falls back to the classic query
-        anchor_token_ids = anchor_mask = anchor_token_type_ids = anchor_group_ids = None
+        anchor_token_ids = anchor_mask = anchor_token_type_ids = anchor_valid = None
 
     batch_exs = [ex['obj'] for ex in example_vecs]
     # first anchor example per query (falls back to the example itself when it has no anchor)
@@ -362,7 +381,7 @@ def collate(batch_data: List[dict]) -> dict:
         'anchor_token_ids': anchor_token_ids,
         'anchor_mask': anchor_mask,
         'anchor_token_type_ids': anchor_token_type_ids,
-        'anchor_group_ids': anchor_group_ids,
+        'anchor_valid': anchor_valid,
         'batch_data': batch_exs,
         'triplet_mask': construct_mask(row_exs=batch_exs) if not args.is_test else None,
         'self_negative_mask': construct_self_negative_mask(batch_exs) if not args.is_test else None,

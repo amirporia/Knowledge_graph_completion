@@ -52,6 +52,8 @@ class CustomBertModel(nn.Module, ABC):
         self.hr_bert = AutoModel.from_pretrained(args.pretrained_model)
         self._drop_unused_pooler(self.hr_bert)
         self.tail_bert = deepcopy(self.hr_bert)
+        self.hr_bert.gradient_checkpointing_enable()
+        self.tail_bert.gradient_checkpointing_enable()
 
     @staticmethod
     def _drop_unused_pooler(encoder: nn.Module) -> None:
