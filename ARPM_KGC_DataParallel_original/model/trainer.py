@@ -432,6 +432,7 @@ class Trainer:
         meters['combined_losses'].update(loss_components['combined_loss'].item(), batch_size)
         meters['top1'].update(acc1.item(), batch_size)
         meters['top3'].update(acc3.item(), batch_size)
+        meters['inv_t'].update(get_model_obj(self.model).log_inv_t.exp().item(), batch_size)
 
     def _backward_pass(self, loss):
         self.optimizer.zero_grad()

@@ -1,12 +1,13 @@
-import torch
 import json
+from datetime import timedelta
+
+import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 
-from ARPM_KGC_DataParallel.setting.config import args
-from ARPM_KGC_DataParallel.model.trainer import Trainer
-from ARPM_KGC_DataParallel.setting.logger_config import logger
-from datetime import timedelta
+from .setting.config import args
+from .model.trainer import Trainer
+from .setting.logger_config import logger
 
 
 def main():

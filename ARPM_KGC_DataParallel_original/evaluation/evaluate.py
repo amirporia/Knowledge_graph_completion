@@ -13,6 +13,7 @@ from ..setting.logger_config import logger
 from ..utils.dict_hub import get_entity_dict, get_all_triplet_dict
 from ..utils.doc import load_data, Example
 from ..utils.triplet import EntityDict
+from ..utils.utils import rerank_by_graph
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +142,7 @@ def compute_metrics(
 
     topk_scores, topk_indices, ranks = [], [], []
     metrics_accumulator = {'mean_rank': 0, 'mrr': 0, 'hit@1': 0,
-                            'hit@3': 0, 'hit@10': 0, 'hit@50': 0}
+                           'hit@3': 0, 'hit@10': 0, 'hit@50': 0}
 
     for start in tqdm.tqdm(range(0, total, batch_size)):
         end = start + batch_size
@@ -156,6 +157,8 @@ def compute_metrics(
         batch_score = model_obj.combined_score(
             S_q, S_p, S_s, lambda_p_tensor[start:end], lambda_s_tensor[start:end]
         )
+
+        rerank_by_graph(batch_score, examples[start:end], entity_dict=entity_dict)
 
         _filter_known_triplets(
             batch_score, examples, start, entity_dict, all_triplet_dict,
