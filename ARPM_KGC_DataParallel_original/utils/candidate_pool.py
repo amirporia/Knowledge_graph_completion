@@ -34,7 +34,7 @@ leak into the candidate pool at evaluation time.
 """
 import random
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 from .dict_hub import get_link_graph, get_train_triplet_dict
 from ..setting.config import args
@@ -109,7 +109,8 @@ class CandidatePoolBuilder:
 
         return candidates
 
-    def _local_candidates(self, head_id: str, relation: str, tail_id: str) -> List[CandidateAnchor]:
+    def _local_candidates(self, head_id: str, relation: str, tail_id: Optional[str],
+                          exclude_edge: Optional[Tuple[str, str]] = None) -> List[CandidateAnchor]:
         """A_local(h,r) = U_{l=0}^{num_hops} A_local^(l)(h,r): hop 0 is the
         same-head-and-relation category (see `_same_head_candidates`); hops
         1..num_hops sample a bounded number of nodes reachable at each exact
@@ -131,7 +132,9 @@ class CandidatePoolBuilder:
         # hop_layers[0] = nodes at graph distance 1, ..., hop_layers[num_hops-1]
         # = nodes at graph distance num_hops -- labeled here as local hop
         # SLOTS 1..num_hops (enumerate start=1), on top of hop-0 above.
-        hop_layers = self.link_graph.get_hop_layers(head_id, max_hop=self.num_hops)
+        hop_layers = self.link_graph.get_hop_layers(
+            head_id, max_hop=self.num_hops, exclude_edge=exclude_edge
+        )
 
         for hop_slot, layer_nodes in enumerate(hop_layers, start=1):
             if not layer_nodes or self.local_per_hop_budget <= 0:
@@ -171,16 +174,14 @@ class CandidatePoolBuilder:
         return candidates
 
     def build(self, head_id: str, relation: str, tail_id: str) -> List[CandidateAnchor]:
-        """A(h,r) = A_local(h,r) U A_global(r), capped at `total_budget`.
+        # The gold tail is only hidden/excluded during training. At evaluation the label must
+        # never influence which anchors are retrieved.
+        training = not args.is_test
+        exclude_tail = tail_id if training else None
+        exclude_edge = (head_id, tail_id) if training else None
 
-        May legitimately return an empty list (isolated head with no graph
-        neighbors, no other tail for the same (h,r) pair, and a relation seen
-        nowhere else) -- callers must handle a query with zero candidate
-        anchors gracefully rather than falling back to the query's own true
-        triple, which would leak the label.
-        """
-        candidates = self._local_candidates(head_id, relation, tail_id) + \
-            self._global_candidates(head_id, tail_id, relation)
+        candidates = self._local_candidates(head_id, relation, exclude_tail, exclude_edge) + \
+            self._global_candidates(head_id, exclude_tail, relation)
 
         if len(candidates) > self.total_budget:
             candidates = random.sample(candidates, self.total_budget)

@@ -2,7 +2,7 @@ import json
 import os
 from collections import deque
 from dataclasses import dataclass
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Tuple
 
 from ..setting.logger_config import logger
 
@@ -153,28 +153,27 @@ class LinkGraph:
         return {entity_dict.entity_to_idx(e_id) for e_id in seen_eids}
 
     def get_hop_layers(self, entity_id: str, max_hop: int = 2,
-                        max_nodes_per_hop: int = 2000) -> List[Set[str]]:
-        """Layer-wise BFS: returns a list of length `max_hop`, where element l-1 is
-        the set of entity IDs at EXACT graph distance l from `entity_id` (l = 1..max_hop).
-
-        This is the structural-distance primitive used to build the local candidate
-        pools A_local^(l)(h,r), and (via the anchors'
-        stored hop labels) the hop-specific memories m^(l). Unlike
-        `get_n_hop_entity_indices`, hops are kept separate rather than merged into a
-        single cumulative n-hop neighborhood.
-        """
+                       max_nodes_per_hop: int = 2000,
+                       exclude_edge: Optional[Tuple[str, str]] = None) -> List[Set[str]]:
+        """Layer-wise BFS: element l-1 is the set of entity IDs at EXACT distance l.
+        `exclude_edge=(a, b)` hides that undirected edge from the traversal (used in
+        training to hide the query's own (h, t) edge so the gold tail cannot leak in)."""
         layers: List[Set[str]] = []
         seen = {entity_id}
         frontier = {entity_id}
+        blocked = None if exclude_edge is None else (exclude_edge, exclude_edge[::-1])
 
         for _ in range(max_hop):
             next_frontier = set()
             for node in frontier:
                 for neighbor in self.graph.get(node, set()):
-                    if neighbor not in seen:
-                        next_frontier.add(neighbor)
-                        if len(next_frontier) >= max_nodes_per_hop:
-                            break
+                    if neighbor in seen or neighbor in next_frontier:
+                        continue
+                    if blocked is not None and (node, neighbor) in blocked:
+                        continue
+                    next_frontier.add(neighbor)
+                    if len(next_frontier) >= max_nodes_per_hop:
+                        break
                 if len(next_frontier) >= max_nodes_per_hop:
                     break
 
