@@ -116,6 +116,10 @@ def parse_args():
                                   'disable it, which reduces the candidate pool to A_global(r) '
                                   'only and is equivalent to ablation A7 (no local structural '
                                   'memory).')
+    graph_group.add_argument('--rerank-n-hop', default=5, type=int, dest='rerank_n_hop',
+                             help='Use n-hop nodes for graph re-ranking (evaluation only)')
+    graph_group.add_argument('--neighbor-weight', default=0.02, type=float, dest='neighbor_weight',
+                             help='Score bonus for entities within n hops of the head (0 disables)')
 
     # ------------------------------------------------------------------
     # ARPM-KGC Memory (core model)

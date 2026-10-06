@@ -285,6 +285,17 @@ class CustomBertModel(nn.Module, ABC):
         return {'ent_vectors': ent_vectors.detach()}
 
 
+def _dp_safe_extended_mask(attention_mask, input_shape=None, device=None, dtype=None):
+    """Replacement for HF `get_extended_attention_mask` that never touches `self.dtype`.
+
+    nn.DataParallel replicas have no registered parameters, so `self.dtype` raises StopIteration
+    inside the HF encoder. Plain function (no self) => survives the replica's shallow __dict__ copy.
+    """
+    dtype = dtype or torch.float32
+    extended = attention_mask[:, None, None, :].to(dtype)
+    return (1.0 - extended) * torch.finfo(dtype).min
+
+
 # ===========================================================================
 # HaSa
 # ===========================================================================
@@ -304,6 +315,7 @@ class HaSaModel(nn.Module):
         self.config = AutoConfig.from_pretrained(args.pretrained_model)
 
         self.bert = AutoModel.from_pretrained(args.pretrained_model)
+        self.bert.get_extended_attention_mask = _dp_safe_extended_mask  # nn.DataParallel fix
         if args.pooling != 'pooler':
             _drop_unused_pooler(self.bert)
         if args.gradient_checkpointing:

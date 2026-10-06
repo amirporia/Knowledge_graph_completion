@@ -113,10 +113,19 @@ class PrototypeActivationScorer(nn.Module):
 def diversity_loss(cand_emb: torch.Tensor, alpha: torch.Tensor,
                    valid_mask: torch.Tensor) -> torch.Tensor:
     """L_div = (1/Z) * sum_{i!=j} alpha_i alpha_j sim(a_i, a_j),
-    Z = N_A * (N_A - 1), averaged over the batch.
+    Z = N_A * (N_A - 1), per example.
 
     cand_emb is expected to already be L2-normalized (as produced by the shared
     E_0 encoder), so a_i . a_j IS cosine similarity.
+
+    Returns a (B,) tensor, NOT the batch mean -- callers must reduce it
+    themselves (e.g. `.mean()`). This is required for correct nn.DataParallel
+    behavior: DataParallel gathers per-replica forward() outputs by
+    concatenating along dim 0, which only works for a (B,) tensor. A 0-dim
+    scalar computed per-replica gets stacked into a length-num_gpus vector
+    instead of the intended full-batch value, silently corrupting the loss
+    under multi-GPU training (single-GPU runs were unaffected only because
+    there was no second replica to stack against).
     """
     sim = torch.einsum('bnd,bmd->bnm', cand_emb, cand_emb)  # (B, N, N)
     outer = alpha.unsqueeze(2) * alpha.unsqueeze(1)  # (B, N, N)
@@ -130,7 +139,7 @@ def diversity_loss(cand_emb: torch.Tensor, alpha: torch.Tensor,
     n_valid = valid_mask.sum(dim=-1).float()
     z = (n_valid * (n_valid - 1)).clamp(min=1.0)
 
-    return (weighted_sum / z).mean()
+    return weighted_sum / z  # (B,) -- caller reduces
 
 
 # ---------------------------------------------------------------------------
