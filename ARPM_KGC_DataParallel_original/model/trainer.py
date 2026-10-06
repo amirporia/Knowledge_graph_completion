@@ -98,13 +98,19 @@ class Trainer:
 
     def _init_optimizer_and_criterion(self):
         self.criterion = nn.CrossEntropyLoss().to(self.device)
-        self.optimizer = AdamW(
-            [p for p in self.model.parameters() if p.requires_grad],
-            lr=self.args.lr,
-            weight_decay=self.args.weight_decay
-        )
+        model_obj = get_model_obj(self.model)
+        temp_params = [model_obj.log_inv_t] if model_obj.log_inv_t.requires_grad else []
+        temp_ids = {id(p) for p in temp_params}
+        main_params = [p for p in self.model.parameters()
+                       if p.requires_grad and id(p) not in temp_ids]
+        groups = [{'params': main_params}]
+        if temp_params:
+            groups.append({'params': temp_params,
+                           'lr': self.args.lr * self.args.t_lr_scale,
+                           'weight_decay': 0.0})
+        self.optimizer = AdamW(groups, lr=self.args.lr, weight_decay=self.args.weight_decay)
         if self.args.rank == 0:
-            report_num_trainable_parameters(get_model_obj(self.model))
+            report_num_trainable_parameters(model_obj)
 
     def _init_data_loaders(self):
         self.train_dataset = Dataset(path=self.args.train_path, test_set=False)
@@ -349,6 +355,7 @@ class Trainer:
         batch_size = q.size(0)
         labels = torch.arange(batch_size, device=q.device)
         inv_t = model_obj.log_inv_t.exp()
+        inv_t_aux = inv_t.detach()
 
         triplet_mask = batch_dict.get('triplet_mask')
 
@@ -373,8 +380,8 @@ class Trainer:
         L_query = self._bidirectional_ce(q_logits, labels, batch_size)
 
         # ---- L_proto, L_struct: inv-temperature scaling only (no margin/self-neg) ----
-        p_logits = S_p * inv_t
-        s_logits = S_s * inv_t
+        p_logits = S_p * inv_t_aux
+        s_logits = S_s * inv_t_aux
         if triplet_mask is not None:
             p_logits = p_logits.masked_fill(~triplet_mask, model_obj.NEGATIVE_INF)
             s_logits = s_logits.masked_fill(~triplet_mask, model_obj.NEGATIVE_INF)
@@ -384,7 +391,7 @@ class Trainer:
 
         # ---- L_combined: the only term touching lambda_p/lambda_s (MemoryGate) ----
         combined_score = model_obj.combined_score(S_q, S_p, S_s, lambda_p, lambda_s)
-        combined_logits = combined_score * inv_t
+        combined_logits = combined_score * inv_t_aux
         if triplet_mask is not None:
             combined_logits = combined_logits.masked_fill(~triplet_mask, model_obj.NEGATIVE_INF)
         L_combined = self._bidirectional_ce(combined_logits, labels, batch_size)
@@ -444,6 +451,7 @@ class Trainer:
                 self.model.parameters(), self.args.grad_clip
             )
             self.scaler.step(self.optimizer)
+            get_model_obj(self.model).clamp_temperature()
             self.scaler.update()
         else:
             loss.backward()
@@ -451,6 +459,7 @@ class Trainer:
                 self.model.parameters(), self.args.grad_clip
             )
             self.optimizer.step()
+            get_model_obj(self.model).clamp_temperature()
 
     @torch.no_grad()
     def _run_eval(self, epoch, step=0):

@@ -20,8 +20,8 @@ if args.use_link_graph:
 
 
 def _custom_tokenize(text: str,
-                      text_pair: Optional[str] = None,
-                      text_triplet: Optional[str] = None) -> dict:
+                     text_pair: Optional[str] = None,
+                     text_triplet: Optional[str] = None) -> dict:
     tokenizer = get_tokenizer()
 
     if text_triplet:
@@ -63,16 +63,11 @@ def _concat_name_desc(entity: str, entity_desc: str) -> str:
     return entity
 
 
-def get_neighbor_desc(head_id: str, tail_id: str = None) -> str:
-    """Get neighbor descriptions for a given entity."""
-    neighbor_ids = get_link_graph().get_neighbor_ids(head_id)
-
-    if not args.is_test and tail_id is not None:
-        neighbor_ids = [n_id for n_id in neighbor_ids if n_id != tail_id]
-
-    entities = [_parse_entity_name(entity_dict.get_entity_by_id(n_id).entity) for n_id in neighbor_ids]
-
-    return ' '.join(entities)
+def get_neighbor_desc(entity_id: str, exclude_ids=frozenset()) -> str:
+    neighbor_ids = get_link_graph().get_neighbor_ids(entity_id)
+    if not args.is_test and exclude_ids:
+        neighbor_ids = [n for n in neighbor_ids if n not in exclude_ids]
+    return ' '.join(_parse_entity_name(entity_dict.get_entity_by_id(n).entity) for n in neighbor_ids)
 
 
 class Example:
@@ -86,10 +81,13 @@ class Example:
     shared module applied with two different input compositions.
     """
 
-    def __init__(self, head_id, relation, tail_id, **kwargs):
+    def __init__(self, head_id, relation, tail_id, hidden_ids=None, **kwargs):
         self.head_id = head_id
         self.tail_id = tail_id
         self.relation = relation
+        # Entities that must never show up in neighbor-text augmentation
+        # (for anchors: the gold tail of the query that spawned them).
+        self.hidden_ids = frozenset(hidden_ids) if hidden_ids else frozenset()
 
     @property
     def head_desc(self):
@@ -121,13 +119,9 @@ class Example:
 
         if args.use_link_graph:
             if len(head_desc.split()) < 20:
-                head_desc += ' ' + get_neighbor_desc(
-                    head_id=self.head_id, tail_id=self.tail_id
-                )
+                head_desc += ' ' + get_neighbor_desc(self.head_id, self.hidden_ids | {self.tail_id})
             if len(tail_desc.split()) < 20:
-                tail_desc += ' ' + get_neighbor_desc(
-                    head_id=self.tail_id, tail_id=self.head_id
-                )
+                tail_desc += ' ' + get_neighbor_desc(self.tail_id, self.hidden_ids | {self.head_id})
 
         head_word = _parse_entity_name(self.head)
         head_text = _concat_name_desc(head_word, head_desc)
@@ -213,8 +207,10 @@ class Dataset(torch.utils.data.dataset.Dataset):
         candidates_vectorized = []
         hops = []
         is_local = []
+        hidden = None if args.is_test else {example.tail_id}
         for cand in candidates:
-            cand_example = Example(head_id=cand.head_id, relation=cand.relation, tail_id=cand.tail_id)
+            cand_example = Example(head_id=cand.head_id, relation=cand.relation,
+                                   tail_id=cand.tail_id, hidden_ids=hidden)
             candidates_vectorized.append(cand_example.vectorize(test=False))
             hops.append(cand.hop)
             is_local.append(cand.is_local)

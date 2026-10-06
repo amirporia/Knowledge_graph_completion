@@ -13,6 +13,7 @@ Pipeline per query (h, r, ?):
 Steps 3-7 are computed once per batch, fully vectorized over a padded
 (batch, max_candidates) candidate grid (see utils/doc.py::collate)
 """
+import math
 from typing import Dict, Optional
 
 import torch
@@ -80,10 +81,10 @@ class ARPMModel(nn.Module):
         self.eps_struct = args.eps_struct
 
         # Shared InfoNCE temperature (training-time logit scaling only) and additive margin
-        self.log_inv_t = nn.Parameter(
-            torch.tensor(1.0 / args.t).log(),
-            requires_grad=args.finetune_t
-        )
+        self.log_inv_t = nn.Parameter(torch.tensor(1.0 / args.t).log(),
+                                      requires_grad=args.finetune_t)
+        self._log_inv_t_lo = math.log(1.0 / args.t_max)
+        self._log_inv_t_hi = math.log(1.0 / args.t_min)
         self.add_margin = args.additive_margin
 
         # ---- Optional discrete (Gumbel) extensions, ablations A11-A13 ----
@@ -102,6 +103,10 @@ class ARPMModel(nn.Module):
         self.uniform_hop_weighting = args.uniform_hop_weighting  # A5
         self.fixed_lambda_p = args.fixed_lambda_p  # A8/A9
         self.fixed_lambda_s = args.fixed_lambda_s  # A8/A10
+
+    @torch.no_grad()
+    def clamp_temperature(self) -> None:
+        self.log_inv_t.clamp_(self._log_inv_t_lo, self._log_inv_t_hi)
 
     @staticmethod
     def _drop_unused_pooler(encoder: nn.Module) -> None:

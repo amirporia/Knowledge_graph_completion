@@ -103,6 +103,12 @@ def parse_args():
                                  'This is the ONLY loss term that backprops through the memory '
                                  'gate G_lambda (lambda_p, lambda_s) -- without it MemoryGate '
                                  'never receives a gradient and stays at random init.')
+    loss_group.add_argument('--t-min', default=0.02, type=float,
+                            help='Lower bound for learnable temperature')
+    loss_group.add_argument('--t-max', default=0.2, type=float,
+                            help='Upper bound for learnable temperature')
+    loss_group.add_argument('--t-lr-scale', default=0.1, type=float,
+                            help='LR multiplier for the learnable temperature')
 
     # Graph and context settings
     graph_group = parser.add_argument_group('Graph')
