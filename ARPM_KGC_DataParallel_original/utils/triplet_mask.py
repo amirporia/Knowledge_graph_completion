@@ -17,12 +17,6 @@ def construct_mask(
 ) -> torch.Tensor:
     """Construct a mask tensor for triplet filtering.
 
-    Used to suppress in-batch false negatives -- entities that are actually valid
-    tails for a given (head, relation) but happen to land in another row's column
-    during in-batch contrastive training. ARPM-KGC reuses this identical mask for
-    all three in-batch losses (L_query, L_proto, L_struct), since a false negative
-    would otherwise corrupt every one of them, not just the S_q term.
-
     Args:
         row_exs: List of examples for rows
         col_exs: List of examples for columns (uses row_exs if None)
@@ -35,6 +29,7 @@ def construct_mask(
     col_exs = row_exs if col_exs is None else col_exs
     num_col = len(col_exs)
 
+    # Get entity IDs for exact matching
     row_entity_ids = torch.LongTensor([
         entity_dict.entity_to_idx(ex.tail_id) for ex in row_exs
     ])
@@ -46,11 +41,13 @@ def construct_mask(
             entity_dict.entity_to_idx(ex.tail_id) for ex in col_exs
         ])
 
+    # Create initial mask based on entity mismatch
     triplet_mask = (row_entity_ids.unsqueeze(1) != col_entity_ids.unsqueeze(0))
 
     if positive_on_diagonal:
         triplet_mask.fill_diagonal_(True)
 
+    # Mask out known neighbors from training set
     _mask_known_neighbors(
         triplet_mask, row_exs, col_exs, num_row, num_col, positive_on_diagonal
     )
@@ -71,10 +68,12 @@ def _mask_known_neighbors(
         head_id, relation = row_exs[i].head_id, row_exs[i].relation
         neighbor_ids = train_triplet_dict.get_neighbors(head_id, relation)
 
+        # Skip if there's only one neighbor (exact match is sufficient)
         if len(neighbor_ids) <= 1:
             continue
 
         for j in range(num_col):
+            # Skip diagonal elements when columns match rows
             if i == j and positive_on_diagonal:
                 continue
 

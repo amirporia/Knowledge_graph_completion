@@ -7,18 +7,16 @@ import torch
 import torch.utils.data
 import tqdm
 
-from ..model.models import build_model
-from ..setting.config import args
-from ..setting.logger_config import logger
-from ..utils.dict_hub import init_tokenizer
-from ..utils.doc import collate, collate_entity, Example, Dataset
-from ..utils.utils import AttrDict, move_to_cuda
-
-_NON_MODEL_KEYS = ('triplet_mask', 'self_negative_mask', 'batch_data', 'test_forward')
+from Baseline.model.models import build_model
+from Baseline.setting.config import args
+from Baseline.setting.logger_config import logger
+from Baseline.utils.dict_hub import init_tokenizer
+from Baseline.utils.doc import collate, Example, Dataset, collate_test
+from Baseline.utils.utils import AttrDict, move_to_cuda, get_model_obj
 
 
 def clean_state_dict(state_dict: dict) -> OrderedDict:
-    """Remove 'module.' prefix from DataParallel/DDP state dict."""
+    """Remove 'module.' prefix from DataParallel state dict."""
     new_state_dict = OrderedDict()
     for key, value in state_dict.items():
         clean_key = key[len('module.'):] if key.startswith('module.') else key
@@ -26,28 +24,17 @@ def clean_state_dict(state_dict: dict) -> OrderedDict:
     return new_state_dict
 
 
-class ARPMPredictor:
-    """Inference wrapper. `predict_by_examples` returns the memory bundle needed to compute
-    S = cos(q,e) + cos(q_hrta,e) + lambda_p S_p + lambda_s S_struct against the full entity set."""
+class BertPredictor:
+    """Predictor class for BERT-based model inference."""
 
     def __init__(self):
         self.model = None
         self.train_args = AttrDict()
         self.use_cuda = False
         self.device = None
-        self.batch_size = args.batch_size
-
-    @classmethod
-    def from_model(cls, model: torch.nn.Module, device: torch.device,
-                   use_cuda: bool, batch_size: int = None) -> 'ARPMPredictor':
-        predictor = cls()
-        predictor.model = model
-        predictor.device = device
-        predictor.use_cuda = use_cuda
-        predictor.batch_size = batch_size or args.batch_size
-        return predictor
 
     def load(self, ckt_path: str, use_data_parallel: bool = False) -> None:
+        """Load model from checkpoint."""
         if not os.path.exists(ckt_path):
             raise FileNotFoundError(f"Checkpoint not found: {ckt_path}")
 
@@ -57,12 +44,17 @@ class ARPMPredictor:
         init_tokenizer(self.train_args)
         self.model = build_model(self.train_args)
 
-        self.model.load_state_dict(clean_state_dict(ckt_dict['state_dict']), strict=True)
+        state_dict = ckt_dict['state_dict']
+        new_state_dict = clean_state_dict(state_dict)
+        self.model.load_state_dict(new_state_dict, strict=True)
         self.model.eval()
+
         self._setup_device(use_data_parallel)
+
         logger.info(f'Model loaded successfully from {ckt_path}')
 
     def _setup_device(self, use_data_parallel: bool) -> None:
+        """Configure model device placement."""
         if use_data_parallel and torch.cuda.device_count() > 1:
             logger.info('Using DataParallel predictor')
             self.model = torch.nn.DataParallel(self.model).cuda()
@@ -78,57 +70,91 @@ class ARPMPredictor:
             logger.info('Using CPU for inference')
 
     def _setup_args(self) -> None:
+        """Configure arguments with defaults and update global config."""
         for key, value in args.__dict__.items():
             if key not in self.train_args.__dict__:
                 logger.info(f'Setting default attribute: {key}={value}')
                 self.train_args.__dict__[key] = value
 
-        logger.info('Training arguments:\n' +
-                    json.dumps(self.train_args.__dict__, ensure_ascii=False, indent=4))
+        logger.info(
+            'Training arguments:\n' +
+            json.dumps(self.train_args.__dict__, ensure_ascii=False, indent=4)
+        )
 
         if hasattr(self.train_args, 'use_link_graph'):
             args.__dict__['use_link_graph'] = self.train_args.use_link_graph
-        # the candidate pool / RAA path must be built exactly as in training
-        for key in ('anchor_num', 'num_hops', 'local_per_hop_budget', 'global_budget', 'anchor_budget'):
-            if hasattr(self.train_args, key):
-                args.__dict__[key] = getattr(self.train_args, key)
         args.__dict__['is_test'] = True
 
     @torch.no_grad()
-    def predict_by_examples(self, examples: List[Example]) -> dict:
-        """Returns concatenated tensors:
-           q (N,d), q_hrta (N,d), prototypes (N,K,d), m_struct (N,d), lambda_p (N,), lambda_s (N,)"""
+    def predict_by_examples(self, examples: List[Example]) -> tuple:
+        """
+        Predict embeddings for query examples.
+
+        Returns:
+            (hr_vectors e_hr, tail_vectors e_t, related_hr_vectors e^avg_hrta)
+        Anchors are sampled deterministically from the TRAIN graph (never from the target).
+        """
         data_loader = self._create_dataloader(examples, is_test=False)
-        keys = ('q', 'q_hrta', 'prototypes', 'm_struct', 'lambda_p', 'lambda_s')
-        collected = {k: [] for k in keys}
 
-        for batch_dict in tqdm.tqdm(data_loader, desc='Predicting query memory'):
-            model_kwargs = {k: v for k, v in batch_dict.items() if k not in _NON_MODEL_KEYS}
-            outputs = self.model(**self._move_to_device(model_kwargs))
-            for k in keys:
-                collected[k].append(outputs[k].float())
+        # Anchor tensors are flattened across the batch (their first dim != batch size), so
+        # DataParallel's scatter would split them wrongly -> always run the unwrapped module here.
+        model = get_model_obj(self.model)
 
-        return {k: torch.cat(v, dim=0) for k, v in collected.items()}
+        hr_tensors, tail_tensors, related_hr_tensors = [], [], []
+
+        for batch_dict in data_loader:
+            batch_dict = self._move_to_device(batch_dict)
+            outputs = model(**batch_dict)
+
+            hr_tensors.append(outputs['hr_vector'])
+            tail_tensors.append(outputs['tail_vector'])
+            related_hr_tensors.append(outputs['related_hr_vector'])
+
+        return (
+            torch.cat(hr_tensors, dim=0),
+            torch.cat(tail_tensors, dim=0),
+            torch.cat(related_hr_tensors, dim=0)
+        )
 
     @torch.no_grad()
     def predict_by_entities(self, entity_exs: List) -> torch.Tensor:
-        examples = [Example(head_id='', relation='', tail_id=e.entity_id) for e in entity_exs]
+        """Predict embeddings (encoder g2) for candidate entities."""
+        examples = [
+            Example(head_id='', relation='', tail_id=entity_ex.entity_id)
+            for entity_ex in entity_exs
+        ]
+
         data_loader = self._create_dataloader(examples, is_test=True)
         ent_tensors = []
+
         for batch_dict in tqdm.tqdm(data_loader, desc='Predicting entities'):
-            outputs = self.model(**self._move_to_device(batch_dict))
+            batch_dict['only_ent_embedding'] = True
+            batch_dict = self._move_to_device(batch_dict)
+            outputs = self.model(**batch_dict)
             ent_tensors.append(outputs['ent_vectors'])
+
         return torch.cat(ent_tensors, dim=0)
 
-    def _create_dataloader(self, examples: List[Example], is_test: bool) -> torch.utils.data.DataLoader:
+    def _create_dataloader(
+            self,
+            examples: List[Example],
+            is_test: bool
+    ) -> torch.utils.data.DataLoader:
+        """Create a DataLoader from examples."""
         dataset = Dataset(path='', examples=examples, test_set=is_test)
-        collate_fn = collate_entity if is_test else collate
+        collate_fn = collate_test if is_test else collate
+
         return torch.utils.data.DataLoader(
-            dataset, num_workers=4, batch_size=self.batch_size,
-            collate_fn=collate_fn, shuffle=False, pin_memory=self.use_cuda
+            dataset,
+            num_workers=4,
+            batch_size=args.batch_size,
+            collate_fn=collate_fn,
+            shuffle=False,
+            pin_memory=self.use_cuda
         )
 
     def _move_to_device(self, batch_dict: dict) -> dict:
+        """Move batch dictionary to appropriate device."""
         if self.use_cuda:
             batch_dict = move_to_cuda(batch_dict)
         return batch_dict

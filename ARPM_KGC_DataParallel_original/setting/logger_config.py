@@ -3,9 +3,8 @@ import logging
 
 def _setup_logger():
     log_format = logging.Formatter("[%(asctime)s %(levelname)s] %(message)s")
-    log_logger = logging.getLogger('arpm_kgc')
+    log_logger = logging.getLogger()
     log_logger.setLevel(logging.INFO)
-    log_logger.propagate = False
 
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(log_format)

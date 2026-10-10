@@ -4,28 +4,32 @@ from typing import Dict
 
 import torch
 
-from .evaluate import evaluate_predictor
-from .predict import ARPMPredictor
+from ..evaluation.evaluate import eval_single_direction
+from ..evaluation.predict import BertPredictor
 from ..setting.config import args
 from ..setting.logger_config import logger
 from ..utils.dict_hub import get_entity_dict
 
+# Constants
 SHARD_SIZE = 1_000_000
 EVAL_BATCH_SIZE = 32
 TASK_REQUIREMENT = 'wiki5m_trans'
 
+# Validate task configuration
 assert args.task == TASK_REQUIREMENT, (
     f'This script is only used for {TASK_REQUIREMENT} transduction setting'
 )
 
+# Initialize entity dictionary once
 entity_dict = get_entity_dict()
 
 
 def get_shard_path(shard_id: int = 0) -> str:
+    """Get the file path for a specific shard."""
     return os.path.join(args.model_dir, f'shard_{shard_id}')
 
 
-def dump_entity_embeddings(predictor: ARPMPredictor) -> None:
+def dump_entity_embeddings(predictor: BertPredictor) -> None:
     """Generate and save entity embeddings in shards."""
     for start in range(0, len(entity_dict), SHARD_SIZE):
         end = min(start + SHARD_SIZE, len(entity_dict))
@@ -76,13 +80,26 @@ def load_entity_embeddings() -> torch.Tensor:
 
 
 def validate_paths() -> None:
+    """Validate that all required paths exist."""
     required_paths = {
         'valid_path': args.valid_path,
         'train_path': args.train_path,
         'eval_model_path': args.eval_model_path,
     }
+
     for path_name, path in required_paths.items():
         assert os.path.exists(path), f'{path_name} does not exist: {path}'
+
+
+def compute_averaged_metrics(
+        forward_metrics: Dict[str, float],
+        backward_metrics: Dict[str, float]
+) -> Dict[str, float]:
+    """Compute averaged metrics from forward and backward evaluations."""
+    return {
+        key: round((forward_metrics[key] + backward_metrics[key]) / 2, 4)
+        for key in forward_metrics
+    }
 
 
 def save_metrics(
@@ -90,6 +107,7 @@ def save_metrics(
         backward_metrics: Dict[str, float],
         averaged_metrics: Dict[str, float]
 ) -> None:
+    """Save evaluation metrics to a JSON file."""
     prefix = os.path.dirname(args.eval_model_path)
     basename = os.path.basename(args.eval_model_path)
     split = os.path.basename(args.valid_path)
@@ -109,23 +127,41 @@ def save_metrics(
 
 
 def predict_by_split() -> None:
+    """Main function to run prediction and evaluation by split."""
+    # Configure batch size
     args.batch_size = max(args.batch_size, torch.cuda.device_count() * 1024)
 
+    # Validate paths
     validate_paths()
 
-    predictor = ARPMPredictor()
+    # Initialize predictor
+    predictor = BertPredictor()
     predictor.load(ckt_path=args.eval_model_path, use_data_parallel=True)
 
+    # Generate and load embeddings
     dump_entity_embeddings(predictor)
     entity_tensor = load_entity_embeddings().cuda()
 
-    result = evaluate_predictor(predictor, entity_tensor=entity_tensor,
-                                 batch_size=EVAL_BATCH_SIZE, save_details=True)
-    forward_metrics, backward_metrics, averaged_metrics = (
-        result['forward'], result['backward'], result['average']
+    # Run evaluations
+    forward_metrics = eval_single_direction(
+        predictor,
+        entity_tensor=entity_tensor,
+        eval_forward=True,
+        batch_size=EVAL_BATCH_SIZE
     )
+
+    backward_metrics = eval_single_direction(
+        predictor,
+        entity_tensor=entity_tensor,
+        eval_forward=False,
+        batch_size=EVAL_BATCH_SIZE
+    )
+
+    # Compute and log results
+    averaged_metrics = compute_averaged_metrics(forward_metrics, backward_metrics)
     logger.info(f'Averaged metrics: {averaged_metrics}')
 
+    # Save metrics
     save_metrics(forward_metrics, backward_metrics, averaged_metrics)
 
 

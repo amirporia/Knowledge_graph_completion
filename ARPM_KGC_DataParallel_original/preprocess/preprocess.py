@@ -1,5 +1,3 @@
-"""Data preprocessing for ARPM-KGC.
-"""
 import argparse
 import json
 import multiprocessing as mp
@@ -13,10 +11,13 @@ from typing import List, Dict, Any
 # Configuration
 # ============================================================================
 
+# Current task name
 CURRENT_TASK_NAME = "wn18rr"
 
+# Get the script's directory (works everywhere)
 SCRIPT_DIR = Path(__file__).parent.parent.parent.absolute()
 
+# Dataset global variables (initialized lazily or as empty dicts)
 DATASET_VARS = {
     'wn18rr': {
         'id2ent': {}
@@ -32,6 +33,7 @@ DATASET_VARS = {
     }
 }
 
+# Backward compatibility references
 wn18rr_id2ent = DATASET_VARS['wn18rr']['id2ent']
 fb15k_id2ent = DATASET_VARS['fb15k237']['id2ent']
 fb15k_id2desc = DATASET_VARS['fb15k237']['id2desc']
@@ -39,6 +41,7 @@ wiki5m_id2rel = DATASET_VARS['WiKi5m']['id2rel']
 wiki5m_id2ent = DATASET_VARS['WiKi5m']['id2ent']
 wiki5m_id2text = DATASET_VARS['WiKi5m']['id2text']
 
+# Constants
 SUPPORTED_TASKS = {'wn18rr', 'fb15k237', 'wiki5m_trans', 'wiki5m_ind'}
 
 
@@ -47,18 +50,42 @@ SUPPORTED_TASKS = {'wn18rr', 'fb15k237', 'wiki5m_trans', 'wiki5m_ind'}
 # ============================================================================
 
 def setup_parser():
+    """Configure and return the argument parser."""
     parser = argparse.ArgumentParser(description='Preprocess dataset')
 
-    parser.add_argument('--task', default=CURRENT_TASK_NAME, type=str, help='dataset name')
-    parser.add_argument('--workers', default=4, type=int, help='number of workers')
-    parser.add_argument('--train-path', type=str, help='path to training data')
-    parser.add_argument('--valid-path', type=str, help='path to validation data')
-    parser.add_argument('--test-path', type=str, help='path to test data')
+    parser.add_argument(
+        '--task',
+        default=CURRENT_TASK_NAME,
+        type=str,
+        help='dataset name'
+    )
+    parser.add_argument(
+        '--workers',
+        default=4,
+        type=int,
+        help='number of workers'
+    )
+    parser.add_argument(
+        '--train-path',
+        type=str,
+        help='path to training data'
+    )
+    parser.add_argument(
+        '--valid-path',
+        type=str,
+        help='path to validation data'
+    )
+    parser.add_argument(
+        '--test-path',
+        type=str,
+        help='path to test data'
+    )
 
     return parser
 
 
 def set_default_paths(args, script_dir):
+    """Set default paths if not provided."""
     if not args.train_path:
         args.train_path = str(script_dir / 'data' / args.task / 'train.txt')
     if not args.valid_path:
@@ -73,6 +100,12 @@ def set_default_paths(args, script_dir):
 # ============================================================================
 
 def _check_sanity(relation_id_to_str: dict) -> None:
+    """
+    Verify that no two relations are normalized to the same surface form.
+
+    Args:
+        relation_id_to_str: Mapping from relation ID to its normalized string
+    """
     relation_str_to_id = {}
 
     for rel_id, rel_str in relation_id_to_str.items():
@@ -93,8 +126,17 @@ def _normalize_relations(
         normalize_fn: callable,
         train_path: str = None
 ) -> None:
+    """
+    Normalize relation strings in examples and optionally save the mapping.
+
+    Args:
+        examples: List of example dictionaries containing 'relation' keys
+        normalize_fn: Function to normalize relation strings
+        train_path: Optional path to training file for saving relation mapping
+    """
     relation_id_to_str = {}
 
+    # Normalize all relations
     for example in examples:
         original_relation = example['relation']
         normalized_relation = normalize_fn(original_relation)
@@ -102,13 +144,16 @@ def _normalize_relations(
         relation_id_to_str[original_relation] = normalized_relation
         example['relation'] = normalized_relation
 
+    # Verify no duplicate normalizations
     _check_sanity(relation_id_to_str)
 
+    # Save mapping if training path is provided
     if train_path:
         _save_relation_mapping(relation_id_to_str, train_path)
 
 
 def _save_relation_mapping(relation_id_to_str: dict, train_path: str) -> None:
+    """Save relation ID to string mapping to a JSON file."""
     output_dir = os.path.dirname(train_path)
     output_path = os.path.join(output_dir, 'relations.json')
 
@@ -123,6 +168,7 @@ def _save_relation_mapping(relation_id_to_str: dict, train_path: str) -> None:
 # ============================================================================
 
 def _load_wn18rr_texts(path: str) -> None:
+    """Load WordNet18RR entity data from file."""
     global wn18rr_id2ent
 
     with open(path, 'r', encoding='utf-8') as f:
@@ -140,6 +186,7 @@ def _load_wn18rr_texts(path: str) -> None:
 
 
 def _load_fb15k237_wikidata(path: str) -> None:
+    """Load FB15k-237 Wikidata entity names and descriptions."""
     global fb15k_id2ent, fb15k_id2desc
 
     with open(path, 'r', encoding='utf-8') as f:
@@ -162,6 +209,15 @@ def _load_fb15k237_wikidata(path: str) -> None:
 
 
 def _load_fb15k237_desc(path: str) -> None:
+    """
+    Load FB15k-237 entity descriptions from a tab-separated file.
+
+    Args:
+        path: Path to the description file with format: entity_id\tDescription text
+
+    The function stores descriptions in the global variable fb15k_id2desc,
+    truncating each description to 50 characters.
+    """
     global fb15k_id2desc
 
     try:
@@ -172,7 +228,7 @@ def _load_fb15k237_desc(path: str) -> None:
 
     for line_num, line in enumerate(lines, 1):
         line = line.strip()
-        if not line:
+        if not line:  # Skip empty lines
             continue
 
         parts = line.split('\t')
@@ -190,11 +246,13 @@ def _load_fb15k237_desc(path: str) -> None:
 
 
 def _truncate(text: str, max_len: int) -> str:
+    """Truncate text to at most max_len words."""
     words = text.split()
     return ' '.join(words[:max_len])
 
 
 def _load_wiki5m_id2rel(path: str) -> None:
+    """Load Wiki5M relation data."""
     global wiki5m_id2rel
 
     with open(path, 'r', encoding='utf-8') as f:
@@ -211,6 +269,7 @@ def _load_wiki5m_id2rel(path: str) -> None:
 
 
 def _load_wiki5m_id2ent(path: str) -> None:
+    """Load Wiki5M entity names."""
     global wiki5m_id2ent
 
     with open(path, 'r', encoding='utf-8') as f:
@@ -227,6 +286,7 @@ def _load_wiki5m_id2ent(path: str) -> None:
 
 
 def _load_wiki5m_id2text(path: str, max_len: int = 30) -> None:
+    """Load Wiki5M entity text descriptions."""
     global wiki5m_id2text
 
     with open(path, 'r', encoding='utf-8') as f:
@@ -248,6 +308,17 @@ def _load_wiki5m_id2text(path: str, max_len: int = 30) -> None:
 # ============================================================================
 
 def _process_line(line: str, id2ent: dict, dataset: str = "wn18rr") -> dict:
+    """
+    Process a line from a knowledge graph dataset into an example dict.
+
+    Args:
+        line: Tab-separated string with head, relation, tail
+        id2ent: Mapping from entity IDs to entity information
+        dataset: Dataset name ("wn18rr", "fb15k237", or "wiki5m")
+
+    Returns:
+        Dictionary with head_id, head, relation, tail_id, tail
+    """
     fields = line.strip().split('\t')
     assert len(fields) == 3, f'Expected 3 fields, got {len(fields)}: {line.strip()}'
 
@@ -261,7 +332,7 @@ def _process_line(line: str, id2ent: dict, dataset: str = "wn18rr") -> dict:
             'tail_id': tail_id,
             'tail': id2ent.get(tail_id, None)
         }
-    else:
+    else:  # wn18rr or fb15k237
         _, head, _ = id2ent[head_id]
         _, tail, _ = id2ent[tail_id]
         return {
@@ -273,6 +344,7 @@ def _process_line(line: str, id2ent: dict, dataset: str = "wn18rr") -> dict:
         }
 
 
+# Convenience wrappers for backward compatibility
 def _process_line_wn18rr(line: str, id2ent: dict) -> dict:
     return _process_line(line, id2ent, "wn18rr")
 
@@ -291,8 +363,10 @@ def preprocess_wn18rr(path, num_workers: int, train_path: str):
 
     lines = open(path, 'r', encoding='utf-8').readlines()
 
+    # Create a partial function with the dictionaries
     from functools import partial
-    process_func = partial(_process_line_wn18rr, id2ent=wn18rr_id2ent)
+    process_func = partial(_process_line_wn18rr,
+                           id2ent=wn18rr_id2ent)
 
     pool = Pool(processes=num_workers)
     examples = pool.map(process_func, lines)
@@ -314,6 +388,7 @@ def _normalize_fb15k237_relation(relation: str) -> str:
     for token in tokens:
         if token not in dedup_tokens[-3:]:
             dedup_tokens.append(token)
+    # leaf words are more important (maybe)
     relation_tokens = dedup_tokens[::-1]
     relation = ' '.join([t for idx, t in enumerate(relation_tokens)
                          if idx == 0 or relation_tokens[idx] != relation_tokens[idx - 1]])
@@ -328,6 +403,7 @@ def preprocess_fb15k237(path, num_workers: int, train_path: str):
 
     lines = open(path, 'r', encoding='utf-8').readlines()
 
+    # Create a partial function with the dictionaries
     from functools import partial
     process_func = partial(_process_line_fb15k237, id2ent=fb15k_id2ent)
     pool = Pool(processes=num_workers)
@@ -359,7 +435,7 @@ def preprocess_wiki5m(path: str, num_workers: int, train_path: str) -> List[dict
     lines = open(path, 'r', encoding='utf-8').readlines()
 
     from functools import partial
-    process_func = partial(_process_line_wiki5m, id2ent=_load_wiki5m_id2ent)
+    process_func = partial(_process_line_wiki5m, id2ent=wiki5m_id2ent)
 
     pool = Pool(processes=num_workers)
     examples = pool.map(process_func, lines)
@@ -376,6 +452,7 @@ def preprocess_wiki5m(path: str, num_workers: int, train_path: str) -> List[dict
         # so after filtering, there are 819 relations instead of 822 relations
         examples = [ex for ex in examples if not _has_none_value(ex)]
     else:
+        # Even though it's invalid (contains null values), we should not change validation/test dataset
         print('Invalid examples: {}'.format(json.dumps(invalid_examples, ensure_ascii=False, indent=4)))
 
     out_path = path + '.json'
@@ -394,6 +471,7 @@ def dump_all_entities(examples, out_path, id2text: dict):
 
         relations.add(ex['relation'])
 
+        # Add head entity if not exists
         if head_id not in id2entity:
             id2entity[head_id] = {
                 'entity_id': head_id,
@@ -401,6 +479,7 @@ def dump_all_entities(examples, out_path, id2text: dict):
                 'entity_desc': id2text[head_id]
             }
 
+        # Add tail entity if not exists
         if tail_id not in id2entity:
             id2entity[tail_id] = {
                 'entity_id': tail_id,
@@ -414,7 +493,9 @@ def dump_all_entities(examples, out_path, id2text: dict):
         json.dump(list(id2entity.values()), f, ensure_ascii=False, indent=4)
 
 
+# Task-specific entity mappings
 def get_entity_mapping(task: str) -> Dict:
+    """Get the entity to text mapping for the given task."""
     mappings = {
         'wn18rr': lambda: {k: v[2] for k, v in wn18rr_id2ent.items()},
         'fb15k237': lambda: {k: v[2] for k, v in fb15k_id2ent.items()},
@@ -429,6 +510,7 @@ def get_entity_mapping(task: str) -> Dict:
 
 
 def setup_multiprocessing():
+    """Configure multiprocessing start method based on platform."""
     if sys.platform != 'win32':
         mp.set_start_method('fork', force=True)
     else:
@@ -436,12 +518,14 @@ def setup_multiprocessing():
 
 
 def validate_file_paths(paths: List[str]) -> None:
+    """Validate that all file paths exist."""
     for path in paths:
         if not os.path.exists(path):
             raise FileNotFoundError(f"File with path '{path}' does not exist...")
 
 
 def load_and_preprocess_data(args: Any):
+    """Load and preprocess all data files."""
     all_examples = []
     file_paths = [args.train_path, args.valid_path, args.test_path]
 
@@ -449,6 +533,7 @@ def load_and_preprocess_data(args: Any):
 
     task_name = args.task.lower()
 
+    # Task-specific preprocessing functions
     TASK_PREPROCESSORS = {
         'wn18rr': preprocess_wn18rr,
         'fb15k237': preprocess_fb15k237,
@@ -469,21 +554,27 @@ def load_and_preprocess_data(args: Any):
 
 
 def dump_entities_to_file(all_examples: List, output_dir: str, id2text: Dict) -> None:
+    """Dump all entities to a JSON file."""
     output_path = os.path.join(output_dir, 'entities.json')
     dump_all_entities(all_examples, out_path=output_path, id2text=id2text)
 
 
 def main():
+    """Main entry point."""
     parser = setup_parser()
     args = parser.parse_args()
     args = set_default_paths(args, SCRIPT_DIR)
 
+    # Configure multiprocessing
     setup_multiprocessing()
 
+    # Load and preprocess data
     all_examples, task_name = load_and_preprocess_data(args)
 
+    # Get entity mapping
     id2text = get_entity_mapping(task_name)
 
+    # Dump entities
     output_dir = os.path.dirname(args.test_path)
     dump_entities_to_file(all_examples, output_dir, id2text)
 

@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from .dict_hub import get_link_graph
+from .doc import Example
 from .triplet import EntityDict
 from ..setting.config import args
 from ..setting.logger_config import logger
@@ -22,9 +23,13 @@ class AttrDict(dict):
 def save_checkpoint(state: Dict[str, Any], is_best: bool, filename: str,
                     eval_state: Dict[str, Any] = None) -> None:
     """Persist a full training checkpoint, and mirror to `model_last.mdl` /
-    (if `is_best`) `model_best.mdl`."""
+    (if `is_best`) `model_best.mdl`. `eval_state` -- when given -- is the
+    lightweight subset (config + weights only) written to model_best.mdl so
+    evaluation/prediction scripts don't need to load optimizer/scheduler state.
+    """
     dirname = os.path.dirname(filename)
     os.makedirs(dirname, exist_ok=True)
+    # torch.save(state, filename)
 
     if is_best:
         torch.save(eval_state if eval_state is not None else state,
@@ -69,7 +74,7 @@ def report_num_trainable_parameters(model: torch.nn.Module) -> int:
 
 
 def get_model_obj(model: nn.Module) -> nn.Module:
-    """Get the underlying model, unwrapping DataParallel/DDP if needed."""
+    """Get the underlying model, unwrapping DataParallel if needed."""
     return model.module if hasattr(model, "module") else model
 
 
@@ -86,9 +91,25 @@ def move_to_device(obj: Any, device) -> Any:
     return obj
 
 
+def split_and_move_to_device(tensor_list: List, device_ids: List[int]) -> Dict[int, List]:
+    """Distribute tensors across multiple devices."""
+    num_gpus = len(device_ids)
+    split_batch_dict = {device_id: [] for device_id in device_ids}
+
+    for i, tensor in enumerate(tensor_list):
+        device_id = device_ids[i % num_gpus]
+        split_batch_dict[device_id].append(move_to_device(tensor, device_id))
+
+    return split_batch_dict
+
+
 def move_to_cuda(sample: Any) -> Any:
-    """Recursively move sample to the current process's CUDA device (or CPU if
-    unavailable)."""
+    """Recursively move sample to the current process's CUDA device (or CPU if unavailable).
+
+    Uses torch.cuda.current_device() rather than a hardcoded index so this is correct
+    both for single-GPU runs (whatever device Trainer/BertPredictor selected) and for
+    each rank of a multi-GPU DDP run (after torch.cuda.set_device(local_rank)).
+    """
     if not sample:
         return {}
 
@@ -145,17 +166,18 @@ class ProgressMeter:
         return '[' + fmt + '/' + fmt.format(num_batches) + ']'
 
 
-def rerank_by_graph(batch_score: torch.Tensor, examples: List, entity_dict: EntityDict) -> None:
-    """SimKGC-style re-ranking (evaluation only): add `neighbor_weight` to every entity within
-    `rerank_n_hop` hops of the head. Disabled with --neighbor-weight 0."""
+def rerank_by_graph(batch_score: torch.tensor,
+                    examples: List[Example],
+                    entity_dict: EntityDict) -> None:
+    """Optional SimKGC re-ranking (off when --neighbor-weight 0)."""
     if args.task == 'wiki5m_ind':
         assert args.neighbor_weight < 1e-6, 'Inductive setting cannot use re-rank strategy'
+
     if args.neighbor_weight < 1e-6:
         return
 
-    link_graph = get_link_graph()
     for idx in range(batch_score.size(0)):
-        neighbor_indices = link_graph.get_n_hop_entity_indices(
+        neighbor_indices = get_link_graph().get_n_hop_entity_indices(
             examples[idx].head_id, entity_dict=entity_dict, n_hop=args.rerank_n_hop
         )
         if neighbor_indices:

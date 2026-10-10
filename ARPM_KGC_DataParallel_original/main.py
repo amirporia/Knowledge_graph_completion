@@ -1,13 +1,12 @@
-import json
-from datetime import timedelta
-
 import torch
+import json
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
+import datetime
 
-from .setting.config import args
-from .model.trainer import Trainer
-from .setting.logger_config import logger
+from Baseline.setting.config import args
+from Baseline.model.trainer import Trainer
+from Baseline.setting.logger_config import logger
 
 
 def main():
@@ -20,7 +19,7 @@ def main():
         dist.init_process_group(
             backend=args.dist_backend, init_method='env://',
             device_id=torch.device(f'cuda:{args.local_rank}'),
-            timeout=timedelta(minutes=60),
+            timeout=datetime.timedelta(minutes=60),
         )
         logger.info(
             f'Distributed training: rank {args.rank}/{args.world_size} '
@@ -32,6 +31,8 @@ def main():
 
     trainer = Trainer(args, ngpus_per_node=torch.cuda.device_count())
 
+    # Only rank 0 needs to log the full args dump; every rank would otherwise print an
+    # identical block.
     if args.rank == 0:
         logger.info('Args={}'.format(json.dumps(args.__dict__, ensure_ascii=False, indent=4)))
 
