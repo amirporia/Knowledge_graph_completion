@@ -1,26 +1,49 @@
-"""Relation-aware candidate anchor retrieval (v2).
+"""Relation-aware candidate anchor retrieval.
 
-Same pool definition as before, A(h,r) = A_local(h,r) U A_global(r), with hop slots
-0..num_hops for local anchors and NO_HOP (-1) for global ones.
+Implements "Relation-Aware Candidate Memory":
+for a query (h, r, ?) this builds the candidate pool
 
-Differences from the previous version:
-  * hop-0 anchors (other known tails of the same (h,r)) are NEVER dropped by the
-    total-budget cap: they feed the RAA-KGC anchor-enhanced query path, which is the
-    strongest component of the baseline. Only hop>=1 and global candidates are
-    sub-sampled to fit `anchor_budget`.
-  * hop-0 needs no graph traversal, so it is kept even with --disable-link-graph
-    (only hop>=1 requires the link graph).
-Retrieval reads only the TRAINING graph, so no valid/test label can enter the pool.
+    A(h, r) = A_local(h, r)  U  A_global(r)
+
+where A_local(h, r) = U_{l=0..num_hops} A_local^(l)(h, r) is made of
+num_hops+1 local hop categories total:
+  - hop 0: OTHER valid tails for the exact SAME (h, r) pair -- i.e. graph
+    distance 0, no traversal at all (excludes the query's own true tail, to
+    avoid leaking the label). This is the tightest possible local evidence:
+    "what else does this exact head-relation pair connect to" -- most useful
+    for one-to-many relations.
+  - hop l (1 <= l <= num_hops): relation-r training triples whose heads sit
+    at graph distance l from h (one hop layer at a time, via
+    LinkGraph.get_hop_layers).
+`--num-hops N` therefore yields N+1 categories: hop-0, hop-1, ..., hop-N
+(e.g. `--num-hops 2` gives hop-0, hop-1, AND hop-2 -- not just two).
+A_global(r) is a bounded sample from the relation-r training set T_r,
+EXCLUDING ground truth triples.
+
+Every candidate is tagged with its hop slot (-1 for global / unknown distance,
+0..num_hops for local, 0-indexed so slot l lines up directly with the l-th row
+of hop-specific structural memory m^(l) and the l-th output channel of G_hop;
+G_hop/m^(l) are therefore allocated num_hops+1 slots, see model/models.py) so
+the model can later build hop-specific structural memory on top of
+exactly the same weighted anchor set used for retrieval and prototype
+construction.
+
+Retrieval only ever reads the *training* graph (via get_train_triplet_dict /
+get_link_graph), independent of args.is_test, so no validation/test labels can
+leak into the candidate pool at evaluation time.
 """
 import random
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 from .dict_hub import get_link_graph, get_train_triplet_dict
 from ..setting.config import args
 from ..setting.logger_config import logger
 
-NO_HOP = -1
+NO_HOP = -1  # sentinel hop value for global candidates (and, in utils/doc.py's
+             # collate, for padding slots) -- distinct from every valid local
+             # hop slot 0..num_hops (including local hop 0), so it can never
+             # be mistaken for a genuine local anchor.
 
 
 class CandidateAnchor:
@@ -30,11 +53,17 @@ class CandidateAnchor:
         self.head_id = head_id
         self.relation = relation
         self.tail_id = tail_id
-        self.hop = hop
+        self.hop = hop            # NO_HOP (-1) = global; 0..num_hops = local hop slot
+                                   # (0 = same head & relation, graph distance 0;
+                                   # 1..num_hops = increasing graph distance)
         self.is_local = is_local
 
 
 class CandidatePoolBuilder:
+    """Builds A_local(h,r) and A_global(r) candidate pools per query, each bounded
+    by a configurable budget so the neural retrieval/prototype/structural stages
+    that follow operate on a manageable, fixed-shape candidate set."""
+
     def __init__(self, num_hops: int, local_per_hop_budget: int,
                  global_budget: int, total_budget: int, use_link_graph: bool):
         self.num_hops = num_hops
@@ -51,7 +80,7 @@ class CandidatePoolBuilder:
     def _build_relation_index(self) -> None:
         for (head_id, relation), tail_ids in self.train_triplet_dict.hr2tails.items():
             pairs = self._relation2pairs[relation]
-            for tail_id in sorted(tail_ids):
+            for tail_id in sorted(tail_ids):  # deterministic order
                 pairs.append((head_id, tail_id))
         logger.info(
             f'CandidatePoolBuilder: indexed {len(self._relation2pairs)} relations '
@@ -60,7 +89,8 @@ class CandidatePoolBuilder:
 
     @staticmethod
     def _get_rng(head_id: str, relation: str):
-        # Evaluation: deterministic per-query sampling. Training: global `random`.
+        # Evaluation: deterministic per-query sampling (comparable across epochs).
+        # Training: global `random` (re-seeded per DataLoader worker by PyTorch).
         if args.is_test:
             return random.Random(f'{head_id}\t{relation}')
         return random
@@ -79,8 +109,10 @@ class CandidatePoolBuilder:
         return candidates
 
     def _local_candidates(self, head_id, relation, tail_id, rng, exclude_edge=None):
+        if self.link_graph is None:
+            return []
         candidates = self._same_head_candidates(head_id, relation, tail_id, rng)
-        if self.link_graph is None or self.num_hops < 1:
+        if self.num_hops < 1:
             return candidates
 
         hop_layers = self.link_graph.get_hop_layers(
@@ -118,15 +150,11 @@ class CandidatePoolBuilder:
         exclude_edge = (head_id, tail_id) if training else None
         rng = self._get_rng(head_id, relation)
 
-        local = self._local_candidates(head_id, relation, exclude_tail, rng, exclude_edge)
-        glob = self._global_candidates(head_id, exclude_tail, relation, rng)
-
-        hop0 = [c for c in local if c.hop == 0]
-        others = [c for c in local if c.hop != 0] + glob
-        room = max(self.total_budget - len(hop0), 0)
-        if len(others) > room:
-            others = rng.sample(others, room)
-        return (hop0 + others)[:self.total_budget]
+        candidates = self._local_candidates(head_id, relation, exclude_tail, rng, exclude_edge) + \
+                     self._global_candidates(head_id, exclude_tail, relation, rng)
+        if len(candidates) > self.total_budget:
+            candidates = rng.sample(candidates, self.total_budget)
+        return candidates
 
 
 _pool_builder: 'CandidatePoolBuilder' = None

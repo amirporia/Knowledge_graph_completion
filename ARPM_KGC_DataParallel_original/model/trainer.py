@@ -25,15 +25,10 @@ from ..utils.utils import (
     get_model_obj
 )
 
-_NON_MODEL_KEYS = ('triplet_mask', 'self_negative_mask', 'batch_data', 'test_forward')
-
 
 class Trainer:
-    """Trains ARPM-KGC v2.
-
-        L = L_query + alpha * L_hrta                      (encoders; identical to the RAA-KGC baseline)
-          + eta_p L_proto + eta_s L_struct + eta_c L_combined + eta_div L_div + eta_pdiv L_pdiv
-                                                           (memory modules only: inputs are detached)
+    """Handles ARPM-KGC model training, evaluation, and checkpointing.
+        L = L_query + eta_p * L_proto + eta_s * L_struct + eta_div * L_div
     """
 
     def __init__(self, args, ngpus_per_node):
@@ -56,7 +51,7 @@ class Trainer:
 
     def _build_model(self):
         if self.args.rank == 0:
-            logger.info("=> creating ARPM-KGC v2 model")
+            logger.info("=> creating ARPM-KGC model")
         self.model = build_model(self.args)
         if self.args.rank == 0:
             logger.info(self.model)
@@ -76,38 +71,50 @@ class Trainer:
         if self.args.distributed:
             self.model = nn.parallel.DistributedDataParallel(
                 self.model, device_ids=[self.args.local_rank], output_device=self.args.local_rank,
-                broadcast_buffers=False, find_unused_parameters=True,
+                broadcast_buffers=False,
+                find_unused_parameters=True,
             )
         elif torch.cuda.device_count() > 1:
-            # Every tensor returned by ARPMModel.forward is a per-example (B, ...) tensor, so
-            # DataParallel gathers them along dim 0 and all losses still see the full batch.
-            logger.info(f'Using nn.DataParallel across {torch.cuda.device_count()} GPUs; '
-                        f'global batch size stays {self.args.batch_size}.')
+            # Single-process multi-GPU (e.g. Kaggle 2xT4, no torchrun). Unlike DDP,
+            # DataParallel scatters only the encoder forward/backward across GPUs and
+            # GATHERS outputs back to self.device before any loss is computed, so
+            # L_query/L_proto/L_struct/L_combined still see the FULL args.batch_size
+            # in-batch negatives -- numerically equivalent to running the same
+            # --batch-size on a single (large-enough-memory) GPU, just splitting the
+            # BERT activations that were causing the OOM.
+            #
+            # Every value returned by ARPMModel.forward() must be a proper (B, ...)
+            # per-example tensor for this to gather correctly -- DataParallel
+            # concatenates per-replica outputs along dim 0. A pre-reduced 0-dim
+            # scalar (e.g. an internal `.mean()`) would instead get stacked into a
+            # length-num_gpus vector; see model/modules.py::diversity_loss, which
+            # returns its per-example (B,) tensor unreduced for exactly this reason.
+            logger.info(
+                f'Using nn.DataParallel across {torch.cuda.device_count()} GPUs; '
+                f'global batch size stays {self.args.batch_size} (split evenly for '
+                f'the encoder pass, gathered before loss computation).'
+            )
             self.model = nn.DataParallel(self.model)
 
     def _init_optimizer_and_criterion(self):
         self.criterion = nn.CrossEntropyLoss().to(self.device)
         model_obj = get_model_obj(self.model)
-
-        main_params, memory_params = [], []
-        for name, p in model_obj.named_parameters():
-            if not p.requires_grad:
-                continue
-            if name.startswith(('hr_bert.', 'tail_bert.')) or name == 'log_inv_t':
-                main_params.append(p)
-            else:
-                memory_params.append(p)
-
+        temp_params = [model_obj.log_inv_t] if model_obj.log_inv_t.requires_grad else []
+        temp_ids = {id(p) for p in temp_params}
+        main_params = [p for p in self.model.parameters()
+                       if p.requires_grad and id(p) not in temp_ids]
         groups = [{'params': main_params}]
-        if memory_params:
-            groups.append({'params': memory_params, 'lr': self.args.memory_lr, 'weight_decay': 0.0})
+        if temp_params:
+            groups.append({'params': temp_params,
+                           'lr': self.args.lr * self.args.t_lr_scale,
+                           'weight_decay': 0.0})
         self.optimizer = AdamW(groups, lr=self.args.lr, weight_decay=self.args.weight_decay)
-
         if self.args.rank == 0:
             report_num_trainable_parameters(model_obj)
 
     def _init_data_loaders(self):
         self.train_dataset = Dataset(path=self.args.train_path, test_set=False)
+
         self.train_loader, self.train_sampler = self._create_data_loader(
             self.train_dataset, shuffle=True, drop_last=True, distributed=self.args.distributed
         )
@@ -125,11 +132,16 @@ class Trainer:
             torch.utils.data.distributed.DistributedSampler(dataset, shuffle=shuffle)
             if distributed else None
         )
+
         loader = torch.utils.data.DataLoader(
-            dataset, batch_size=self.args.batch_size,
+            dataset,
+            batch_size=self.args.batch_size,
             shuffle=shuffle if sampler is None else False,
-            sampler=sampler, collate_fn=collate, num_workers=self.args.workers,
-            pin_memory=False, drop_last=drop_last
+            sampler=sampler,
+            collate_fn=collate,
+            num_workers=self.args.workers,
+            pin_memory=False,
+            drop_last=drop_last
         )
         return loader, sampler
 
@@ -140,15 +152,25 @@ class Trainer:
 
         self.args.warmup = min(self.args.warmup, num_training_steps // 10)
         if self.args.rank == 0:
-            logger.info(f'Total training steps: {num_training_steps}, warmup steps: {self.args.warmup}')
+            logger.info(
+                f'Total training steps: {num_training_steps}, '
+                f'warmup steps: {self.args.warmup}'
+            )
         self.scheduler = self._create_lr_scheduler(num_training_steps)
 
     def _create_lr_scheduler(self, num_training_steps):
-        schedulers = {'linear': get_linear_schedule_with_warmup, 'cosine': get_cosine_schedule_with_warmup}
-        if self.args.lr_scheduler not in schedulers:
-            raise ValueError(f'Unknown lr scheduler: {self.args.lr_scheduler}')
-        return schedulers[self.args.lr_scheduler](
-            optimizer=self.optimizer, num_warmup_steps=self.args.warmup,
+        schedulers = {
+            'linear': get_linear_schedule_with_warmup,
+            'cosine': get_cosine_schedule_with_warmup
+        }
+
+        scheduler_type = self.args.lr_scheduler
+        if scheduler_type not in schedulers:
+            raise ValueError(f'Unknown lr scheduler: {scheduler_type}')
+
+        return schedulers[scheduler_type](
+            optimizer=self.optimizer,
+            num_warmup_steps=self.args.warmup,
             num_training_steps=num_training_steps
         )
 
@@ -159,8 +181,31 @@ class Trainer:
         if not self.args.resume:
             return
 
-        # Load on CPU first: avoids a transient double allocation of weights + AdamW state on the GPU.
+        # Load onto CPU first -- NOT directly onto the GPU via `map_location=self.device`.
+        #
+        # By this point the model is already resident on the GPU (see `_setup_device`,
+        # which runs before this method). Loading the checkpoint straight to
+        # `self.device` means the checkpoint's full model weights AND the entire AdamW
+        # optimizer state (two extra tensors per parameter -- exp_avg/exp_avg_sq, each
+        # the same size as the parameter itself) get materialized on the GPU all at
+        # once, on top of the model that's already sitting there -- before
+        # `load_state_dict` even runs. For two full BERT encoders (hr_bert + tail_bert)
+        # that transient double allocation is on the order of several GiB.
+        #
+        # This is exactly why a fresh run (nothing to resume, this method returns
+        # immediately) never OOMs while resuming does: the extra memory isn't needed
+        # once loading finishes, but by then the CUDA caching allocator can be left
+        # fragmented enough that the first real allocation in the forward pass
+        # (candidate encoding in `ARPMModel._build_memory`) fails even though the
+        # *total* free memory would otherwise be enough.
+        #
+        # Loading to CPU avoids the spike: `nn.Module.load_state_dict` copies each CPU
+        # tensor into the existing GPU parameter's storage in place (no second
+        # full-size GPU buffer), and `Optimizer.load_state_dict` casts/moves each
+        # state tensor to its parameter's device one at a time rather than assuming
+        # an already-GPU-resident blob.
         checkpoint = load_checkpoint(self.args.resume_path, map_location='cpu')
+
         get_model_obj(self.model).load_state_dict(checkpoint['state_dict'])
 
         if checkpoint.get('optimizer') is not None:
@@ -174,9 +219,15 @@ class Trainer:
         self.start_epoch = checkpoint.get('epoch', -1) + 1
 
         if self.args.rank == 0:
-            logger.info(f'Resumed from {self.args.resume_path} '
-                        f'(checkpoint epoch {checkpoint.get("epoch")}, resuming at epoch {self.start_epoch})')
+            logger.info(
+                f'Resumed from {self.args.resume_path} '
+                f'(checkpoint epoch {checkpoint.get("epoch")}, resuming at epoch {self.start_epoch})'
+            )
 
+        # Drop the CPU checkpoint dict and release any cached CUDA blocks left over
+        # from the load, so the first training batch starts from a clean,
+        # unfragmented allocator state rather than immediately racing the forward
+        # pass against leftover cache pressure from resuming.
         del checkpoint
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -193,8 +244,8 @@ class Trainer:
         meters = self._init_training_meters()
         progress = ProgressMeter(
             len(self.train_loader),
-            [meters['losses'], meters['query_losses'], meters['hrta_losses'], meters['proto_losses'],
-             meters['struct_losses'], meters['combined_losses'], meters['lam_p'], meters['lam_s'],
+            [meters['losses'], meters['query_losses'], meters['proto_losses'],
+             meters['struct_losses'], meters['div_losses'], meters['combined_losses'],
              meters['inv_t'], meters['top1'], meters['top3']],
             prefix=f"Epoch: [{epoch}]"
         )
@@ -205,7 +256,7 @@ class Trainer:
 
             outputs, loss_components = self._forward_and_compute_losses(batch_dict)
 
-            self._update_meters(meters, loss_components, outputs)
+            self._update_meters(meters, loss_components)
             self._backward_pass(loss_components['total_loss'])
             self.scheduler.step()
 
@@ -221,12 +272,10 @@ class Trainer:
         return {
             'losses': AverageMeter('Loss', ':.4'),
             'query_losses': AverageMeter('L_query', ':.4'),
-            'hrta_losses': AverageMeter('L_hrta', ':.4'),
             'proto_losses': AverageMeter('L_proto', ':.4'),
             'struct_losses': AverageMeter('L_struct', ':.4'),
-            'combined_losses': AverageMeter('L_comb', ':.4'),
-            'lam_p': AverageMeter('lam_p', ':.3f'),
-            'lam_s': AverageMeter('lam_s', ':.3f'),
+            'div_losses': AverageMeter('L_div', ':.4'),
+            'combined_losses': AverageMeter('L_combined', ':.4'),
             'top1': AverageMeter('Acc@1', ':6.2f'),
             'top3': AverageMeter('Acc@3', ':6.2f'),
             'inv_t': AverageMeter('InvT', ':6.2f')
@@ -238,88 +287,122 @@ class Trainer:
         return batch_dict
 
     def _forward_and_compute_losses(self, batch_dict):
-        """Forward AND loss computation inside the same autocast region (see v1 notes)."""
-        model_kwargs = {k: v for k, v in batch_dict.items() if k not in _NON_MODEL_KEYS}
+        """Forward pass AND loss computation together, inside the SAME autocast
+        region when AMP is enabled.
+
+        `_compute_losses` matmuls tensors produced inside the model's forward
+        pass against each other (score_query/score_prototypes/score_struct/
+        combined_score). Under autocast, `nn.functional.normalize` (used in
+        model/models.py::_pool_output for q/tail_vector/head_vector) is always
+        run in fp32 -- autocast's fixed policy for norm-family ops, for
+        numerical stability -- while prototypes/m_struct (pure einsum/matmul
+        output) get cast to fp16, autocast's fixed policy for matmul-family ops.
+        Inside forward(), that's fine: everything is still inside one active
+        autocast region, which keeps reconciling dtypes as needed. Splitting
+        forward (autocast) from loss computation (no autocast, as this used to
+        do) means that reconciliation stops at the `with` block's exit, so
+        score_prototypes's einsum('bkd,ed->bke', prototypes[fp16],
+        tail_vector[fp32]) fails with "expected scalar type Half but found
+        Float" instead of being silently promoted. Loss computation is exactly
+        the matmul-heavy code AMP is meant to speed up anyway, so this isn't a
+        workaround -- only backward()/optimizer.step() (via GradScaler) belong
+        outside autocast.
+        """
+        model_kwargs = {k: v for k, v in batch_dict.items()
+                        if k not in ('triplet_mask', 'self_negative_mask', 'batch_data', 'test_forward')}
         with torch.amp.autocast('cuda', enabled=self.args.use_amp):
             outputs = self.model(**model_kwargs)
             loss_components = self._compute_losses(outputs, batch_dict)
         return outputs, loss_components
 
     def _compute_losses(self, outputs, batch_dict) -> Dict:
+        """In-batch negatives (batch tail vectors act as the candidate entity set).
+         The same false-negative `triplet_mask` is applied
+        to all three logit matrices (S_q, S_p, S_struct) since an unmasked false
+        negative would corrupt every one of them, not just S_q.
+
+        A shared inverse-temperature `exp(log_inv_t)` (and, for S_q only, the
+        additive margin + self-negative term) is applied ONLY to the copies of
+        S_q/S_p/S_struct/S(t|h,r) used to form the CE logits below -- never to the
+        raw values returned for ranking or analysis (see model/models.py scoring
+        docstring).
+
+        L_combined (weighted by --eta-combined) is a bidirectional CE loss on the
+        scaled combined score S(t|h,r) = S_q + lambda_p*S_p + lambda_s*S_struct.
+        It exists purely so MemoryGate (G_lambda, producing lambda_p/lambda_s)
+        sits on a path back to total_loss -- L_query/L_proto/L_struct/L_div never
+        touch lambda_p/lambda_s, so without this term the gate is never trained
+        and, under DDP, triggers "unused parameter" errors.
+        """
         model_obj = get_model_obj(self.model)
 
         q = outputs['q']
-        q_hrta = outputs['q_hrta']
         tail_vector = outputs['tail_vector']
         head_vector = outputs['head_vector']
         prototypes = outputs['prototypes']
         m_struct = outputs['m_struct']
         lambda_p = outputs['lambda_p']
         lambda_s = outputs['lambda_s']
+        slot_gate = outputs.get('slot_gate')
 
+        # outputs['div_loss'] is a per-example (B,) tensor (see
+        # modules.py::diversity_loss), not a pre-reduced scalar -- this is what
+        # lets nn.DataParallel gather it correctly across GPUs (concatenation
+        # along dim 0) instead of stacking two per-GPU scalars into a length-2
+        # vector. Reduce it here, after gathering, not inside the model.
         div_loss = outputs['div_loss'].mean()
-        pdiv_loss = outputs['proto_div'].mean()
 
         batch_size = q.size(0)
         labels = torch.arange(batch_size, device=q.device)
         inv_t = model_obj.log_inv_t.exp()
         inv_t_aux = inv_t.detach()
-        triplet_mask = batch_dict.get('triplet_mask')
-        margin = torch.diag_embed(torch.full((batch_size,), self.args.additive_margin, device=q.device))
 
-        # ---- L_query (encoders): additive margin + self-negative, as in the baseline ----
+        triplet_mask = batch_dict.get('triplet_mask')
+
         S_q = model_obj.score_query(q, tail_vector)
-        q_logits = (S_q - margin) * inv_t
+        S_p = model_obj.score_prototypes(prototypes, tail_vector, slot_gate=slot_gate)
+        S_s = model_obj.score_struct(m_struct, tail_vector)
+
+        # ---- L_query: additive margin + self-negative + inv-temperature scaling ----
+        q_logits = S_q - torch.diag_embed(
+            torch.full((batch_size,), self.args.additive_margin, device=q.device)
+        )
+        q_logits = q_logits * inv_t
         if triplet_mask is not None:
             q_logits = q_logits.masked_fill(~triplet_mask, model_obj.NEGATIVE_INF)
+
         if self.args.use_self_negative:
             self_neg_logits = torch.sum(q * head_vector, dim=1) * inv_t
-            self_neg_logits = self_neg_logits.masked_fill(~batch_dict['self_negative_mask'],
-                                                          model_obj.NEGATIVE_INF)
+            self_negative_mask = batch_dict['self_negative_mask']
+            self_neg_logits = self_neg_logits.masked_fill(~self_negative_mask, model_obj.NEGATIVE_INF)
             q_logits = torch.cat([q_logits, self_neg_logits.unsqueeze(1)], dim=-1)
+
         L_query = self._bidirectional_ce(q_logits, labels, batch_size)
 
-        # ---- L_hrta (encoders): anchor-enhanced query, as in the baseline (Eq. 7) ----
-        if model_obj.use_raa:
-            S_h = model_obj.score_query(q_hrta, tail_vector)
-            h_logits = (S_h - margin) * inv_t
-            if triplet_mask is not None:
-                h_logits = h_logits.masked_fill(~triplet_mask, model_obj.NEGATIVE_INF)
-            L_hrta = self._bidirectional_ce(h_logits, labels, batch_size)
-            S_base = S_q.detach() + S_h.detach()
-        else:
-            L_hrta = q.new_zeros(())
-            S_base = S_q.detach()
-
-        # ---- memory losses: only memory modules receive gradient (q and tails are detached) ----
-        tail_d = tail_vector.detach()
-        S_p = model_obj.score_prototypes(prototypes, tail_d)
-        S_s = model_obj.score_struct(m_struct, tail_d)
-
+        # ---- L_proto, L_struct: inv-temperature scaling only (no margin/self-neg) ----
         p_logits = S_p * inv_t_aux
         s_logits = S_s * inv_t_aux
         if triplet_mask is not None:
             p_logits = p_logits.masked_fill(~triplet_mask, model_obj.NEGATIVE_INF)
             s_logits = s_logits.masked_fill(~triplet_mask, model_obj.NEGATIVE_INF)
+
         L_proto = self._bidirectional_ce(p_logits, labels, batch_size)
         L_struct = self._bidirectional_ce(s_logits, labels, batch_size)
 
-        # ---- L_combined: trains the gate (base score is frozen, so the gate learns the residual) ----
-        combined_score = model_obj.combined_score(S_base, S_p, S_s, lambda_p, lambda_s)
+        # ---- L_combined: the only term touching lambda_p/lambda_s (MemoryGate) ----
+        combined_score = model_obj.combined_score(S_q, S_p, S_s, lambda_p, lambda_s)
         combined_logits = combined_score * inv_t_aux
         if triplet_mask is not None:
             combined_logits = combined_logits.masked_fill(~triplet_mask, model_obj.NEGATIVE_INF)
         L_combined = self._bidirectional_ce(combined_logits, labels, batch_size)
 
-        total_loss = (L_query + self.args.alpha * L_hrta
-                      + self.args.eta_proto * L_proto + self.args.eta_struct * L_struct
-                      + self.args.eta_combined * L_combined
-                      + self.args.eta_div * div_loss + self.args.eta_pdiv * pdiv_loss)
+        total_loss = L_query + self.args.eta_proto * L_proto + \
+                     self.args.eta_struct * L_struct + self.args.eta_div * div_loss + \
+                     self.args.eta_combined * L_combined
 
         return {
             'total_loss': total_loss,
             'query_loss': L_query,
-            'hrta_loss': L_hrta,
             'proto_loss': L_proto,
             'struct_loss': L_struct,
             'div_loss': div_loss,
@@ -330,23 +413,30 @@ class Trainer:
 
     @staticmethod
     def _bidirectional_ce(logits: torch.Tensor, labels: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """CE(logits, labels) in both directions (t->prediction and prediction->t).
+        `logits` may have an extra trailing self-negative column (only ever present for S_q);
+        the backward direction always uses only the square (batch_size, batch_size)
+        block."""
         criterion = nn.CrossEntropyLoss()
         loss = criterion(logits, labels)
         loss = loss + criterion(logits[:, :batch_size].t(), labels)
         return loss
 
-    def _update_meters(self, meters, loss_components, outputs):
+    def _update_meters(self, meters, loss_components):
         batch_size = self.args.batch_size
-        acc1, acc3 = accuracy(loss_components['combined_score'], loss_components['labels'], topk=(1, 3))
+
+        acc1, acc3 = accuracy(
+            loss_components['combined_score'],
+            loss_components['labels'],
+            topk=(1, 3)
+        )
 
         meters['losses'].update(loss_components['total_loss'].item(), batch_size)
         meters['query_losses'].update(loss_components['query_loss'].item(), batch_size)
-        meters['hrta_losses'].update(loss_components['hrta_loss'].item(), batch_size)
         meters['proto_losses'].update(loss_components['proto_loss'].item(), batch_size)
         meters['struct_losses'].update(loss_components['struct_loss'].item(), batch_size)
+        meters['div_losses'].update(loss_components['div_loss'].item(), batch_size)
         meters['combined_losses'].update(loss_components['combined_loss'].item(), batch_size)
-        meters['lam_p'].update(outputs['lambda_p'].mean().item(), batch_size)
-        meters['lam_s'].update(outputs['lambda_s'].mean().item(), batch_size)
         meters['top1'].update(acc1.item(), batch_size)
         meters['top3'].update(acc3.item(), batch_size)
         meters['inv_t'].update(get_model_obj(self.model).log_inv_t.exp().item(), batch_size)
@@ -357,17 +447,29 @@ class Trainer:
         if self.args.use_amp:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.args.grad_clip
+            )
             self.scaler.step(self.optimizer)
+            get_model_obj(self.model).clamp_temperature()
             self.scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.args.grad_clip
+            )
             self.optimizer.step()
+            get_model_obj(self.model).clamp_temperature()
 
     @torch.no_grad()
     def _run_eval(self, epoch, step=0):
+        """Rank-0-only validation + checkpointing after each epoch (step=0) or
+        every `--eval-every-n-step` steps mid-epoch (step=i+1).
+        """
         if self.args.rank == 0:
+            # in_batch_metric_dict = self.eval_epoch(epoch) logger.info(f'Epoch {epoch} in-batch diagnostic (NOT used
+            # for checkpoint selection): {json.dumps(in_batch_metric_dict)}')
+
             is_epoch_boundary = (step == 0)
             due_for_full_eval = (epoch + 1) % max(self.args.full_eval_every_n_epochs, 1) == 0
             run_full_eval = self.valid_loader is not None and is_epoch_boundary and due_for_full_eval
@@ -376,8 +478,9 @@ class Trainer:
             if run_full_eval:
                 full_metric_dict = self._compute_full_validation_metrics()
                 logger.info(
-                    f'Epoch {epoch} full filtered-ranking validation (used for checkpoint selection via '
-                    f'--checkpoint-metric={self.args.checkpoint_metric}): {json.dumps(full_metric_dict)}'
+                    f'Epoch {epoch} full filtered-ranking validation (used for '
+                    f'checkpoint selection via --checkpoint-metric='
+                    f'{self.args.checkpoint_metric}): {json.dumps(full_metric_dict)}'
                 )
                 is_best = self._check_best_metric(full_metric_dict)
                 if is_best:
@@ -403,6 +506,7 @@ class Trainer:
             filename = f'{self.args.model_dir}/checkpoint_{epoch}_{step}.mdl'
 
         model_state = get_model_obj(self.model).state_dict()
+
         full_state = {
             'epoch': epoch,
             'args': self.args.__dict__,
@@ -412,14 +516,59 @@ class Trainer:
             'scaler': self.scaler.state_dict() if self.args.use_amp else None,
             'best_metric': self.best_metric,
         }
-        eval_state = {'epoch': epoch, 'args': self.args.__dict__, 'state_dict': model_state}
+        eval_state = {
+            'epoch': epoch,
+            'args': self.args.__dict__,
+            'state_dict': model_state,
+        }
 
         save_checkpoint(full_state, is_best=is_best, filename=filename, eval_state=eval_state)
-        delete_old_checkpoints(path_pattern=f'{self.args.model_dir}/checkpoint_*.mdl',
-                               keep=self.args.max_to_keep)
+
+        delete_old_checkpoints(
+            path_pattern=f'{self.args.model_dir}/checkpoint_*.mdl',
+            keep=self.args.max_to_keep
+        )
+
+    @torch.no_grad()
+    def eval_epoch(self, epoch) -> Dict:
+        """Cheap in-batch diagnostic: Acc@1/Acc@3/loss on S(t|h,r) among only
+        the batch's own tails."""
+        if not self.valid_loader:
+            return {}
+
+        meters = {
+            'losses': AverageMeter('Loss', ':.4'),
+            'top1': AverageMeter('Acc@1', ':6.2f'),
+            'top3': AverageMeter('Acc@3', ':6.2f')
+        }
+
+        for batch_dict in self.valid_loader:
+            self.model.eval()
+            batch_dict = self._move_batch_to_device(batch_dict)
+
+            outputs, loss_components = self._forward_and_compute_losses(batch_dict)
+
+            batch_size = self.args.batch_size
+            meters['losses'].update(loss_components['total_loss'].item(), batch_size)
+
+            acc1, acc3 = accuracy(
+                loss_components['combined_score'], loss_components['labels'], topk=(1, 3)
+            )
+            meters['top1'].update(acc1.item(), batch_size)
+            meters['top3'].update(acc3.item(), batch_size)
+
+        return self._format_metrics(meters)
+
+    def _format_metrics(self, meters):
+        return {
+            'Acc@1': round(meters['top1'].avg, 3),
+            'Acc@3': round(meters['top3'].avg, 3),
+            'loss': round(meters['losses'].avg, 3)
+        }
 
     @torch.no_grad()
     def _compute_full_validation_metrics(self) -> Dict[str, float]:
+
         from ..evaluation.predict import ARPMPredictor
         from ..evaluation.evaluate import evaluate_predictor
         from ..utils.dict_hub import get_entity_dict
@@ -437,6 +586,7 @@ class Trainer:
             )
             entity_dict = get_entity_dict()
             entity_tensor = predictor.predict_by_entities(entity_dict.entity_exs)
+
             result = evaluate_predictor(
                 predictor, entity_tensor=entity_tensor,
                 batch_size=self.args.full_eval_batch_size, save_details=False,

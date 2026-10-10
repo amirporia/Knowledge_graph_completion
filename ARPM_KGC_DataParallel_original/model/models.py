@@ -1,41 +1,39 @@
-"""ARPM-KGC v2.
+"""ARPM-KGC model.
 
-Final score (per query (h, r, ?)):
+Pipeline per query (h, r, ?):
+  1. q = E_0(h, r)                                   [self._encode]
+  2. a_i = E_0(h_i, r, t_i) for every candidate       [self._encode, flattened+batched]
+  3. alpha_i = softmax_i(cos(q,a_i) / tau_r)               -> RQ1
+  4. L_div
+  5. P_q = ProtoGen(W_q, q) = {p_1..p_K}                   -> RQ2
+  6. m_struct = sum_l beta_l * m^(l)                       -> RQ3
+  7. [lambda_p, lambda_s] = G_lambda(q)                    -> RQ4
+  8. S(t|h,r) = S_q(t) + lambda_p S_p(t) + lambda_s S_struct(t)
 
-    S(t) = cos(q, e_t) + cos(q_hrta, e_t)  +  lambda_p * S_p(t)  +  lambda_s * S_struct(t)
-           [------ RAA-KGC baseline ------]   [----- gated memory residual -----]
-
-Key differences from v1:
-  1. The baseline's anchor-enhanced query q_hrta (mean of E_0(h, r, t_i) over hop-0 anchors) is
-     part of the model, so with lambda = 0 the model IS the baseline.
-  2. Memory anchors are represented by their tail embeddings E_1(t_i) from tail_bert, computed
-     under no_grad (eval mode). The anchors therefore live in the same space as the entities they
-     are scored against and no longer send gradients into hr_bert / tail_bert.
-  3. The memory branch sees q.detach(); its auxiliary losses see tail_vector.detach(). The encoders
-     are trained only by L_query and L_hrta (exactly as in the baseline).
-  4. Prototypes / m_struct are L2-normalised, so S_p and S_struct are real cosine-scale scores.
-  5. The gate also sees statistics of the retrieved pool and starts at lambda ~ 0.12.
+Steps 3-7 are computed once per batch, fully vectorized over a padded
+(batch, max_candidates) candidate grid (see utils/doc.py::collate)
 """
 import math
-from copy import deepcopy
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import AutoModel, AutoConfig
 
 from .modules import (
-    ProtoGen, HopScorer, MemoryGate, NUM_GATE_FEATS,
-    diversity_loss, prototype_diversity,
+    ProtoGen, HopScorer, MemoryGate, PrototypeActivationScorer,
+    diversity_loss, gumbel_sigmoid_gate, gumbel_softmax_topk, gumbel_sigmoid_slot_gate,
 )
 
 
 def build_model(args) -> nn.Module:
+    """Factory function to create the model."""
     return ARPMModel(args)
 
 
 class ARPMModel(nn.Module):
+    """Adaptive Relation-Aware Prototype Memory model for KGC."""
+
     NEGATIVE_INF = -1e4
 
     def __init__(self, args):
@@ -43,85 +41,120 @@ class ARPMModel(nn.Module):
         self.args = args
         self.config = AutoConfig.from_pretrained(args.pretrained_model)
         d = self.config.hidden_size
-        self.hidden_size = d
 
+        # ---- Shared dual encoder ----
         self.hr_bert = AutoModel.from_pretrained(args.pretrained_model)  # E_0
         self._drop_unused_pooler(self.hr_bert)
+        from copy import deepcopy
         self.tail_bert = deepcopy(self.hr_bert)  # E_1
+
+        # Gradient checkpointing: trades ~15-25% extra backward-pass compute for a
+        # large cut in activation memory, with NO change to any forward-pass math,
+        # loss, or output -- only how intermediate activations are stored/recomputed.
+        # This is the actual OOM lever here: the candidate encode in _build_memory
+        # flattens (batch_size * max_candidates) rows into one BERT forward call,
+        # which dwarfs the query/tail/head encodes and is what exhausts GPU0's
+        # memory under nn.DataParallel (GPU0 additionally carries the master model
+        # copy, AdamW optimizer state, and the gather point for all replicas' outputs,
+        # so it OOMs before GPU1 would). HF's gradient_checkpointing_enable() is a
+        # no-op during .eval()/no_grad(), so evaluation/prediction paths (which use
+        # their own, much smaller --full-eval-batch-size) are unaffected.
         self.hr_bert.gradient_checkpointing_enable()
         self.tail_bert.gradient_checkpointing_enable()
 
+        # ---- ARPM-KGC memory modules ----
+        # `args.num_hops` (N) is the max graph distance considered beyond the
+        # same-head/same-relation category: local anchors span hop-0
+        # (same head & relation), hop-1 (graph distance 1), ..., hop-N (graph
+        # distance N) -- N+1 categories in total (utils/candidate_pool.py),
+        # so structural memory needs N+1 slots.
         self.num_hops = args.num_hops
         self.num_hop_slots = args.num_hops + 1
         self.num_prototypes = args.num_prototypes
-        self.use_raa = args.anchor_num > 0
-        self.anchor_budget = args.anchor_budget
 
-        # query-conditioned anchor attention: logits_i = a_i . (W q) / tau_r, W initialised to I
-        self.attn_proj = nn.Linear(d, d, bias=False)
-        with torch.no_grad():
-            self.attn_proj.weight.copy_(torch.eye(d))
-
-        self.proto_gen = ProtoGen(d, args.num_prototypes, temperature=args.proto_attn_temperature)
-        self.hop_scorer = HopScorer(d, self.num_hop_slots)
-        self.memory_gate = MemoryGate(d, NUM_GATE_FEATS, init_bias=args.gate_init_bias)
+        self.proto_gen = ProtoGen(hidden_size=d, num_prototypes=args.num_prototypes)
+        self.hop_scorer = HopScorer(hidden_size=d, num_hops=self.num_hop_slots)
+        self.memory_gate = MemoryGate(hidden_size=d)
 
         self.tau_r = args.retrieval_temperature
         self.tau_p = args.proto_temperature
         self.eps_struct = args.eps_struct
 
-        self.log_inv_t = nn.Parameter(torch.tensor(1.0 / args.t).log(), requires_grad=args.finetune_t)
+        # Shared InfoNCE temperature (training-time logit scaling only) and additive margin
+        self.log_inv_t = nn.Parameter(torch.tensor(1.0 / args.t).log(),
+                                      requires_grad=args.finetune_t)
+        self._log_inv_t_lo = math.log(1.0 / args.t_max)
+        self._log_inv_t_hi = math.log(1.0 / args.t_min)
         self.add_margin = args.additive_margin
 
-        self.random_anchor_selection = args.random_anchor_selection
-        self.uniform_hop_weighting = args.uniform_hop_weighting
-        self.fixed_lambda_p = args.fixed_lambda_p
-        self.fixed_lambda_s = args.fixed_lambda_s
+        # ---- Optional discrete (Gumbel) extensions, ablations A11-A13 ----
+        self.use_gumbel_anchor = args.use_gumbel_anchor
+        self.gumbel_tau_sel = args.gumbel_tau_sel
+        self.use_gumbel_hop = args.use_gumbel_hop
+        self.gumbel_tau_hop = args.gumbel_tau_hop
+        self.gumbel_topk_hop = args.gumbel_topk_hop
+        self.use_gumbel_proto = args.use_gumbel_proto
+        self.gumbel_tau_proto = args.gumbel_tau_proto
+        if self.use_gumbel_proto:
+            self.proto_activation = PrototypeActivationScorer(hidden_size=d, num_prototypes=args.num_prototypes)
+
+        # ---- Ablation overrides ----
+        self.random_anchor_selection = args.random_anchor_selection  # A1
+        self.uniform_hop_weighting = args.uniform_hop_weighting  # A5
+        self.fixed_lambda_p = args.fixed_lambda_p  # A8/A9
+        self.fixed_lambda_s = args.fixed_lambda_s  # A8/A10
+
+    @torch.no_grad()
+    def clamp_temperature(self) -> None:
+        self.log_inv_t.clamp_(self._log_inv_t_lo, self._log_inv_t_hi)
 
     @staticmethod
     def _drop_unused_pooler(encoder: nn.Module) -> None:
         if getattr(encoder, 'pooler', None) is not None:
             encoder.pooler = None
 
-    # ------------------------------------------------------------------ encoding
-    def _encode(self, encoder, token_ids, mask, token_type_ids) -> torch.Tensor:
-        outputs = encoder(input_ids=token_ids, attention_mask=mask,
-                          token_type_ids=token_type_ids, return_dict=True)
+    # ------------------------------------------------------------------
+    # Encoding
+    # ------------------------------------------------------------------
+
+    def _encode(self, encoder: nn.Module, token_ids: torch.Tensor,
+                mask: torch.Tensor, token_type_ids: torch.Tensor) -> torch.Tensor:
+        outputs = encoder(
+            input_ids=token_ids,
+            attention_mask=mask,
+            token_type_ids=token_type_ids,
+            return_dict=True
+        )
         last_hidden_state = outputs.last_hidden_state
         cls_output = last_hidden_state[:, 0, :]
         return _pool_output(self.args.pooling, cls_output, mask, last_hidden_state)
 
-    def _encode_slots(self, encoder, ids, mask, tt, valid) -> torch.Tensor:
-        """Encode only the VALID slots of a (B, N, L) batch; invalid slots are zero vectors.
-        Returns (B, N, d) float32."""
-        batch_size, n, length = ids.shape
-        out = torch.zeros(batch_size * n, self.hidden_size, device=ids.device)
-        flat_valid = valid.reshape(-1)
-        if bool(flat_valid.any()):
-            sel = flat_valid.nonzero(as_tuple=False).squeeze(1)
-            m = mask.reshape(-1, length)[sel]
-            max_len = max(int(m.sum(dim=1).max()), 1)  # drop batch padding
-            vec = self._encode(
-                encoder,
-                ids.reshape(-1, length)[sel][:, :max_len],
-                m[:, :max_len],
-                tt.reshape(-1, length)[sel][:, :max_len],
-            )
-            out = out.index_copy(0, sel, vec.float())
-        return out.view(batch_size, n, self.hidden_size)
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
 
-    # ------------------------------------------------------------------ forward
     def forward(
             self,
-            tail_token_ids, tail_mask, tail_token_type_ids,
-            h_triple_token_ids=None, h_triple_mask=None, h_triple_token_type_ids=None,
-            head_token_ids=None, head_mask=None, head_token_type_ids=None,
-            cand_tail_token_ids=None, cand_tail_mask=None, cand_tail_token_type_ids=None,
-            candidate_valid_mask=None, candidate_hop_id=None, candidate_is_local=None,
-            anchor_token_ids=None, anchor_mask=None, anchor_token_type_ids=None, anchor_valid=None,
+            tail_token_ids: torch.Tensor,
+            tail_mask: torch.Tensor,
+            tail_token_type_ids: torch.Tensor,
+            h_triple_token_ids: Optional[torch.Tensor] = None,
+            h_triple_mask: Optional[torch.Tensor] = None,
+            h_triple_token_type_ids: Optional[torch.Tensor] = None,
+            head_token_ids: Optional[torch.Tensor] = None,
+            head_mask: Optional[torch.Tensor] = None,
+            head_token_type_ids: Optional[torch.Tensor] = None,
+            candidate_token_ids: Optional[torch.Tensor] = None,
+            candidate_mask_tok: Optional[torch.Tensor] = None,
+            candidate_token_type_ids: Optional[torch.Tensor] = None,
+            candidate_valid_mask: Optional[torch.Tensor] = None,
+            candidate_hop_id: Optional[torch.Tensor] = None,
+            candidate_is_local: Optional[torch.Tensor] = None,
+            max_candidates: Optional[int] = None,
             only_ent_embedding: bool = False,
             **kwargs
     ) -> Dict:
+        """A single unified forward pass, used for both training and evaluation."""
         if only_ent_embedding:
             return self._predict_ent_embedding(tail_token_ids, tail_mask, tail_token_type_ids)
 
@@ -129,109 +162,151 @@ class ARPMModel(nn.Module):
         tail_vector = self._encode(self.tail_bert, tail_token_ids, tail_mask, tail_token_type_ids)
         head_vector = self._encode(self.tail_bert, head_token_ids, head_mask, head_token_type_ids)
 
-        # RAA-KGC: e^avg_hrta = mean_i E_0(h, r, t_i) over hop-0 anchors (falls back to q)
-        q_hrta = q
-        if self.use_raa and anchor_token_ids is not None:
-            a_vec = self._encode_slots(self.hr_bert, anchor_token_ids, anchor_mask,
-                                       anchor_token_type_ids, anchor_valid)
-            cnt = anchor_valid.sum(dim=1, keepdim=True)
-            mean = a_vec.sum(dim=1) / cnt.clamp(min=1).to(a_vec.dtype)
-            q_hrta = torch.where(cnt > 0, mean.to(q.dtype), q)
+        memory_out = self._build_memory(
+            q, candidate_token_ids, candidate_mask_tok, candidate_token_type_ids,
+            candidate_valid_mask, candidate_hop_id, candidate_is_local, max_candidates
+        )
 
-        # memory anchors: E_1(t_i), no gradient, deterministic (eval mode -> no dropout / no checkpointing)
-        was_training = self.tail_bert.training
-        self.tail_bert.eval()
-        with torch.no_grad():
-            cand_emb = self._encode_slots(self.tail_bert, cand_tail_token_ids, cand_tail_mask,
-                                          cand_tail_token_type_ids, candidate_valid_mask)
-        self.tail_bert.train(was_training)
+        gates = self.memory_gate(q)  # (B, 2)
+        lambda_p, lambda_s = gates[:, 0], gates[:, 1]
 
-        with torch.amp.autocast(device_type=q.device.type, enabled=False):
-            mem = self._memory(q.detach().float(), cand_emb.float(), candidate_valid_mask,
-                               candidate_hop_id, candidate_is_local)
-
-        lambda_p, lambda_s = mem['gates'][:, 0], mem['gates'][:, 1]
+        # A8/A9/A10: override the learned gate with a fixed constant, if requested.
         if self.fixed_lambda_p is not None:
             lambda_p = torch.full_like(lambda_p, self.fixed_lambda_p)
         if self.fixed_lambda_s is not None:
             lambda_s = torch.full_like(lambda_s, self.fixed_lambda_s)
-        # no local anchor at any hop -> no structural evidence -> lambda_s = 0 (structural fact)
-        lambda_s = torch.where(mem['has_local_anchor'], lambda_s, torch.zeros_like(lambda_s))
 
-        return {
+        # Failure mode 2: no local anchor at any hop
+        # for this query -> no structural evidence exists, so lambda_s is
+        # hard-set to 0 regardless of the learned gate OR a --fixed-lambda-s
+        # ablation override above -- "no evidence" is a structural fact about
+        # the query, not a policy choice.
+        has_local_anchor = memory_out['has_local_anchor']
+        lambda_s = torch.where(has_local_anchor, lambda_s, torch.zeros_like(lambda_s))
+
+        output = {
             'q': q,
-            'q_hrta': q_hrta,
             'tail_vector': tail_vector,
             'head_vector': head_vector,
-            'prototypes': mem['prototypes'],
-            'm_struct': mem['m_struct'],
-            'div_loss': mem['div_loss'],
-            'proto_div': mem['proto_div'],
+            'prototypes': memory_out['prototypes'],
+            'm_struct': memory_out['m_struct'],
+            'div_loss': memory_out['div_loss'],
             'lambda_p': lambda_p,
             'lambda_s': lambda_s,
         }
 
-    # ------------------------------------------------------------------ memory
-    def _memory(self, qm, cand_emb, valid, hop_id, is_local) -> Dict:
-        n = cand_emb.size(1)
+        if self.use_gumbel_proto:
+            zeta = self.proto_activation(q)  # (B, K)
+            output['slot_gate'] = gumbel_sigmoid_slot_gate(zeta, self.gumbel_tau_proto, self.training)
 
-        logits = torch.einsum('bnd,bd->bn', cand_emb, self.attn_proj(qm)) / self.tau_r
-        if self.random_anchor_selection:  # A1
-            alpha = valid.float() / valid.sum(-1, keepdim=True).clamp(min=1).float()
+        return output
+
+    def _build_memory(self, q, cand_ids, cand_mask_tok, cand_type_ids,
+                      valid_mask, hop_id, is_local, max_candidates) -> Dict:
+        batch_size = q.size(0)
+        d = q.size(1)
+
+        cand_emb_flat = self._encode(self.hr_bert, cand_ids, cand_mask_tok, cand_type_ids)
+        cand_emb = cand_emb_flat.view(batch_size, max_candidates, d)
+        cand_emb = cand_emb * valid_mask.unsqueeze(-1)  # zero-out padded/invalid slots
+
+        # ---- Query-Conditioned Anchor Selection (RQ1) ----
+        s = torch.einsum('bnd,bd->bn', cand_emb, q)  # cosine similarity (both L2-normalized)
+        s_masked = s.masked_fill(~valid_mask, float('-inf'))
+
+        if self.random_anchor_selection:
+            # A1: uniform weights over valid candidates (query-blind), instead of
+            # the learned softmax(cos(q,a_i)/tau_r) -- isolates the contribution
+            # of query-conditioned selection itself (RQ1).
+            n_valid = valid_mask.sum(dim=-1, keepdim=True).clamp(min=1).to(cand_emb.dtype)
+            alpha = valid_mask.to(cand_emb.dtype) / n_valid
         else:
-            alpha = torch.softmax(logits.masked_fill(~valid, self.NEGATIVE_INF), dim=-1) * valid
-            alpha = alpha / alpha.sum(-1, keepdim=True).clamp(min=1e-12)  # all-invalid row -> zeros
+            alpha = torch.softmax(s_masked / self.tau_r, dim=-1)
+            alpha = torch.nan_to_num(alpha, nan=0.0) * valid_mask  # rows with 0 valid candidates -> 0
 
-        div = diversity_loss(cand_emb, alpha, valid)
+        if self.use_gumbel_anchor:
+            keep_gate = gumbel_sigmoid_gate(s_masked, self.gumbel_tau_sel, self.training)  # (B, N)
+            alpha = alpha * keep_gate  # W_q^sparse = {(a_i, alpha_i * c_i^ST) : c_i^ST = 1}
 
-        prototypes = F.normalize(self.proto_gen(cand_emb, qm, alpha, valid), dim=-1)  # zero stays zero
-        proto_div = prototype_diversity(prototypes)
+        # ---- Diversity regularization ----
+        div = diversity_loss(cand_emb, alpha, valid_mask)
 
-        m_struct, has_local_anchor = self._structural_memory(cand_emb, alpha, hop_id, is_local, valid, qm)
-        m_struct = F.normalize(m_struct, dim=-1)
+        # ---- Multi-Prototype Semantic Memory (RQ2) ----
+        prototypes = self.proto_gen(cand_emb, q, alpha, valid_mask)
 
-        with torch.no_grad():
-            n_valid = valid.sum(1).float()
-            n_local = (valid & is_local).sum(1).float()
-            budget = float(max(self.anchor_budget, 1))
-            ent = -(alpha * torch.log(alpha + 1e-12)).sum(1) / math.log(max(n, 2))
-            has_hop0 = ((hop_id == 0) & valid & is_local).any(1).float()
-            feats = torch.stack([n_valid / budget, n_local / budget, alpha.max(1).values, ent, has_hop0], 1)
-        gates = self.memory_gate(qm, feats)
+        # ---- Adaptive Structural Memory (RQ3) ----
+        m_struct, has_local_anchor = self._structural_memory(cand_emb, alpha, hop_id, is_local, valid_mask, q)
 
-        return {'prototypes': prototypes, 'm_struct': m_struct, 'div_loss': div, 'proto_div': proto_div,
-                'has_local_anchor': has_local_anchor, 'gates': gates}
+        return {'prototypes': prototypes, 'm_struct': m_struct, 'div_loss': div,
+                'has_local_anchor': has_local_anchor}
 
     def _structural_memory(self, cand_emb, alpha, hop_id, is_local, valid_mask, q):
-        """m_struct = sum_l beta_l m^(l). Empty hops get exactly zero weight; a query with no local
-        anchor gets m_struct = 0 (and lambda_s = 0 in forward)."""
-        batch_size, n, _ = cand_emb.shape
-        L = self.num_hop_slots
+        """Adaptive Structural Memory, with two cheap, parameter-free
+        safeguards against degenerate candidate pools:
 
-        local_valid = valid_mask & is_local
+        1. Some hops empty, not all: the hop-selection softmax (or its Gumbel/
+           uniform-ablation counterparts) is masked so a hop with zero local
+           anchors gets EXACTLY zero weight, rather than relying on G_hop to
+           learn that on its own.
+        2. No local anchor at ANY hop for this query: m_struct has nothing to
+           be built from, so it is hard-set to 0 and the caller (`forward`)
+           hard-overrides lambda_s <- 0 for that query, rather than trusting
+           the learned (or ablation-fixed) gate to discover this rare case
+           itself.
+
+        Returns (m_struct, has_local_anchor) where has_local_anchor is a
+        (B,) bool used by `forward` for the lambda_s override.
+        """
+        batch_size, n, d = cand_emb.shape
+        L = self.num_hop_slots  # num_hops + 1 (hop-0 through hop-num_hops inclusive)
+
+        local_valid = valid_mask & is_local  # (B, N)
+
+        # hop_id is 0-indexed for local anchors: slot 0 = same head & relation
+        # as the query (graph distance 0, no traversal), slot 1 = graph
+        # distance 1 (direct/1-edge-away neighbors), ..., slot L-1 (=
+        # self.num_hops) = graph distance self.num_hops (farthest configured);
+        # -1 for global anchors (no known structural distance) and for
+        # padding (see utils/candidate_pool.py, utils/doc.py). Clamping here
+        # is only to keep the scatter index non-negative -- any candidate
+        # that isn't a genuine local anchor is zeroed out immediately after
+        # via `local_valid`, regardless of which slot its clamped hop lands in.
         clamped_hop = hop_id.clamp(min=0, max=L - 1)
         hop_onehot = torch.zeros(batch_size, n, L, device=cand_emb.device, dtype=cand_emb.dtype)
         hop_onehot.scatter_(2, clamped_hop.unsqueeze(-1), 1.0)
         hop_onehot = hop_onehot * local_valid.unsqueeze(-1).to(cand_emb.dtype)
 
-        alpha_hop = alpha.unsqueeze(-1) * hop_onehot
-        numer = torch.einsum('bnl,bnd->bld', alpha_hop, cand_emb)
-        hop_anchor_count = hop_onehot.sum(dim=1)
-        denom = alpha_hop.sum(dim=1).unsqueeze(-1) + self.eps_struct
-        m_hop = numer / denom
+        alpha_hop = alpha.unsqueeze(-1) * hop_onehot  # (B, N, L)
+        numer = torch.einsum('bnl,bnd->bld', alpha_hop, cand_emb)  # (B, L, d)
+        hop_anchor_count = hop_onehot.sum(dim=1)  # (B, L): real local anchors per hop slot
+        denom = alpha_hop.sum(dim=1).unsqueeze(-1) + self.eps_struct  # (B, L, 1)
+        m_hop = numer / denom  # (B, L, d)
 
-        hop_valid_mask = hop_anchor_count > 0
-        z = self.hop_scorer(q)
-        if self.uniform_hop_weighting:  # A5
-            n_valid_hops = hop_valid_mask.sum(-1, keepdim=True).clamp(min=1).to(z.dtype)
+        # ---- Failure mode 1: mask empty hops out of the hop-selection weighting ----
+        hop_valid_mask = hop_anchor_count > 0  # (B, L)
+
+        z = self.hop_scorer(q)  # (B, L)
+        if self.uniform_hop_weighting:
+            # A5: fixed uniform beta_l, ignoring G_hop(q,l) entirely -- but still
+            # only over hops that actually have a local anchor; an empty hop
+            # must get zero weight under any weighting *policy*, ablated or not.
+            n_valid_hops = hop_valid_mask.sum(dim=-1, keepdim=True).clamp(min=1).to(z.dtype)
             beta = hop_valid_mask.to(z.dtype) / n_valid_hops
+        elif self.use_gumbel_hop:
+            beta = gumbel_softmax_topk(z, self.gumbel_tau_hop, self.gumbel_topk_hop,
+                                       self.training, valid_mask=hop_valid_mask)
         else:
-            beta = torch.softmax(z.masked_fill(~hop_valid_mask, self.NEGATIVE_INF), dim=-1)
-            beta = beta * hop_valid_mask
+            z_masked = z.masked_fill(~hop_valid_mask, self.NEGATIVE_INF)
+            beta = torch.softmax(z_masked, dim=-1)
 
         m_struct = torch.einsum('bl,bld->bd', beta, m_hop)
-        has_local_anchor = hop_valid_mask.any(dim=-1)
-        m_struct = torch.where(has_local_anchor.unsqueeze(-1), m_struct, torch.zeros_like(m_struct))
+
+        # ---- Failure mode 2: no local anchor at any hop -> hard-zero m_struct ----
+        has_local_anchor = hop_valid_mask.any(dim=-1)  # (B,)
+        m_struct = torch.where(
+            has_local_anchor.unsqueeze(-1), m_struct, torch.zeros_like(m_struct)
+        )
+
         return m_struct, has_local_anchor
 
     @torch.no_grad()
@@ -239,38 +314,59 @@ class ARPMModel(nn.Module):
         ent_vectors = self._encode(self.tail_bert, tail_token_ids, tail_mask, tail_token_type_ids)
         return {'ent_vectors': ent_vectors.detach()}
 
-    # ------------------------------------------------------------------ scoring
     def score_query(self, q: torch.Tensor, entity_matrix: torch.Tensor) -> torch.Tensor:
+        """S_q(t) = sim(q, e_t)."""
         return q.mm(entity_matrix.t())
 
-    def score_prototypes(self, prototypes: torch.Tensor, entity_matrix: torch.Tensor) -> torch.Tensor:
-        """S_p(t) = tau_p * (logsumexp_k(cos(p_k, e_t)/tau_p) - log K): a soft-max over prototypes on
-        the cosine scale (zero prototypes give exactly 0)."""
-        sim = torch.einsum('bkd,ed->bke', prototypes, entity_matrix).float() / self.tau_p
-        return self.tau_p * (torch.logsumexp(sim, dim=1) - math.log(prototypes.size(1)))
+    def score_prototypes(self, prototypes: torch.Tensor, entity_matrix: torch.Tensor,
+                         slot_gate: Optional[torch.Tensor] = None, eps: float = 1e-8) -> torch.Tensor:
+        """S_p(t) = tau_p * log sum_k exp(sim(p_k, e_t) / tau_p).
+
+        If `slot_gate` (B, K) is given (A13), inactive slots are
+        masked out of the sum instead of contributing at full weight:
+        S_p^ST(t) = tau_p * log( sum_k omega_k^ST * exp(sim(p_k,e_t)/tau_p) + eps ).
+        """
+        sim = torch.einsum('bkd,ed->bke', prototypes, entity_matrix) / self.tau_p  # (B, K, Ne)
+
+        if slot_gate is not None:
+            weighted_exp = slot_gate.unsqueeze(-1) * torch.exp(sim)
+            return self.tau_p * torch.log(weighted_exp.sum(dim=1) + eps)
+
+        return self.tau_p * torch.logsumexp(sim, dim=1)
 
     def score_struct(self, m_struct: torch.Tensor, entity_matrix: torch.Tensor) -> torch.Tensor:
+        """S_struct(t) = sim(m_struct, e_t)."""
         return m_struct.mm(entity_matrix.t())
 
-    @staticmethod
-    def combined_score(S_base, S_p, S_s, lambda_p, lambda_s) -> torch.Tensor:
-        """S = S_base + lambda_p S_p + lambda_s S_struct, S_base = S_q (+ S_hrta)."""
-        return S_base + lambda_p.unsqueeze(-1) * S_p + lambda_s.unsqueeze(-1) * S_s
+    def combined_score(self, S_q: torch.Tensor, S_p: torch.Tensor, S_s: torch.Tensor,
+                       lambda_p: torch.Tensor, lambda_s: torch.Tensor) -> torch.Tensor:
+        """S(t|h,r) = S_q(t) + lambda_p * S_p(t) + lambda_s * S_struct(t)."""
+        return S_q + lambda_p.unsqueeze(-1) * S_p + lambda_s.unsqueeze(-1) * S_s
 
 
-def _pool_output(pooling, cls_output, mask, last_hidden_state) -> torch.Tensor:
+def _pool_output(
+        pooling: str,
+        cls_output: torch.Tensor,
+        mask: torch.Tensor,
+        last_hidden_state: torch.Tensor
+) -> torch.Tensor:
+    """Pool the output hidden states according to the specified pooling strategy"""
     if pooling == 'cls':
         output_vector = cls_output
+
     elif pooling == 'max':
         input_mask_expanded = mask.unsqueeze(-1).expand(last_hidden_state.size()).long()
         last_hidden_state_masked = last_hidden_state.clone()
         last_hidden_state_masked[input_mask_expanded == 0] = -1e4
         output_vector = torch.max(last_hidden_state_masked, 1)[0]
+
     elif pooling == 'mean':
         input_mask_expanded = mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
         sum_embeddings = torch.sum(last_hidden_state * input_mask_expanded, 1)
         sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-4)
         output_vector = sum_embeddings / sum_mask
+
     else:
         raise ValueError(f'Unknown pooling mode: {pooling}')
+
     return nn.functional.normalize(output_vector, dim=1)
