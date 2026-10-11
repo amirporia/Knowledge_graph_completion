@@ -26,6 +26,8 @@ from ..utils.utils import (
 )
 
 _NON_MODEL_KEYS = ('triplet_mask', 'self_negative_mask', 'related_triplet_mask', 'batch_data')
+
+
 class Trainer:
     """Handles model training, evaluation, and checkpointing."""
 
@@ -94,25 +96,12 @@ class Trainer:
             report_num_trainable_parameters(get_model_obj(self.model))
 
     def _init_data_loaders(self):
-        """Initialize training and validation data loaders."""
+        """Initialize the training data loader (validation uses the full filtered-ranking pass)."""
         self.train_dataset = Dataset(path=self.args.train_path, test_set=False)
 
         self.train_loader, self.train_sampler = self._create_data_loader(
             self.train_dataset, shuffle=True, drop_last=True, distributed=self.args.distributed
         )
-
-        # Validation only ever runs on rank 0 (see _run_eval), so other ranks skip
-        # loading/tokenizing it entirely instead of duplicating that work per GPU.
-        self.valid_dataset = None
-        self.valid_loader = None
-        if self.args.valid_path and self.args.rank == 0:
-            # deterministic anchors -> comparable validation numbers between epochs
-            self.valid_dataset = Dataset(
-                path=self.args.valid_path, test_set=False
-            )
-            self.valid_loader, _ = self._create_data_loader(
-                self.valid_dataset, shuffle=False, distributed=False
-            )
 
     def _create_data_loader(self, dataset, shuffle, drop_last=False, distributed=False):
         """Create a DataLoader, using a DistributedSampler when sharding across ranks."""
@@ -334,17 +323,57 @@ class Trainer:
             self.optimizer.step()
 
     @torch.no_grad()
+    def _compute_full_validation_metrics(self) -> Dict[str, float]:
+        """Same protocol as evaluation/evaluate.py, run on the in-memory model."""
+        from ..evaluation.predict import BertPredictor
+        from ..evaluation.evaluate import evaluate_predictor
+        from ..utils.dict_hub import get_entity_dict
+
+        model_obj = get_model_obj(self.model)
+        was_training = model_obj.training
+        was_is_test = self.args.is_test
+
+        model_obj.eval()
+        self.args.is_test = True  # no label-excluding anchors / no training masks
+        try:
+            predictor = BertPredictor.from_model(
+                model_obj, device=self.device, use_cuda=torch.cuda.is_available(),
+                batch_size=self.args.full_eval_batch_size,
+            )
+            entity_tensor = predictor.predict_by_entities(get_entity_dict().entity_exs)
+            result = evaluate_predictor(
+                predictor, entity_tensor=entity_tensor,
+                batch_size=self.args.full_eval_batch_size, save_details=False,
+            )
+        finally:
+            self.args.is_test = was_is_test
+            model_obj.train(was_training)
+
+        return result['average']
+
+    @torch.no_grad()
     def _run_eval(self, epoch, step=0):
-        """Run validation + checkpointing on rank 0; other ranks wait at the barrier."""
+        """Rank 0: full filtered-ranking validation (checkpoint selection) + checkpointing."""
         if self.args.rank == 0:
-            if self.args.skip_valid_eval or self.valid_loader is None:
-                # No validation: keep the latest weights as "best" so evaluate.py still finds model_best.mdl
+            is_best = False
+
+            if self.args.skip_valid_eval or not self.args.valid_path:
+                # No validation: keep the latest weights as "best"
                 is_best = True
             else:
-                metric_dict = self.eval_epoch(epoch)
-                is_best = self._check_best_metric(metric_dict)
-                if is_best:
-                    self.best_metric = metric_dict
+                is_epoch_boundary = (step == 0)
+                due = ((epoch + 1) % max(self.args.full_eval_every_n_epochs, 1) == 0
+                       or epoch == self.args.epochs - 1)  # always evaluate the final epoch
+                if is_epoch_boundary and due:
+                    metric_dict = self._compute_full_validation_metrics()
+                    logger.info(
+                        f'Epoch {epoch} full filtered-ranking validation '
+                        f'(checkpoint metric: {self.args.checkpoint_metric}): '
+                        f'{json.dumps(metric_dict)}'
+                    )
+                    is_best = self._check_best_metric(metric_dict)
+                    if is_best:
+                        self.best_metric = metric_dict
 
             self._save_checkpoint(epoch, step, is_best)
 
@@ -352,12 +381,12 @@ class Trainer:
             dist.barrier()
 
     def _check_best_metric(self, metric_dict):
-        """Check if current metrics are the best so far."""
-        if not self.valid_loader:
+        if not metric_dict:
             return False
         if self.best_metric is None:
             return True
-        return metric_dict.get('Acc@1', 0) > self.best_metric.get('Acc@1', 0)
+        key = self.args.checkpoint_metric
+        return metric_dict.get(key, 0) > self.best_metric.get(key, 0)
 
     def _save_checkpoint(self, epoch, step, is_best):
         """Save model checkpoint and clean up old ones."""
@@ -390,47 +419,3 @@ class Trainer:
             keep=self.args.max_to_keep
         )
 
-    @torch.no_grad()
-    def eval_epoch(self, epoch) -> Dict:
-        """Evaluate the model on the validation set (rank 0 only)."""
-        if not self.valid_loader:
-            return {}
-
-        meters = {
-            'losses': AverageMeter('Loss', ':.4'),
-            'top1': AverageMeter('Acc@1', ':6.2f'),
-            'top3': AverageMeter('Acc@3', ':6.2f')
-        }
-
-        # Use the unwrapped module: under DDP only rank 0 runs this, and a DDP forward
-        # on a single rank must not trigger collective communication.
-        model = get_model_obj(self.model)
-        model.eval()
-
-        for batch_dict in self.valid_loader:
-            batch_dict = self._move_batch_to_device(batch_dict)
-
-            outputs = model(**batch_dict)
-            outputs = model.compute_logits(output_dict=outputs, batch_dict=batch_dict)
-            outputs = ModelOutput(**outputs)
-
-            loss = self.criterion(outputs.hr_logits, outputs.hr_labels)
-            acc1, acc3 = accuracy(outputs.hr_logits, outputs.hr_labels, topk=(1, 3))
-
-            batch_size = outputs.hr_logits.size(0)
-            meters['losses'].update(loss.item(), batch_size)
-            meters['top1'].update(acc1.item(), batch_size)
-            meters['top3'].update(acc3.item(), batch_size)
-
-        metric_dict = self._format_metrics(meters)
-        logger.info(f'Epoch {epoch}, valid metric: {json.dumps(metric_dict)}')
-
-        return metric_dict
-
-    def _format_metrics(self, meters):
-        """Format meter values into a metric dictionary."""
-        return {
-            'Acc@1': round(meters['top1'].avg, 3),
-            'Acc@3': round(meters['top3'].avg, 3),
-            'loss': round(meters['losses'].avg, 3)
-        }

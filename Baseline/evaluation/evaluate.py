@@ -229,6 +229,7 @@ def eval_single_direction(
         entity_tensor: torch.Tensor,
         eval_forward: bool = True,
         batch_size: int = 64,
+        save_details: bool = True,
 ) -> Dict:
     """Evaluate model performance in a single direction (head->tail or tail->head)."""
     start_time = time()
@@ -258,13 +259,27 @@ def eval_single_direction(
     direction = 'forward' if eval_forward else 'backward'
     logger.info(f'{direction} metrics: {json.dumps(metrics)}')
 
-    _save_prediction_details(
-        examples, topk_scores, topk_indices, target, ranks,
-        eval_direction=direction,
-    )
+    if save_details:
+        _save_prediction_details(
+            examples, topk_scores, topk_indices, target, ranks,
+            eval_direction=direction,
+        )
 
     logger.info(f'Evaluation took {round(time() - start_time, 3)} seconds')
     return metrics
+
+
+def evaluate_predictor(
+        predictor: BertPredictor,
+        entity_tensor: torch.Tensor,
+        batch_size: int = 64,
+        save_details: bool = True,
+) -> Dict:
+    """Forward + backward filtered ranking; shared by the trainer and the eval scripts."""
+    fwd = eval_single_direction(predictor, entity_tensor, True, batch_size, save_details)
+    bwd = eval_single_direction(predictor, entity_tensor, False, batch_size, save_details)
+    avg = {k: round((fwd[k] + bwd[k]) / 2, 4) for k in fwd}
+    return {'forward': fwd, 'backward': bwd, 'average': avg}
 
 
 def _save_prediction_details(

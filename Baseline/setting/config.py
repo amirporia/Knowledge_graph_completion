@@ -85,6 +85,14 @@ def parse_args():
     mgmt_group.add_argument('--skip-valid-eval', action='store_true',
                             help='Skip validation during training; the latest checkpoint is then '
                                  'saved as model_best.mdl')
+    mgmt_group.add_argument('--checkpoint-metric', default='mrr', type=str,
+                            choices=['mrr', 'hit@1', 'hit@3', 'hit@10', 'hit@50'],
+                            help='Full filtered-ranking validation metric used to pick model_best.mdl')
+    mgmt_group.add_argument('--full-eval-every-n-epochs', default=1, type=int,
+                            help='Run the full filtered-ranking validation every n epochs '
+                                 '(the last epoch is always evaluated)')
+    mgmt_group.add_argument('--full-eval-batch-size', default=128, type=int,
+                            help='Batch size for the full validation pass (queries and entities)')
 
     # Loss and optimization
     loss_group = parser.add_argument_group('Loss and Optimization')

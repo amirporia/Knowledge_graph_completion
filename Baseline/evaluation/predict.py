@@ -32,6 +32,17 @@ class BertPredictor:
         self.train_args = AttrDict()
         self.use_cuda = False
         self.device = None
+        self.batch_size = args.batch_size
+
+    @classmethod  # NEW
+    def from_model(cls, model: torch.nn.Module, device: torch.device,
+                   use_cuda: bool, batch_size: int = None) -> 'BertPredictor':
+        predictor = cls()
+        predictor.model = model
+        predictor.device = device
+        predictor.use_cuda = use_cuda
+        predictor.batch_size = batch_size or args.batch_size
+        return predictor
 
     def load(self, ckt_path: str, use_data_parallel: bool = False) -> None:
         """Load model from checkpoint."""
@@ -147,7 +158,7 @@ class BertPredictor:
         return torch.utils.data.DataLoader(
             dataset,
             num_workers=4,
-            batch_size=args.batch_size,
+            batch_size=self.batch_size,
             collate_fn=collate_fn,
             shuffle=False,
             pin_memory=self.use_cuda
