@@ -71,6 +71,11 @@ def parse_args():
     g = parser.add_argument_group('Loss and Optimization')
     g.add_argument('--t', default=0.05, type=float)
     g.add_argument('--additive-margin', default=0.02, type=float)
+    g.add_argument('--t-mem', default=0.05, type=float, dest='t_mem',
+                   help='Initial temperature of the memory losses L_proto / L_struct '
+                        '(separate from --t, which only scales L_query / L_hrta)')
+    _add_toggle(g, 'finetune-t-mem', True,
+                'Make the memory-loss temperatures (proto, struct) trainable parameters')
     # same default as the baseline (temperature is learnable, no clamping)
     _add_toggle(g, 'finetune-t', True, 'Make temperature a trainable parameter')
     g.add_argument('--alpha', default=0.2, type=float,

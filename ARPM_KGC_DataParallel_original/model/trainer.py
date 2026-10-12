@@ -263,7 +263,6 @@ class Trainer:
         batch_size = q.size(0)
         labels = torch.arange(batch_size, device=q.device)
         inv_t = model_obj.log_inv_t.exp()
-        inv_t_aux = inv_t.detach()
         triplet_mask = batch_dict.get('triplet_mask')
         margin = torch.diag_embed(torch.full((batch_size,), self.args.additive_margin, device=q.device))
 
@@ -296,13 +295,20 @@ class Trainer:
         S_p = model_obj.score_prototypes(prototypes, tail_d)
         S_s = model_obj.score_struct(m_struct, tail_d)
 
-        p_logits = S_p * inv_t_aux
-        s_logits = S_s * inv_t_aux
+        inv_t_proto, inv_t_struct = model_obj.memory_inv_temps()
+        p_logits = S_p * inv_t_proto
+        s_logits = S_s * inv_t_struct
         if triplet_mask is not None:
             p_logits = p_logits.masked_fill(~triplet_mask, model_obj.NEGATIVE_INF)
             s_logits = s_logits.masked_fill(~triplet_mask, model_obj.NEGATIVE_INF)
-        L_proto = self._bidirectional_ce(p_logits, labels, batch_size)
-        L_struct = self._bidirectional_ce(s_logits, labels, batch_size)
+
+        cand_valid = batch_dict['candidate_valid_mask'].to(q.device)
+        cand_local = batch_dict['candidate_is_local'].to(q.device)
+        proto_row_valid = cand_valid.any(dim=1)
+        struct_row_valid = (cand_valid & cand_local).any(dim=1)
+
+        L_proto = self._masked_bidirectional_ce(p_logits, labels, proto_row_valid)
+        L_struct = self._masked_bidirectional_ce(s_logits, labels, struct_row_valid)
 
         total_loss = (L_query + self.args.alpha * L_hrta
                       + self.args.eta_proto * L_proto + self.args.eta_struct * L_struct
@@ -331,6 +337,30 @@ class Trainer:
         loss = criterion(logits, labels)
         loss = loss + criterion(logits[:, :batch_size].t(), labels)
         return loss
+
+    @staticmethod
+    def _masked_bidirectional_ce(logits: torch.Tensor, labels: torch.Tensor,
+                                 row_valid: torch.Tensor) -> torch.Tensor:
+        """Bidirectional in-batch CE that ignores queries whose memory is an all-zero vector.
+
+        Forward  (query -> tail): only valid queries are rows; every tail in the batch stays a
+                                  candidate, since tail embeddings always exist.
+        Backward (tail -> query): only valid queries are rows AND columns. An invalid query has a
+                                  constant zero score, so it is not a meaningful distractor either.
+        The mean is taken over valid rows only, so invalid rows no longer dilute the loss.
+        """
+        idx = row_valid.nonzero(as_tuple=True)[0]
+        if idx.numel() == 0:
+            # Nothing to learn from in this batch: zero loss, but keep the graph connected
+            # (zero gradient) so DDP still sees every parameter participate.
+            return logits.sum() * 0.0
+
+        fwd = nn.functional.cross_entropy(logits[idx], labels[idx])
+
+        sub = logits[idx][:, idx]  # (V, V): valid queries x their own tails
+        sub_labels = torch.arange(idx.numel(), device=logits.device)
+        bwd = nn.functional.cross_entropy(sub.t(), sub_labels)
+        return fwd + bwd
 
     def _update_meters(self, meters, loss_components):
         batch_size = self.args.batch_size

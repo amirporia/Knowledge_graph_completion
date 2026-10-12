@@ -32,6 +32,7 @@ def build_model(args) -> nn.Module:
 
 class ARPMModel(nn.Module):
     NEGATIVE_INF = -1e4
+    MEM_LOG_INV_T_RANGE = (0.0, math.log(100.0))  # inverse temperature kept in [1, 100]
 
     def __init__(self, args):
         super().__init__()
@@ -65,10 +66,22 @@ class ARPMModel(nn.Module):
         self.eps_struct = args.eps_struct
 
         self.log_inv_t = nn.Parameter(torch.tensor(1.0 / args.t).log(), requires_grad=args.finetune_t)
+        # Separate inverse temperatures for the memory losses. Tail-to-tail cosines (S_p, S_struct)
+        # are more compressed than query-to-tail cosines (S_q), so they need their own sharpness.
+        self.log_inv_t_proto = nn.Parameter(torch.tensor(1.0 / args.t_mem).log(),
+                                            requires_grad=args.finetune_t_mem)
+        self.log_inv_t_struct = nn.Parameter(torch.tensor(1.0 / args.t_mem).log(),
+                                             requires_grad=args.finetune_t_mem)
         self.add_margin = args.additive_margin
 
         self.random_anchor_selection = args.random_anchor_selection
         self.uniform_hop_weighting = args.uniform_hop_weighting
+
+    def memory_inv_temps(self):
+        """(inv_t_proto, inv_t_struct), clamped so a learnable temperature cannot run away."""
+        lo, hi = self.MEM_LOG_INV_T_RANGE
+        return (self.log_inv_t_proto.clamp(lo, hi).exp(),
+                self.log_inv_t_struct.clamp(lo, hi).exp())
 
     @staticmethod
     def _drop_unused_pooler(encoder: nn.Module) -> None:
