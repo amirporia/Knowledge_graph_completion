@@ -9,6 +9,10 @@ import torch.backends.cudnn as cudnn
 SCRIPT_DIR = Path(__file__).parent.parent.parent.absolute()
 CURRENT_TASK_NAME = "wn18rr"
 
+# (c_h, c_p, c_s): weights of S_hrta, S_p, S_struct in  S = S_q + c_h S_hrta + c_p S_p + c_s S_struct.
+# Used whenever a coefficient is not given on the command line and no best_coefs.json is found.
+DEFAULT_COEFS = (1.0, 0.1, 0.1)
+
 
 def _add_toggle(group, name: str, default: bool, help_text: str) -> None:
     """Register `--name` / `--no-name` flags sharing one boolean destination."""
@@ -42,7 +46,7 @@ def parse_args():
     g.add_argument('--lr', '--learning-rate', default=5e-5, type=float, dest='lr',
                    help='LR of the two BERT encoders (and the temperature)')
     g.add_argument('--memory-lr', default=1e-3, type=float, dest='memory_lr',
-                   help='LR of the small memory modules (attention, prototypes, hop scorer, gate). '
+                   help='LR of the small memory modules (attention, prototypes, hop scorer). '
                         'They are trained from scratch, so 5e-5 is far too small for them.')
     g.add_argument('--wd', '--weight-decay', default=1e-4, type=float, dest='weight_decay')
     g.add_argument('--lr-scheduler', default='linear', type=str, choices=['linear', 'cosine'])
@@ -71,7 +75,6 @@ def parse_args():
     _add_toggle(g, 'finetune-t', True, 'Make temperature a trainable parameter')
     g.add_argument('--alpha', default=0.2, type=float,
                    help='Weight of L_hrta (anchor-enhanced query loss, same as RAA-KGC)')
-    g.add_argument('--eta-combined', default=0.1, type=float, dest='eta_combined')
 
     # Graph
     g = parser.add_argument_group('Graph')
@@ -95,9 +98,6 @@ def parse_args():
     g.add_argument('--proto-temperature', default=0.1, type=float, dest='proto_temperature')
     g.add_argument('--proto-attn-temperature', default=0.5, type=float, dest='proto_attn_temperature')
     g.add_argument('--eps-struct', default=1e-6, type=float, dest='eps_struct')
-    g.add_argument('--gate-init-bias', default=-2.0, type=float, dest='gate_init_bias',
-                   help='Initial bias of the memory gate (sigmoid(-2)=0.12: memory starts as a small '
-                        'perturbation of the baseline score)')
     g.add_argument('--eta-proto', default=0.1, type=float, dest='eta_proto')
     g.add_argument('--eta-struct', default=0.1, type=float, dest='eta_struct')
     g.add_argument('--eta-div', default=0.0, type=float, dest='eta_div')
@@ -105,12 +105,27 @@ def parse_args():
                    help='Weight of the prototype-specialisation loss (cosine between prototypes)')
     _add_toggle(g, 'use-self-negative', True, 'Use head entity as an additional negative for S_q')
 
+    # Score coefficients (constants, no learned gate)
+    g = parser.add_argument_group('Score coefficients: S = S_q + c_h*S_hrta + c_p*S_p + c_s*S_struct')
+    g.add_argument('--coef-h', default=None, type=float, dest='coef_h',
+                   help=f'c_h: weight of the anchor-enhanced score S_hrta (default {DEFAULT_COEFS[0]}; '
+                        'overridden by best_coefs.json at evaluation if present and no coef is given)')
+    g.add_argument('--coef-p', default=None, type=float, dest='coef_p',
+                   help=f'c_p: weight of the prototype score S_p (default {DEFAULT_COEFS[1]})')
+    g.add_argument('--coef-s', default=None, type=float, dest='coef_s',
+                   help=f'c_s: weight of the structural score S_struct (default {DEFAULT_COEFS[2]})')
+    g.add_argument('--tune-coefs', action='store_true', dest='tune_coefs',
+                   help='Grid-search (c_h, c_p, c_s) on --valid-path by average MRR and save '
+                        'best_coefs.json next to the checkpoint. Always run this on the VALIDATION '
+                        'split; then evaluate the test split without --tune-coefs.')
+    g.add_argument('--coef-h-grid', nargs='+', type=float, default=[0.0, 0.5, 1.0, 1.5], dest='coef_h_grid')
+    g.add_argument('--coef-p-grid', nargs='+', type=float, default=[0.0, 0.1, 0.25, 0.5, 1.0], dest='coef_p_grid')
+    g.add_argument('--coef-s-grid', nargs='+', type=float, default=[0.0, 0.1, 0.25, 0.5, 1.0], dest='coef_s_grid')
+
     # Ablations
     g = parser.add_argument_group('Ablation Overrides')
     g.add_argument('--random-anchor-selection', action='store_true', dest='random_anchor_selection')
     g.add_argument('--uniform-hop-weighting', action='store_true', dest='uniform_hop_weighting')
-    g.add_argument('--fixed-lambda-p', default=None, type=float, dest='fixed_lambda_p')
-    g.add_argument('--fixed-lambda-s', default=None, type=float, dest='fixed_lambda_s')
 
     # System
     g = parser.add_argument_group('System')
@@ -123,16 +138,14 @@ def parse_args():
     # Evaluation
     g = parser.add_argument_group('Evaluation')
     g.add_argument('--is-test', action='store_true', default=False)
-    g.add_argument('--scale-p', default=None, type=float, dest='scale_p',
-                   help='Global post-hoc multiplier on lambda_p at evaluation (default: best_scales.json '
-                        'if present, else 1.0)')
-    g.add_argument('--scale-s', default=None, type=float, dest='scale_s',
-                   help='Global post-hoc multiplier on lambda_s at evaluation')
-    g.add_argument('--tune-scales', action='store_true', dest='tune_scales',
-                   help='Grid-search (scale_p, scale_s) on --valid-path and save best_scales.json. '
-                        '(0,0) is in the grid, so tuning can always fall back to the RAA baseline score.')
 
     return parser.parse_args()
+
+
+def get_coefs(arguments):
+    """(c_h, c_p, c_s) with unset values replaced by DEFAULT_COEFS."""
+    given = (arguments.coef_h, arguments.coef_p, arguments.coef_s)
+    return tuple(d if v is None else float(v) for v, d in zip(given, DEFAULT_COEFS))
 
 
 def generate_paths_from_task(arguments):

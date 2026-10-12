@@ -1,34 +1,29 @@
-"""ARPM-KGC v2.
+"""ARPM-KGC v2 (constant-coefficient version).
 
 Final score (per query (h, r, ?)):
 
-    S(t) = cos(q, e_t) + cos(q_hrta, e_t)  +  lambda_p * S_p(t)  +  lambda_s * S_struct(t)
-           [------ RAA-KGC baseline ------]   [----- gated memory residual -----]
+    S(t) = cos(q, e_t) + c_h * cos(q_hrta, e_t) + c_p * S_p(t) + c_s * S_struct(t)
 
-Key differences from v1:
-  1. The baseline's anchor-enhanced query q_hrta (mean of E_0(h, r, t_i) over hop-0 anchors) is
-     part of the model, so with lambda = 0 the model IS the baseline.
-  2. Memory anchors are represented by their tail embeddings E_1(t_i) from tail_bert, computed
-     under no_grad (eval mode). The anchors therefore live in the same space as the entities they
-     are scored against and no longer send gradients into hr_bert / tail_bert.
-  3. The memory branch sees q.detach(); its auxiliary losses see tail_vector.detach(). The encoders
-     are trained only by L_query and L_hrta (exactly as in the baseline).
-  4. Prototypes / m_struct are L2-normalised, so S_p and S_struct are real cosine-scale scores.
-  5. The gate also sees statistics of the retrieved pool and starts at lambda ~ 0.12.
+c_h, c_p, c_s are CONSTANTS (no learned gate). They are selected on the validation set by
+`evaluation/evaluate.py::resolve_coefs` (grid search, `--tune-coefs`) or given explicitly with
+`--coef-h/--coef-p/--coef-s`. With c_h = 1, c_p = c_s = 0 the model is exactly the RAA-KGC baseline.
+
+Other design points (unchanged from v2):
+  * Memory anchors are represented by their tail embeddings E_1(t_i) computed under no_grad.
+  * The memory branch sees q.detach(); its auxiliary losses see tail_vector.detach(). The encoders
+    are trained only by L_query and L_hrta (exactly as in the baseline).
+  * Prototypes / m_struct are L2-normalised, so S_p and S_struct are real cosine-scale scores.
 """
 import math
 from copy import deepcopy
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel, AutoConfig
 
-from .modules import (
-    ProtoGen, HopScorer, MemoryGate, NUM_GATE_FEATS,
-    diversity_loss, prototype_diversity,
-)
+from .modules import ProtoGen, HopScorer, diversity_loss, prototype_diversity
 
 
 def build_model(args) -> nn.Module:
@@ -64,7 +59,6 @@ class ARPMModel(nn.Module):
 
         self.proto_gen = ProtoGen(d, args.num_prototypes, temperature=args.proto_attn_temperature)
         self.hop_scorer = HopScorer(d, self.num_hop_slots)
-        self.memory_gate = MemoryGate(d, NUM_GATE_FEATS, init_bias=args.gate_init_bias)
 
         self.tau_r = args.retrieval_temperature
         self.tau_p = args.proto_temperature
@@ -75,8 +69,6 @@ class ARPMModel(nn.Module):
 
         self.random_anchor_selection = args.random_anchor_selection
         self.uniform_hop_weighting = args.uniform_hop_weighting
-        self.fixed_lambda_p = args.fixed_lambda_p
-        self.fixed_lambda_s = args.fixed_lambda_s
 
     @staticmethod
     def _drop_unused_pooler(encoder: nn.Module) -> None:
@@ -150,14 +142,6 @@ class ARPMModel(nn.Module):
             mem = self._memory(q.detach().float(), cand_emb.float(), candidate_valid_mask,
                                candidate_hop_id, candidate_is_local)
 
-        lambda_p, lambda_s = mem['gates'][:, 0], mem['gates'][:, 1]
-        if self.fixed_lambda_p is not None:
-            lambda_p = torch.full_like(lambda_p, self.fixed_lambda_p)
-        if self.fixed_lambda_s is not None:
-            lambda_s = torch.full_like(lambda_s, self.fixed_lambda_s)
-        # no local anchor at any hop -> no structural evidence -> lambda_s = 0 (structural fact)
-        lambda_s = torch.where(mem['has_local_anchor'], lambda_s, torch.zeros_like(lambda_s))
-
         return {
             'q': q,
             'q_hrta': q_hrta,
@@ -167,14 +151,10 @@ class ARPMModel(nn.Module):
             'm_struct': mem['m_struct'],
             'div_loss': mem['div_loss'],
             'proto_div': mem['proto_div'],
-            'lambda_p': lambda_p,
-            'lambda_s': lambda_s,
         }
 
     # ------------------------------------------------------------------ memory
     def _memory(self, qm, cand_emb, valid, hop_id, is_local) -> Dict:
-        n = cand_emb.size(1)
-
         logits = torch.einsum('bnd,bd->bn', cand_emb, self.attn_proj(qm)) / self.tau_r
         if self.random_anchor_selection:  # A1
             alpha = valid.float() / valid.sum(-1, keepdim=True).clamp(min=1).float()
@@ -187,24 +167,15 @@ class ARPMModel(nn.Module):
         prototypes = F.normalize(self.proto_gen(cand_emb, qm, alpha, valid), dim=-1)  # zero stays zero
         proto_div = prototype_diversity(prototypes)
 
-        m_struct, has_local_anchor = self._structural_memory(cand_emb, alpha, hop_id, is_local, valid, qm)
+        # a query with no local anchor gets m_struct = 0 (so S_struct = 0 for it)
+        m_struct, _ = self._structural_memory(cand_emb, alpha, hop_id, is_local, valid, qm)
         m_struct = F.normalize(m_struct, dim=-1)
 
-        with torch.no_grad():
-            n_valid = valid.sum(1).float()
-            n_local = (valid & is_local).sum(1).float()
-            budget = float(max(self.anchor_budget, 1))
-            ent = -(alpha * torch.log(alpha + 1e-12)).sum(1) / math.log(max(n, 2))
-            has_hop0 = ((hop_id == 0) & valid & is_local).any(1).float()
-            feats = torch.stack([n_valid / budget, n_local / budget, alpha.max(1).values, ent, has_hop0], 1)
-        gates = self.memory_gate(qm, feats)
-
-        return {'prototypes': prototypes, 'm_struct': m_struct, 'div_loss': div, 'proto_div': proto_div,
-                'has_local_anchor': has_local_anchor, 'gates': gates}
+        return {'prototypes': prototypes, 'm_struct': m_struct, 'div_loss': div, 'proto_div': proto_div}
 
     def _structural_memory(self, cand_emb, alpha, hop_id, is_local, valid_mask, q):
         """m_struct = sum_l beta_l m^(l). Empty hops get exactly zero weight; a query with no local
-        anchor gets m_struct = 0 (and lambda_s = 0 in forward)."""
+        anchor gets m_struct = 0."""
         batch_size, n, _ = cand_emb.shape
         L = self.num_hop_slots
 
@@ -253,9 +224,14 @@ class ARPMModel(nn.Module):
         return m_struct.mm(entity_matrix.t())
 
     @staticmethod
-    def combined_score(S_base, S_p, S_s, lambda_p, lambda_s) -> torch.Tensor:
-        """S = S_base + lambda_p S_p + lambda_s S_struct, S_base = S_q (+ S_hrta)."""
-        return S_base + lambda_p.unsqueeze(-1) * S_p + lambda_s.unsqueeze(-1) * S_s
+    def combined_score(S_q: torch.Tensor, S_h: Optional[torch.Tensor], S_p: torch.Tensor,
+                       S_s: torch.Tensor, coef_h: float, coef_p: float, coef_s: float) -> torch.Tensor:
+        """S = S_q + c_h S_hrta + c_p S_p + c_s S_struct with constant coefficients.
+        S_h is None when the RAA anchor path is disabled (--anchor-num 0)."""
+        score = S_q + coef_p * S_p + coef_s * S_s
+        if S_h is not None:
+            score = score + coef_h * S_h
+        return score
 
 
 def _pool_output(pooling, cls_output, mask, last_hidden_state) -> torch.Tensor:

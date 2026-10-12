@@ -11,6 +11,7 @@ from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_wi
 
 from .models import build_model
 from ..evaluation.metric import accuracy
+from ..setting.config import get_coefs
 from ..setting.logger_config import logger
 from ..utils.dict_hub import init_tokenizer
 from ..utils.doc import Dataset, collate
@@ -29,11 +30,15 @@ _NON_MODEL_KEYS = ('triplet_mask', 'self_negative_mask', 'batch_data', 'test_for
 
 
 class Trainer:
-    """Trains ARPM-KGC v2.
+    """Trains ARPM-KGC v2 (constant score coefficients).
 
         L = L_query + alpha * L_hrta                      (encoders; identical to the RAA-KGC baseline)
-          + eta_p L_proto + eta_s L_struct + eta_c L_combined + eta_div L_div + eta_pdiv L_pdiv
+          + eta_p L_proto + eta_s L_struct + eta_div L_div + eta_pdiv L_pdiv
                                                            (memory modules only: inputs are detached)
+
+    The coefficients c_h, c_p, c_s of S = S_q + c_h S_hrta + c_p S_p + c_s S_struct are NOT trained.
+    They only enter the in-batch accuracy shown in the training log; the final values are tuned on
+    the validation set by evaluation/evaluate.py (--tune-coefs).
     """
 
     def __init__(self, args, ngpus_per_node):
@@ -74,6 +79,7 @@ class Trainer:
         self.model.to(self.device)
 
         if self.args.distributed:
+            # hop_scorer is unused under --uniform-hop-weighting, so unused params must be allowed.
             self.model = nn.parallel.DistributedDataParallel(
                 self.model, device_ids=[self.args.local_rank], output_device=self.args.local_rank,
                 broadcast_buffers=False, find_unused_parameters=True,
@@ -194,8 +200,7 @@ class Trainer:
         progress = ProgressMeter(
             len(self.train_loader),
             [meters['losses'], meters['query_losses'], meters['hrta_losses'], meters['proto_losses'],
-             meters['struct_losses'], meters['combined_losses'], meters['lam_p'], meters['lam_s'],
-             meters['inv_t'], meters['top1'], meters['top3']],
+             meters['struct_losses'], meters['inv_t'], meters['top1'], meters['top3']],
             prefix=f"Epoch: [{epoch}]"
         )
 
@@ -205,7 +210,7 @@ class Trainer:
 
             outputs, loss_components = self._forward_and_compute_losses(batch_dict)
 
-            self._update_meters(meters, loss_components, outputs)
+            self._update_meters(meters, loss_components)
             self._backward_pass(loss_components['total_loss'])
             self.scheduler.step()
 
@@ -224,9 +229,6 @@ class Trainer:
             'hrta_losses': AverageMeter('L_hrta', ':.4'),
             'proto_losses': AverageMeter('L_proto', ':.4'),
             'struct_losses': AverageMeter('L_struct', ':.4'),
-            'combined_losses': AverageMeter('L_comb', ':.4'),
-            'lam_p': AverageMeter('lam_p', ':.3f'),
-            'lam_s': AverageMeter('lam_s', ':.3f'),
             'top1': AverageMeter('Acc@1', ':6.2f'),
             'top3': AverageMeter('Acc@3', ':6.2f'),
             'inv_t': AverageMeter('InvT', ':6.2f')
@@ -238,7 +240,7 @@ class Trainer:
         return batch_dict
 
     def _forward_and_compute_losses(self, batch_dict):
-        """Forward AND loss computation inside the same autocast region (see v1 notes)."""
+        """Forward AND loss computation inside the same autocast region."""
         model_kwargs = {k: v for k, v in batch_dict.items() if k not in _NON_MODEL_KEYS}
         with torch.amp.autocast('cuda', enabled=self.args.use_amp):
             outputs = self.model(**model_kwargs)
@@ -254,8 +256,6 @@ class Trainer:
         head_vector = outputs['head_vector']
         prototypes = outputs['prototypes']
         m_struct = outputs['m_struct']
-        lambda_p = outputs['lambda_p']
-        lambda_s = outputs['lambda_s']
 
         div_loss = outputs['div_loss'].mean()
         pdiv_loss = outputs['proto_div'].mean()
@@ -286,10 +286,10 @@ class Trainer:
             if triplet_mask is not None:
                 h_logits = h_logits.masked_fill(~triplet_mask, model_obj.NEGATIVE_INF)
             L_hrta = self._bidirectional_ce(h_logits, labels, batch_size)
-            S_base = S_q.detach() + S_h.detach()
+            S_h_det = S_h.detach()
         else:
             L_hrta = q.new_zeros(())
-            S_base = S_q.detach()
+            S_h_det = None
 
         # ---- memory losses: only memory modules receive gradient (q and tails are detached) ----
         tail_d = tail_vector.detach()
@@ -304,17 +304,15 @@ class Trainer:
         L_proto = self._bidirectional_ce(p_logits, labels, batch_size)
         L_struct = self._bidirectional_ce(s_logits, labels, batch_size)
 
-        # ---- L_combined: trains the gate (base score is frozen, so the gate learns the residual) ----
-        combined_score = model_obj.combined_score(S_base, S_p, S_s, lambda_p, lambda_s)
-        combined_logits = combined_score * inv_t_aux
-        if triplet_mask is not None:
-            combined_logits = combined_logits.masked_fill(~triplet_mask, model_obj.NEGATIVE_INF)
-        L_combined = self._bidirectional_ce(combined_logits, labels, batch_size)
-
         total_loss = (L_query + self.args.alpha * L_hrta
                       + self.args.eta_proto * L_proto + self.args.eta_struct * L_struct
-                      + self.args.eta_combined * L_combined
                       + self.args.eta_div * div_loss + self.args.eta_pdiv * pdiv_loss)
+
+        # Diagnostic only (no gradient): in-batch accuracy of the constant-coefficient combined score.
+        with torch.no_grad():
+            coef_h, coef_p, coef_s = get_coefs(self.args)
+            combined_score = model_obj.combined_score(S_q.detach(), S_h_det, S_p.detach(), S_s.detach(),
+                                                      coef_h, coef_p, coef_s)
 
         return {
             'total_loss': total_loss,
@@ -323,7 +321,6 @@ class Trainer:
             'proto_loss': L_proto,
             'struct_loss': L_struct,
             'div_loss': div_loss,
-            'combined_loss': L_combined,
             'combined_score': combined_score,
             'labels': labels,
         }
@@ -335,7 +332,7 @@ class Trainer:
         loss = loss + criterion(logits[:, :batch_size].t(), labels)
         return loss
 
-    def _update_meters(self, meters, loss_components, outputs):
+    def _update_meters(self, meters, loss_components):
         batch_size = self.args.batch_size
         acc1, acc3 = accuracy(loss_components['combined_score'], loss_components['labels'], topk=(1, 3))
 
@@ -344,9 +341,6 @@ class Trainer:
         meters['hrta_losses'].update(loss_components['hrta_loss'].item(), batch_size)
         meters['proto_losses'].update(loss_components['proto_loss'].item(), batch_size)
         meters['struct_losses'].update(loss_components['struct_loss'].item(), batch_size)
-        meters['combined_losses'].update(loss_components['combined_loss'].item(), batch_size)
-        meters['lam_p'].update(outputs['lambda_p'].mean().item(), batch_size)
-        meters['lam_s'].update(outputs['lambda_s'].mean().item(), batch_size)
         meters['top1'].update(acc1.item(), batch_size)
         meters['top3'].update(acc3.item(), batch_size)
         meters['inv_t'].update(get_model_obj(self.model).log_inv_t.exp().item(), batch_size)
@@ -376,7 +370,8 @@ class Trainer:
             if run_full_eval:
                 full_metric_dict = self._compute_full_validation_metrics()
                 logger.info(
-                    f'Epoch {epoch} full filtered-ranking validation (used for checkpoint selection via '
+                    f'Epoch {epoch} full filtered-ranking validation with coefficients '
+                    f'(c_h, c_p, c_s)={get_coefs(self.args)} (used for checkpoint selection via '
                     f'--checkpoint-metric={self.args.checkpoint_metric}): {json.dumps(full_metric_dict)}'
                 )
                 is_best = self._check_best_metric(full_metric_dict)

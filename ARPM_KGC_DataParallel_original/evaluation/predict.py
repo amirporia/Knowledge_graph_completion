@@ -15,8 +15,6 @@ from ..utils.doc import collate, collate_entity, Example, Dataset
 from ..utils.utils import AttrDict, move_to_cuda
 
 _NON_MODEL_KEYS = ('triplet_mask', 'self_negative_mask', 'batch_data', 'test_forward')
-
-
 def clean_state_dict(state_dict: dict) -> OrderedDict:
     """Remove 'module.' prefix from DataParallel/DDP state dict."""
     new_state_dict = OrderedDict()
@@ -28,7 +26,7 @@ def clean_state_dict(state_dict: dict) -> OrderedDict:
 
 class ARPMPredictor:
     """Inference wrapper. `predict_by_examples` returns the memory bundle needed to compute
-    S = cos(q,e) + cos(q_hrta,e) + lambda_p S_p + lambda_s S_struct against the full entity set."""
+    S = cos(q,e) + c_h cos(q_hrta,e) + c_p S_p + c_s S_struct against the full entity set."""
 
     def __init__(self):
         self.model = None
@@ -97,9 +95,9 @@ class ARPMPredictor:
     @torch.no_grad()
     def predict_by_examples(self, examples: List[Example]) -> dict:
         """Returns concatenated tensors:
-           q (N,d), q_hrta (N,d), prototypes (N,K,d), m_struct (N,d), lambda_p (N,), lambda_s (N,)"""
+           q (N,d), q_hrta (N,d), prototypes (N,K,d), m_struct (N,d)"""
         data_loader = self._create_dataloader(examples, is_test=False)
-        keys = ('q', 'q_hrta', 'prototypes', 'm_struct', 'lambda_p', 'lambda_s')
+        keys = ('q', 'q_hrta', 'prototypes', 'm_struct')
         collected = {k: [] for k in keys}
 
         for batch_dict in tqdm.tqdm(data_loader, desc='Predicting query memory'):

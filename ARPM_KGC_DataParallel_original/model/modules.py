@@ -2,16 +2,14 @@
 
   - ProtoGen       -> K query-conditioned prototypes from the weighted anchor set
   - HopScorer      -> z_l = G_hop(q, l)
-  - MemoryGate     -> [lambda_p, lambda_s] = G_lambda(q, memory-statistics), biased towards ~0.12
   - diversity_loss / prototype_diversity
 
-The Gumbel extensions (A11-A13) of the previous version were removed to keep the model
-small; they can be re-added from the old modules.py unchanged.
+The learned memory gate (G_lambda) was removed: the weights of the three score components
+(S_hrta, S_p, S_struct) are now plain constants chosen on the validation set
+(see evaluation/evaluate.py::resolve_coefs).
 """
 import torch
 import torch.nn as nn
-
-NUM_GATE_FEATS = 5  # n_valid, n_local, max_alpha, alpha_entropy, has_hop0
 
 
 class ProtoGen(nn.Module):
@@ -51,22 +49,6 @@ class HopScorer(nn.Module):
 
     def forward(self, query: torch.Tensor) -> torch.Tensor:
         return self.linear(query)
-
-
-class MemoryGate(nn.Module):
-    """[lambda_p, lambda_s] in (0,1). Input: q plus cheap statistics of the retrieved pool
-    (how many anchors, how peaked alpha is, whether hop-0 anchors exist, ...), so the gate can
-    tell queries with informative memory from queries without. Initial bias < 0 -> memory
-    starts as a small perturbation of the baseline score."""
-
-    def __init__(self, hidden_size: int, num_feats: int = NUM_GATE_FEATS, init_bias: float = -2.0):
-        super().__init__()
-        self.linear = nn.Linear(hidden_size + num_feats, 2)
-        nn.init.normal_(self.linear.weight, std=0.02)
-        nn.init.constant_(self.linear.bias, init_bias)
-
-    def forward(self, query: torch.Tensor, feats: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(self.linear(torch.cat([query, feats], dim=-1)))
 
 
 def diversity_loss(cand_emb, alpha, valid_mask):

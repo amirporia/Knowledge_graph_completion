@@ -4,7 +4,7 @@ from typing import Dict
 
 import torch
 
-from .evaluate import evaluate_predictor
+from .evaluate import evaluate_predictor, resolve_coefs, current_coefs, BEST_COEFS_NAME
 from .predict import ARPMPredictor
 from ..setting.config import args
 from ..setting.logger_config import logger
@@ -96,7 +96,9 @@ def save_metrics(
 
     output_path = os.path.join(prefix, f'metrics_{split}_{basename}.json')
 
+    c_h, c_p, c_s = current_coefs()
     metrics_data = {
+        'coefficients': {'coef_h': c_h, 'coef_p': c_p, 'coef_s': c_s},
         'forward_metrics': forward_metrics,
         'backward_metrics': backward_metrics,
         'average_metrics': averaged_metrics,
@@ -119,12 +121,16 @@ def predict_by_split() -> None:
     dump_entity_embeddings(predictor)
     entity_tensor = load_entity_embeddings().cuda()
 
+    coefs_path = os.path.join(os.path.dirname(args.eval_model_path), BEST_COEFS_NAME)
+    resolve_coefs(predictor, entity_tensor, coefs_path, batch_size=EVAL_BATCH_SIZE)
+
     result = evaluate_predictor(predictor, entity_tensor=entity_tensor,
                                  batch_size=EVAL_BATCH_SIZE, save_details=True)
     forward_metrics, backward_metrics, averaged_metrics = (
         result['forward'], result['backward'], result['average']
     )
-    logger.info(f'Averaged metrics: {averaged_metrics}')
+    logger.info(f'Coefficients used (c_h, c_p, c_s): {current_coefs()}  '
+                f'Averaged metrics: {averaged_metrics}')
 
     save_metrics(forward_metrics, backward_metrics, averaged_metrics)
 
