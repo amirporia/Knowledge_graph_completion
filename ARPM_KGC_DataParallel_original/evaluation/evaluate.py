@@ -17,7 +17,7 @@ from ..utils.doc import load_data, Example
 from ..utils.triplet import EntityDict
 from ..utils.utils import rerank_by_graph
 
-FILTER_FILL = -1.0
+FILTER_FILL = -1e4
 BEST_COEFS_NAME = 'best_coefs.json'
 
 Coefs = Tuple[float, float, float]  # (c_h, c_p, c_s)
@@ -142,13 +142,12 @@ def compute_metrics(
             if cs != 0.0:
                 score += cs * S_s
             score = score.masked_fill(fmask, FILTER_FILL)
-            sorted_score, sorted_idx = torch.sort(score, dim=-1, descending=True)
-            target_pos = torch.nonzero(sorted_idx.eq(tgt).long(), as_tuple=False)
-            assert target_pos.size(0) == score.size(0), "Rank size mismatch"
-            ranks[pi].append((target_pos[:, 1] + 1).cpu())
+            tgt_score = score.gather(1, tgt)
+            ranks[pi].append(((score > tgt_score).sum(dim=1) + 1).cpu())
             if top_k > 0 and pi == 0:
-                topk_scores.extend(sorted_score[:, :top_k].tolist())
-                topk_indices.extend(sorted_idx[:, :top_k].tolist())
+                vals, inds = score.topk(top_k, dim=-1)
+                topk_scores.extend(vals.tolist())
+                topk_indices.extend(inds.tolist())
 
     all_ranks = [torch.cat(r) for r in ranks]
     return {'metrics': [_summarise(r) for r in all_ranks], 'ranks': all_ranks,
