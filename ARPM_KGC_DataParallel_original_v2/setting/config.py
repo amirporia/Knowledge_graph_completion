@@ -46,7 +46,7 @@ def parse_args():
     g.add_argument('-b', '--batch-size', default=32, type=int)
     g.add_argument('--lr', '--learning-rate', default=5e-5, type=float, dest='lr',
                    help='LR of the two BERT encoders (and the temperature)')
-    g.add_argument('--memory-lr', default=1e-3, type=float, dest='memory_lr',
+    g.add_argument('--memory-lr', default=1e-4, type=float, dest='memory_lr',
                    help='LR of the small memory modules (attention, prototypes, hop scorer). '
                         'They are trained from scratch, so 5e-5 is far too small for them.')
     g.add_argument('--wd', '--weight-decay', default=1e-4, type=float, dest='weight_decay')
@@ -90,7 +90,7 @@ def parse_args():
 
     # Memory
     g = parser.add_argument_group('ARPM-KGC Memory')
-    g.add_argument('--num-hops', default=5, type=int, dest='num_hops')
+    g.add_argument('--num-hops', default=2, type=int, dest='num_hops')
     g.add_argument('--num-prototypes', default=4, type=int, dest='num_prototypes')
     g.add_argument('--local-per-hop-budget', default=5, type=int, dest='local_per_hop_budget')
     g.add_argument('--global-budget', default=5, type=int, dest='global_budget')
@@ -99,8 +99,7 @@ def parse_args():
     g.add_argument('--proto-temperature', default=0.1, type=float, dest='proto_temperature')
     g.add_argument('--proto-attn-temperature', default=0.5, type=float, dest='proto_attn_temperature')
     g.add_argument('--eps-struct', default=1e-6, type=float, dest='eps_struct')
-    # S_p replaces the former anchor-enhanced path (weight alpha=0.2 on L_hrta): it now trains the encoders,
-    # so L_proto gets a larger default weight than in v2 (0.1).
+
     g.add_argument('--eta-proto', default=0.2, type=float, dest='eta_proto')
     g.add_argument('--eta-struct', default=0.1, type=float, dest='eta_struct')
     g.add_argument('--eta-div', default=0.0, type=float, dest='eta_div')
