@@ -113,7 +113,7 @@ def parse_args():
                 'Do not detach q in the semantic branch: L_proto also trains the query encoder E_0')
     _add_toggle(g, 'memory-grad-tail', True,
                 'Do not detach the in-batch tail vectors in L_proto: L_proto also trains E_1')
-    _add_toggle(g, 'memory-grad-cand', False,
+    _add_toggle(g, 'memory-grad-cand', True,
                 'Let candidate embeddings E_1(t_i) carry gradient from L_proto/L_div (extra memory/compute)')
 
     # Score coefficients (constants, no learned gate)
