@@ -1,3 +1,4 @@
+import gc
 import json
 from datetime import timedelta
 
@@ -34,6 +35,12 @@ def main():
 
     if args.rank == 0:
         logger.info('Args={}'.format(json.dumps(args.__dict__, ensure_ascii=False, indent=4)))
+
+    # The graph / triplet dictionaries hold tens of millions of Python objects. Moving them to the
+    # permanent generation keeps the cyclic GC of every forked DataLoader worker from touching (= copying,
+    # copy-on-write) all of those memory pages. Harmless for the small datasets.
+    gc.collect()
+    gc.freeze()
 
     trainer.train_loop()
 

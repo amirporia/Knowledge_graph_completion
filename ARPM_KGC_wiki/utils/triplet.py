@@ -4,7 +4,7 @@ import os
 import sys
 from collections import deque
 from dataclasses import dataclass
-from typing import List, Optional, Set, Tuple
+from typing import Iterator, List, Optional, Set, Tuple
 
 from ..setting.logger_config import logger
 
@@ -12,6 +12,53 @@ from ..setting.logger_config import logger
 def _intern(s):
     """Intern strings so the many copies of an entity / relation id share one object (saves GBs on Wikidata5M)."""
     return sys.intern(s) if isinstance(s, str) else s
+
+
+def iter_json_array(path: str, chunk_size: int = 1 << 24) -> Iterator[dict]:
+    """Yield the elements of a (possibly multi-GB) top-level JSON array one at a time.
+
+    `json.load` on the 20.6M-triple Wikidata5M train file materialises every dict at once
+    (~11 GB) on top of the structures that are already in RAM. This reads the file in
+    `chunk_size` pieces and decodes one object at a time, so the peak is only the final
+    data structure. Works for both the compact and the indent=4 files written by preprocess.
+    """
+    decoder = json.JSONDecoder()
+    with open(path, 'r', encoding='utf-8') as f:
+        buf, pos, started = f.read(chunk_size), 0, False
+        while True:
+            # skip whitespace / commas; refill when the buffer is exhausted
+            while True:
+                while pos < len(buf) and buf[pos] in ' \t\r\n,':
+                    pos += 1
+                if pos < len(buf):
+                    break
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    return
+                buf, pos = chunk, 0
+
+            ch = buf[pos]
+            if not started:
+                if ch != '[':
+                    raise ValueError(f'{path}: expected a JSON array')
+                started = True
+                pos += 1
+                continue
+            if ch == ']':
+                return
+
+            while True:
+                try:
+                    obj, end = decoder.raw_decode(buf, pos)
+                    break
+                except json.JSONDecodeError:
+                    # the object straddles the end of the buffer: read more and retry
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        raise
+                    buf, pos = buf[pos:] + chunk, 0
+            yield obj
+            pos = end
 
 
 @dataclass
@@ -41,19 +88,22 @@ class TripletDict:
         )
 
     def _load(self, path: str) -> None:
-        with open(path, 'r', encoding='utf-8') as f:
-            examples = json.load(f)
+        # Streamed: forward and inverse triplets are inserted directly (same content as
+        # `examples + [reverse_triplet(o) for o in examples]`), nothing is kept in a list.
+        n = 0
+        hr2tails, relations = self.hr2tails, self.relations
+        for obj in iter_json_array(path):
+            head_id, tail_id = _intern(obj['head_id']), _intern(obj['tail_id'])
+            rel = _intern(obj['relation'])
+            inv_rel = _intern(f"inverse {obj['relation']}")
 
-        # Forward and inverse triplets are inserted directly: no second list of dicts is built.
-        for obj in examples:
-            for ex in (obj, reverse_triplet(obj)):
-                rel = _intern(ex['relation'])
-                key = (_intern(ex['head_id']), rel)
-                self.relations.add(rel)
-                self.hr2tails.setdefault(key, set()).add(_intern(ex['tail_id']))
+            relations.add(rel)
+            relations.add(inv_rel)
+            hr2tails.setdefault((head_id, rel), set()).add(tail_id)
+            hr2tails.setdefault((tail_id, inv_rel), set()).add(head_id)
+            n += 1
 
-        self.triplet_cnt = 2 * len(examples)
-        del examples
+        self.triplet_cnt += 2 * n
 
     def get_neighbors(self, head_id: str, relation: str) -> Set[str]:
         return self.hr2tails.get((head_id, relation), set())
@@ -71,8 +121,7 @@ class EntityDict:
         if not os.path.exists(entities_path):
             raise FileNotFoundError(f'Entities file not found: {entities_path}')
 
-        with open(entities_path, 'r', encoding='utf-8') as f:
-            self.entity_exs = [EntityExample(**obj) for obj in json.load(f)]
+        self.entity_exs = [EntityExample(**obj) for obj in iter_json_array(entities_path)]
 
         if inductive_test_path:
             self._filter_inductive_entities(inductive_test_path)
@@ -117,14 +166,10 @@ class LinkGraph:
 
         self.graph = {}
 
-        with open(train_path, 'r', encoding='utf-8') as f:
-            examples = json.load(f)
-
-        for ex in examples:
+        for ex in iter_json_array(train_path):
             head_id, tail_id = _intern(ex['head_id']), _intern(ex['tail_id'])
             self.graph.setdefault(head_id, set()).add(tail_id)
             self.graph.setdefault(tail_id, set()).add(head_id)
-        del examples
 
         logger.info(f'Done build link graph with {len(self.graph)} nodes')
 
