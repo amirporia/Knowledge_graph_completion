@@ -2,6 +2,7 @@ import json
 import os
 from typing import Optional, List, Tuple
 
+import numpy as np
 import torch
 import torch.utils.data.dataset
 
@@ -117,8 +118,49 @@ class Example:
         return {'ids': enc['input_ids'], 'tt': enc['token_type_ids']}
 
 
+class CompactExamples:
+    """Training triples kept as int arrays; `Example` objects are built lazily on access.
+
+    Indexing is identical to `load_data(path)`: index 2*j is the forward query of triple j,
+    index 2*j+1 its inverse. Needs ~10 bytes per triple instead of several hundred.
+    """
+
+    def __init__(self, path: str):
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        rels = sorted({d['relation'] for d in data})
+        rel2idx = {r: i for i, r in enumerate(rels)}
+        n = len(data)
+
+        self.h = np.empty(n, dtype=np.int32)
+        self.r = np.empty(n, dtype=np.int16)
+        self.t = np.empty(n, dtype=np.int32)
+        for i in range(n):
+            d = data[i]
+            self.h[i] = entity_dict.entity_to_idx(d['head_id'])
+            self.t[i] = entity_dict.entity_to_idx(d['tail_id'])
+            self.r[i] = rel2idx[d['relation']]
+            data[i] = None  # free progressively
+        del data
+
+        self.rel_fwd = rels
+        self.rel_inv = [f'inverse {r}' for r in rels]
+        self.ids = [e.entity_id for e in entity_dict.entity_exs]  # references only
+        logger.info(f'CompactExamples: {n} triples -> {2 * n} queries from {path}')
+
+    def __len__(self):
+        return 2 * len(self.h)
+
+    def __getitem__(self, i):
+        j, backward = divmod(i, 2)
+        h, r, t = int(self.h[j]), int(self.r[j]), int(self.t[j])
+        if backward:
+            return Example(self.ids[t], self.rel_inv[r], self.ids[h])
+        return Example(self.ids[h], self.rel_fwd[r], self.ids[t])
+
+
 class Dataset(torch.utils.data.dataset.Dataset):
-    def __init__(self, path, test_set=False, examples=None):
+    def __init__(self, path, test_set=False, examples=None, compact=False):
         self.path_list = path.split(',')
         self.test_set = test_set
 
@@ -126,6 +168,8 @@ class Dataset(torch.utils.data.dataset.Dataset):
 
         if examples:
             self.examples = examples
+        elif compact and len(self.path_list) == 1:
+            self.examples = CompactExamples(self.path_list[0])
         else:
             self.examples = []
             for file_path in self.path_list:

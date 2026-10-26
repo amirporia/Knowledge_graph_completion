@@ -10,10 +10,15 @@ Differences from the previous version:
     sub-sampled to fit `anchor_budget`.
   * hop-0 needs no graph traversal, so it is kept even with --disable-link-graph
     (only hop>=1 requires the link graph).
+  * Hub-safe: for (h,r) pairs with more than LARGE_NEIGHBORHOOD known tails (Wikidata5M has
+    pairs with >1M tails) the same-head candidates are drawn with rng.sample over a cached sorted
+    tuple instead of sorting + shuffling the whole set for every example. Smaller neighbourhoods
+    (all of wn18rr / fb15k237 in practice) take the original code path unchanged.
 Retrieval reads only the TRAINING graph, so no valid/test label can enter the pool.
 """
 import random
 from collections import defaultdict
+from functools import lru_cache
 from typing import Dict, List, Tuple
 
 from .dict_hub import get_link_graph, get_train_triplet_dict
@@ -21,6 +26,7 @@ from ..setting.config import args
 from ..setting.logger_config import logger
 
 NO_HOP = -1
+LARGE_NEIGHBORHOOD = 5000
 
 
 class CandidateAnchor:
@@ -65,8 +71,27 @@ class CandidatePoolBuilder:
             return random.Random(f'{head_id}\t{relation}')
         return random
 
+    @lru_cache(maxsize=64)
+    def _sorted_tails_cached(self, head_id, relation):
+        """Sorted tails of a hub (h,r); cached per process so the sort happens once, not per example."""
+        return tuple(sorted(self.train_triplet_dict.get_neighbors(head_id, relation)))
+
     def _same_head_candidates(self, head_id, relation, tail_id, rng):
-        candidate_tails = sorted(self.train_triplet_dict.get_neighbors(head_id, relation))
+        neighbors = self.train_triplet_dict.get_neighbors(head_id, relation)
+
+        if len(neighbors) > LARGE_NEIGHBORHOOD:
+            pool = self._sorted_tails_cached(head_id, relation)
+            picks = rng.sample(range(len(pool)), min(len(pool), self.local_per_hop_budget + 1))
+            out = []
+            for i in picks:
+                if len(out) >= self.local_per_hop_budget:
+                    break
+                if pool[i] == tail_id:
+                    continue
+                out.append(CandidateAnchor(head_id, relation, pool[i], 0, True))
+            return out
+
+        candidate_tails = sorted(neighbors)
         rng.shuffle(candidate_tails)
         candidates, found = [], 0
         for cand_tail in candidate_tails:

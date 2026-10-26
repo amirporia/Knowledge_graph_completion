@@ -15,6 +15,8 @@ from ..utils.doc import collate, collate_entity, Example, Dataset
 from ..utils.utils import AttrDict, move_to_cuda
 
 _NON_MODEL_KEYS = ('triplet_mask', 'self_negative_mask', 'batch_data', 'test_forward')
+
+
 def clean_state_dict(state_dict: dict) -> OrderedDict:
     """Remove 'module.' prefix from DataParallel/DDP state dict."""
     new_state_dict = OrderedDict()
@@ -92,6 +94,11 @@ class ARPMPredictor:
                 args.__dict__[key] = getattr(self.train_args, key)
         args.__dict__['is_test'] = True
 
+    def _autocast(self):
+        """fp16 autocast for the encoders when --eval-amp is given (training also used AMP)."""
+        return torch.autocast('cuda', dtype=torch.float16,
+                              enabled=bool(self.use_cuda and getattr(args, 'eval_amp', False)))
+
     @torch.no_grad()
     def predict_by_examples(self, examples: List[Example]) -> dict:
         """Returns concatenated tensors:
@@ -102,7 +109,8 @@ class ARPMPredictor:
 
         for batch_dict in tqdm.tqdm(data_loader, desc='Predicting query memory'):
             model_kwargs = {k: v for k, v in batch_dict.items() if k not in _NON_MODEL_KEYS}
-            outputs = self.model(**self._move_to_device(model_kwargs))
+            with self._autocast():
+                outputs = self.model(**self._move_to_device(model_kwargs))
             for k in keys:
                 collected[k].append(outputs[k].float())
 
@@ -114,15 +122,24 @@ class ARPMPredictor:
         data_loader = self._create_dataloader(examples, is_test=True)
         ent_tensors = []
         for batch_dict in tqdm.tqdm(data_loader, desc='Predicting entities'):
-            outputs = self.model(**self._move_to_device(batch_dict))
+            with self._autocast():
+                outputs = self.model(**self._move_to_device(batch_dict))
             ent_tensors.append(outputs['ent_vectors'])
         return torch.cat(ent_tensors, dim=0)
 
     def _create_dataloader(self, examples: List[Example], is_test: bool) -> torch.utils.data.DataLoader:
         dataset = Dataset(path='', examples=examples, test_set=is_test)
         collate_fn = collate_entity if is_test else collate
+
+        # Entity encoding is cheap per item and can use a big batch; query encoding carries ~30
+        # sequences per query (anchors + candidates) and must keep the small --batch-size.
+        batch_size = self.batch_size
+        entity_bs = getattr(args, 'entity_batch_size', 0)
+        if is_test and entity_bs > 0:
+            batch_size = entity_bs * max(1, torch.cuda.device_count())
+
         return torch.utils.data.DataLoader(
-            dataset, num_workers=4, batch_size=self.batch_size,
+            dataset, num_workers=4, batch_size=batch_size,
             collate_fn=collate_fn, shuffle=False, pin_memory=self.use_cuda
         )
 

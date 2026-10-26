@@ -1,10 +1,17 @@
+import heapq
 import json
 import os
+import sys
 from collections import deque
 from dataclasses import dataclass
 from typing import List, Optional, Set, Tuple
 
 from ..setting.logger_config import logger
+
+
+def _intern(s):
+    """Intern strings so the many copies of an entity / relation id share one object (saves GBs on Wikidata5M)."""
+    return sys.intern(s) if isinstance(s, str) else s
 
 
 @dataclass
@@ -37,14 +44,16 @@ class TripletDict:
         with open(path, 'r', encoding='utf-8') as f:
             examples = json.load(f)
 
-        examples += [reverse_triplet(obj) for obj in examples]
+        # Forward and inverse triplets are inserted directly: no second list of dicts is built.
+        for obj in examples:
+            for ex in (obj, reverse_triplet(obj)):
+                rel = _intern(ex['relation'])
+                key = (_intern(ex['head_id']), rel)
+                self.relations.add(rel)
+                self.hr2tails.setdefault(key, set()).add(_intern(ex['tail_id']))
 
-        for ex in examples:
-            self.relations.add(ex['relation'])
-            key = (ex['head_id'], ex['relation'])
-            self.hr2tails.setdefault(key, set()).add(ex['tail_id'])
-
-        self.triplet_cnt = len(examples)
+        self.triplet_cnt = 2 * len(examples)
+        del examples
 
     def get_neighbors(self, head_id: str, relation: str) -> Set[str]:
         return self.hr2tails.get((head_id, relation), set())
@@ -112,16 +121,16 @@ class LinkGraph:
             examples = json.load(f)
 
         for ex in examples:
-            head_id, tail_id = ex['head_id'], ex['tail_id']
+            head_id, tail_id = _intern(ex['head_id']), _intern(ex['tail_id'])
             self.graph.setdefault(head_id, set()).add(tail_id)
             self.graph.setdefault(tail_id, set()).add(head_id)
+        del examples
 
         logger.info(f'Done build link graph with {len(self.graph)} nodes')
 
     def get_neighbor_ids(self, entity_id: str, max_to_keep: int = 10) -> List[str]:
-        """Returns sorted list of neighbor IDs (deterministic order)."""
-        neighbor_ids = self.graph.get(entity_id, set())
-        return sorted(neighbor_ids)[:max_to_keep]
+        """Returns the `max_to_keep` smallest neighbor IDs (== sorted(...)[:k], but O(n) for hub nodes)."""
+        return heapq.nsmallest(max_to_keep, self.graph.get(entity_id, ()))
 
     def get_n_hop_entity_indices(
             self,

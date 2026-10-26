@@ -67,6 +67,24 @@ def parse_args():
     g.add_argument('--full-eval-every-n-epochs', default=1, type=int)
     g.add_argument('--full-eval-batch-size', default=8, type=int)
 
+    # Large-scale settings (Wikidata5M). All defaults keep the old behaviour.
+    g = parser.add_argument_group('Large-scale (Wikidata5M)')
+    g.add_argument('--epoch-examples', default=0, type=int, dest='epoch_examples',
+                   help='>0: one "epoch" is a fixed chunk of this many training queries '
+                        '(scheduler / resume work per chunk). 0 = full pass over the data.')
+    g.add_argument('--compact-train', action='store_true', dest='compact_train',
+                   help='Keep train triples as numpy arrays and build Example objects lazily (saves RAM)')
+    g.add_argument('--entity-batch-size', default=0, type=int, dest='entity_batch_size',
+                   help='Per-GPU batch size for entity encoding at evaluation (0 = use --batch-size)')
+    g.add_argument('--eval-amp', action='store_true', dest='eval_amp',
+                   help='fp16 autocast for evaluation encoders')
+    g.add_argument('--max-eval-queries', default=0, type=int, dest='max_eval_queries',
+                   help='Evaluate on a random subset of this many queries per direction (0 = all)')
+    g.add_argument('--tune-queries', default=0, type=int, dest='tune_queries',
+                   help='With --tune-coefs: tune on a random subset of this many queries per direction')
+    g.add_argument('--tune-only', action='store_true', dest='tune_only',
+                   help='eval_wiki5m_trans: stop after coefficient tuning')
+
     # Loss
     g = parser.add_argument_group('Loss and Optimization')
     g.add_argument('--t', default=0.05, type=float)

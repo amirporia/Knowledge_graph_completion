@@ -41,6 +41,10 @@ wiki5m_id2text = DATASET_VARS['WiKi5m']['id2text']
 
 SUPPORTED_TASKS = {'wn18rr', 'fb15k237', 'wiki5m_trans', 'wiki5m_ind'}
 
+# Compact separators for the big Wikidata5M files (indent=4 would be ~2x larger on disk).
+COMPACT = {'ensure_ascii': False, 'separators': (',', ':')}
+PRETTY = {'ensure_ascii': False, 'indent': 4}
+
 
 # ============================================================================
 # Argument Parser Setup
@@ -303,7 +307,7 @@ def preprocess_wn18rr(path, num_workers: int, train_path: str):
                          train_path=train_path if train_path == path else None)
 
     out_path = path + '.json'
-    json.dump(examples, open(out_path, 'w', encoding='utf-8'), ensure_ascii=False, indent=4)
+    json.dump(examples, open(out_path, 'w', encoding='utf-8'), **PRETTY)
     print('Save {} examples to {}'.format(len(examples), out_path))
     return examples
 
@@ -339,7 +343,7 @@ def preprocess_fb15k237(path, num_workers: int, train_path: str):
                          train_path=train_path if train_path == path else None)
 
     out_path = path + '.json'
-    json.dump(examples, open(out_path, 'w', encoding='utf-8'), ensure_ascii=False, indent=4)
+    json.dump(examples, open(out_path, 'w', encoding='utf-8'), **PRETTY)
     print('Save {} examples to {}'.format(len(examples), out_path))
     return examples
 
@@ -356,15 +360,18 @@ def preprocess_wiki5m(path: str, num_workers: int, train_path: str) -> List[dict
     if not wiki5m_id2text:
         _load_wiki5m_id2text(path=os.path.join(os.path.dirname(path), 'wikidata5m_text.txt'))
 
-    lines = open(path, 'r', encoding='utf-8').readlines()
+    with open(path, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
 
     from functools import partial
-    process_func = partial(_process_line_wiki5m, id2ent=_load_wiki5m_id2ent)
+    # FIX: pass the id->name DICT (the old code passed the loader function, which crashes).
+    process_func = partial(_process_line_wiki5m, id2ent=wiki5m_id2ent)
 
     pool = Pool(processes=num_workers)
     examples = pool.map(process_func, lines)
     pool.close()
     pool.join()
+    del lines
 
     _normalize_relations(examples, normalize_fn=lambda rel_id: wiki5m_id2rel.get(rel_id, None),
                          train_path=train_path if train_path == path else None)
@@ -377,14 +384,16 @@ def preprocess_wiki5m(path: str, num_workers: int, train_path: str) -> List[dict
         examples = [ex for ex in examples if not _has_none_value(ex)]
     else:
         print('Invalid examples: {}'.format(json.dumps(invalid_examples, ensure_ascii=False, indent=4)))
+    del invalid_examples
 
     out_path = path + '.json'
-    json.dump(examples, open(out_path, 'w', encoding='utf-8'), ensure_ascii=False, indent=4)
+    with open(out_path, 'w', encoding='utf-8') as f:
+        json.dump(examples, f, **COMPACT)
     print('Save {} examples to {}'.format(len(examples), out_path))
     return examples
 
 
-def dump_all_entities(examples, out_path, id2text: dict):
+def dump_all_entities(examples, out_path, id2text: dict, compact: bool = False):
     id2entity = {}
     relations = set()
 
@@ -411,7 +420,7 @@ def dump_all_entities(examples, out_path, id2text: dict):
     print(f'Get {len(id2entity)} entities, {len(relations)} relations in total')
 
     with open(out_path, 'w', encoding='utf-8') as f:
-        json.dump(list(id2entity.values()), f, ensure_ascii=False, indent=4)
+        json.dump(list(id2entity.values()), f, **(COMPACT if compact else PRETTY))
 
 
 def get_entity_mapping(task: str) -> Dict:
@@ -468,9 +477,9 @@ def load_and_preprocess_data(args: Any):
     return all_examples, task_name
 
 
-def dump_entities_to_file(all_examples: List, output_dir: str, id2text: Dict) -> None:
+def dump_entities_to_file(all_examples: List, output_dir: str, id2text: Dict, compact: bool = False) -> None:
     output_path = os.path.join(output_dir, 'entities.json')
-    dump_all_entities(all_examples, out_path=output_path, id2text=id2text)
+    dump_all_entities(all_examples, out_path=output_path, id2text=id2text, compact=compact)
 
 
 def main():
@@ -485,7 +494,7 @@ def main():
     id2text = get_entity_mapping(task_name)
 
     output_dir = os.path.dirname(args.test_path)
-    dump_entities_to_file(all_examples, output_dir, id2text)
+    dump_entities_to_file(all_examples, output_dir, id2text, compact=task_name.startswith('wiki5m'))
 
     print('Done')
 

@@ -39,6 +39,10 @@ class Trainer:
     The coefficients c_h, c_p, c_s of S = S_q + c_h S_hrta + c_p S_p + c_s S_struct are NOT trained.
     They only enter the in-batch accuracy shown in the training log; the final values are tuned on
     the validation set by evaluation/evaluate.py (--tune-coefs).
+
+    Large datasets: with --epoch-examples N an "epoch" is a fixed chunk of N training queries taken
+    from one fixed permutation of the data (seeded by --seed), so the LR schedule and --resume work
+    per chunk and no query repeats until the whole dataset has been consumed.
     """
 
     def __init__(self, args, ngpus_per_node):
@@ -113,10 +117,15 @@ class Trainer:
             report_num_trainable_parameters(model_obj)
 
     def _init_data_loaders(self):
-        self.train_dataset = Dataset(path=self.args.train_path, test_set=False)
-        self.train_loader, self.train_sampler = self._create_data_loader(
-            self.train_dataset, shuffle=True, drop_last=True, distributed=self.args.distributed
-        )
+        self.train_dataset = Dataset(path=self.args.train_path, test_set=False,
+                                     compact=self.args.compact_train)
+
+        # With --epoch-examples the loader is rebuilt for every chunk (see _epoch_loader).
+        self.train_loader, self.train_sampler = None, None
+        if self.args.epoch_examples <= 0:
+            self.train_loader, self.train_sampler = self._create_data_loader(
+                self.train_dataset, shuffle=True, drop_last=True, distributed=self.args.distributed
+            )
 
         self.valid_dataset = None
         self.valid_loader = None
@@ -139,9 +148,32 @@ class Trainer:
         )
         return loader, sampler
 
+    def _epoch_loader(self, epoch):
+        """Loader (and sampler) of one epoch: the whole dataset, or the epoch's fixed chunk."""
+        k, n = self.args.epoch_examples, len(self.train_dataset)
+        if k <= 0 or k >= n:
+            return self.train_loader, self.train_sampler
+
+        if not hasattr(self, '_perm'):
+            g = torch.Generator()
+            g.manual_seed(1234 + (self.args.seed or 0))
+            self._perm = torch.randperm(n, generator=g)
+
+        start = (epoch * k) % n
+        idx = self._perm[start:start + k]
+        if idx.numel() < k:  # wrap around
+            idx = torch.cat([idx, self._perm[:k - idx.numel()]])
+
+        subset = torch.utils.data.Subset(self.train_dataset, idx.tolist())
+        return self._create_data_loader(subset, shuffle=True, drop_last=True,
+                                        distributed=self.args.distributed)
+
     def _init_scheduler(self):
         world_size = self.args.world_size if self.args.distributed else 1
-        steps_per_epoch = len(self.train_dataset) // world_size // max(self.args.batch_size, 1)
+        n_train = len(self.train_dataset)
+        if self.args.epoch_examples > 0:
+            n_train = min(n_train, self.args.epoch_examples)
+        steps_per_epoch = n_train // world_size // max(self.args.batch_size, 1)
         num_training_steps = self.args.epochs * steps_per_epoch
 
         self.args.warmup = min(self.args.warmup, num_training_steps // 10)
@@ -193,18 +225,19 @@ class Trainer:
             self._run_eval(epoch=epoch)
 
     def train_epoch(self, epoch):
+        loader, sampler = self._epoch_loader(epoch)
         if self.args.distributed:
-            self.train_sampler.set_epoch(epoch)
+            sampler.set_epoch(epoch)
 
         meters = self._init_training_meters()
         progress = ProgressMeter(
-            len(self.train_loader),
+            len(loader),
             [meters['losses'], meters['query_losses'], meters['hrta_losses'], meters['proto_losses'],
              meters['struct_losses'], meters['inv_t'], meters['top1'], meters['top3']],
             prefix=f"Epoch: [{epoch}]"
         )
 
-        for i, batch_dict in enumerate(self.train_loader):
+        for i, batch_dict in enumerate(loader):
             self.model.train()
             batch_dict = self._move_batch_to_device(batch_dict)
 

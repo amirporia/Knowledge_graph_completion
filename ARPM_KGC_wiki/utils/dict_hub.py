@@ -10,10 +10,35 @@ from ..setting.logger_config import logger
 
 # Module-level singletons
 _train_triplet_dict: Optional[TripletDict] = None
-_all_triplet_dict: Optional[TripletDict] = None
+_all_triplet_dict = None
 _link_graph: Optional[LinkGraph] = None
 _entity_dict: Optional[EntityDict] = None
 _tokenizer: Optional[AutoTokenizer] = None
+
+
+class _OverlayTripletDict:
+    """train + valid/test triplets without a second copy of the (huge) training graph.
+
+    Behaves like the TripletDict that used to be built from every `*.txt.json` of the data folder:
+    `get_neighbors` returns the union of both parts.
+    """
+
+    def __init__(self, base: TripletDict, extra: TripletDict) -> None:
+        self.base = base
+        self.extra = extra
+
+    def get_neighbors(self, head_id: str, relation: str):
+        a = self.base.get_neighbors(head_id, relation)
+        b = self.extra.get_neighbors(head_id, relation)
+        return (a | b) if b else a
+
+    @property
+    def hr2tails(self):
+        """Merged mapping; only used by the small-dataset evaluation path (builds a shallow copy)."""
+        merged = dict(self.base.hr2tails)
+        for key, tails in self.extra.hr2tails.items():
+            merged[key] = (merged[key] | tails) if key in merged else tails
+        return merged
 
 
 def _init_entity_dict() -> None:
@@ -36,7 +61,11 @@ def _init_all_triplet_dict() -> None:
         path_pattern = os.path.join(
             os.path.dirname(args.train_path), '*.txt.json'
         )
-        _all_triplet_dict = TripletDict(path_list=glob.glob(path_pattern))
+        train_abs = os.path.abspath(args.train_path)
+        extra_paths = [p for p in glob.glob(path_pattern) if os.path.abspath(p) != train_abs]
+        _all_triplet_dict = _OverlayTripletDict(
+            get_train_triplet_dict(), TripletDict(path_list=extra_paths)
+        )
 
 
 def _init_link_graph() -> None:
@@ -68,7 +97,7 @@ def get_train_triplet_dict() -> TripletDict:
     return _train_triplet_dict
 
 
-def get_all_triplet_dict() -> TripletDict:
+def get_all_triplet_dict():
     _init_all_triplet_dict()
     return _all_triplet_dict
 
