@@ -1,272 +1,357 @@
 # ARPM-KGC: Adaptive Relation-Aware Prototype Memory for Knowledge Graph Completion
 
-A reference implementation of **ARPM-KGC**, a text-based knowledge graph completion (KGC) model that extends relation-aware anchor retrieval with query-conditioned anchor selection, multi-prototype semantic memory, adaptive structural (hop-distance) memory, and an adaptive gate that controls how strongly each memory source influences the final prediction.
+Reference implementation of **ARPM-KGC**, a text-based knowledge graph completion (KGC) model that extends the relation-aware anchor framework of Yuan et al. (2025) [RAA-KGC]. For a query $(h, r, ?)$ it retrieves a bounded pool of relation-aware anchors from the **training graph only**, and turns that pool into two compact memories: a **multi-prototype semantic memory** and a **hop-aware structural memory**. Both are scored against every candidate entity and added, with constant weights tuned on the validation split, to the dual-encoder score.
 
-The method builds on the relation-aware anchor enhancement framework of Yuan et al. (2025) [RAA-KGC] and is evaluated under the standard filtered-ranking KGC protocol on WN18RR, FB15k-237, and Wikidata5M.
+Evaluation follows the standard filtered-ranking protocol (MRR, Hits@1/3/10/50, mean rank) on WN18RR, FB15k-237 and Wikidata5M.
 
 ## Contents
 
 - [Overview](#overview)
 - [Requirements](#requirements)
-- [Repository Structure](#repository-structure)
-- [Data Preparation](#data-preparation)
-- [Proposal-to-Code Mapping](#proposal-to-code-mapping)
+- [Repository structure](#repository-structure)
+- [Data preparation](#data-preparation)
 - [Usage](#usage)
-- [Hyperparameters](#hyperparameters)
-- [Ablation Study](#ablation-study)
-- [Checkpoint Selection](#checkpoint-selection)
-- [Design Decisions and Implementation Notes](#design-decisions-and-implementation-notes)
-- [Validation Performed](#validation-performed)
+- [Hyperparameters and flags](#hyperparameters-and-flags)
+- [Score coefficients](#score-coefficients)
+- [Ablation study](#ablation-study)
+- [Checkpoints and model selection](#checkpoints-and-model-selection)
+- [Outputs](#outputs)
+- [Implementation notes](#implementation-notes)
+- [Method-to-code mapping](#method-to-code-mapping)
+- [Known limitations](#known-limitations)
 - [Citation](#citation)
-- [Acknowledgements](#acknowledgements)
-- [License](#license)
 
 ## Overview
 
-Given a query $(h, r, ?)$, ARPM-KGC retrieves a bounded pool of relation-aware anchor triples from the training graph, both from the local neighborhood of $h$ (at graph distances $1, \dots, N$) and from the global set of relation-$r$ triples. It then makes four query-conditioned decisions over that pool:
+Given a query $(h, r, ?)$, ARPM-KGC builds a candidate pool $\mathcal{A}(h,r) = \mathcal{A}_{\text{local}}(h,r) \cup \mathcal{A}_{\text{global}}(r)$:
 
-1. **Anchor selection (RQ1).** Which anchors are relevant to this query, via query-conditioned attention weights $\alpha_i$ rather than uniform or random sampling.
-2. **Prototype organization (RQ2).** Which distinct semantic modes the selected anchors represent, via $K$ learned prototype vectors instead of a single averaged memory vector.
-3. **Structural aggregation (RQ3).** Which graph-hop distances provide useful evidence, via a learned, hop-availability-masked weighting over per-hop structural memories.
-4. **Memory gating (RQ4).** How strongly semantic and structural memory should influence the final score, via two independent, query-conditioned gates $\lambda_p, \lambda_s$.
+- **Local anchors** come from the neighbourhood of $h$ in the training graph, tagged with a hop slot: hop-0 = other known tails of the same $(h,r)$, hop-$\ell$ = a head at graph distance $\ell$ that has relation $r$ (up to `--num-hops`).
+- **Global anchors** are random relation-$r$ training pairs with a different head (tagged `NO_HOP = -1`).
 
-The final score is additive and does not modify the query representation:
+Each anchor is represented by its tail embedding $E_1(t_i)$. Over this pool the model makes three query-conditioned decisions:
+
+1. **Anchor selection (RQ1).** Attention weights $\alpha_i = \mathrm{softmax}_i\big(a_i^\top W q / \tau_r\big)$ decide which anchors matter for this query.
+2. **Prototype organisation (RQ2).** `ProtoGen` builds $K$ query-conditioned prototypes $p_k$ from the weighted anchors (bilinear attention per slot) instead of one averaged vector.
+3. **Structural aggregation (RQ3).** Per-hop memories $m^{(\ell)}$ are combined with learned, hop-availability-masked weights $\beta_\ell = \mathrm{softmax}(G_{\text{hop}}(q))$ into $m_{\text{struct}}$.
+
+The final ranking score is
 
 $$
-S(t \mid h, r) = S_q(t) + \lambda_p S_p(t) + \lambda_s S_{\text{struct}}(t)
+S(t \mid h,r) \;=\; S_q(t) \;+\; c_h\, S_{\text{hrta}}(t) \;+\; c_p\, S_p(t) \;+\; c_s\, S_{\text{struct}}(t)
 $$
 
-so a query for which memory is unhelpful degrades gracefully to the underlying query–entity similarity, with both gates independently discardable.
+| Term | Definition |
+| --- | --- |
+| $S_q$ | $\cos(q, e_t)$, the (head, relation) query against the entity embedding |
+| $S_{\text{hrta}}$ | $\cos(q_{\text{hrta}}, e_t)$, the RAA-KGC anchor-enhanced query (mean of $E_0(h,r,t_i)$ over up to `--anchor-num` hop-0 anchors; falls back to $q$) |
+| $S_p$ | $\tau_p\big(\log\sum_k \exp(\cos(p_k, e_t)/\tau_p) - \log K\big)$, a soft maximum over prototypes |
+| $S_{\text{struct}}$ | $\cos(m_{\text{struct}}, e_t)$ |
+
+**$c_h, c_p, c_s$ are constants, not learned.** They are chosen by a grid search on the *validation* split (`--tune-coefs`) or given explicitly (`--coef-h/--coef-p/--coef-s`). With $c_h = 1,\ c_p = c_s = 0$ the model reduces exactly to the RAA-KGC inference rule, which makes the baseline a special case of the same checkpoint. Queries whose memory is empty contribute exactly 0 for the missing term, so they degrade gracefully to the query/RAA score.
+
+> **Version note.** An earlier revision of this repository described a learned memory gate $G_\lambda$ (with $\lambda_p, \lambda_s$), an auxiliary $\mathcal{L}_{\text{combined}}$, and Gumbel-based discrete gating. None of these exist in the current code. Checkpoints containing `memory_gate.*` weights come from that revision and cannot be loaded.
 
 ## Requirements
 
 - Python 3.8+
-- PyTorch (tested under 1.12+ and 2.x)
-- `transformers` (`AutoModel`, `AutoConfig`, `AutoTokenizer`, and the linear/cosine warmup schedulers)
-- `tqdm`
+- PyTorch 2.x (2.3+ recommended; the code uses `torch.amp.autocast` and `device_id` in `init_process_group`)
+- `transformers`, `tqdm`
 
-No specific package versions are pinned in this repository; any reasonably recent combination of the above is expected to work. GPU training additionally requires CUDA and, for multi-GPU runs, `torch.distributed`/`torchrun`.
-
-## Repository Structure
-
-```
-ARPM_KGC/
-  setting/      config.py, logger_config.py
-  utils/        triplet.py, dict_hub.py, candidate_pool.py, doc.py, triplet_mask.py, utils.py
-  model/        modules.py, models.py, trainer.py
-  evaluation/   metric.py, predict.py, evaluate.py, eval_wiki5m_trans.py
-  preprocess/   preprocess.py
-  main.py
-```
-
-## Data Preparation
-
-From the directory that *contains* `ARPM_KGC/`, run:
+No versions are pinned. A CUDA GPU is strongly recommended; multi-GPU training works either through `torchrun` (DDP) or, when launched with plain `python` on a multi-GPU machine, `nn.DataParallel`.
 
 ```bash
-python -m ARPM_KGC.preprocess.preprocess --task wn18rr
+pip install torch transformers tqdm
 ```
 
-This produces the tokenized triple files and `entities.json` under `data/<TASK>/` expected by `utils/dict_hub.py` and `utils/doc.py`. The same command works for `fb15k237`, `wiki5m_trans`, and `wiki5m_ind`.
+## Repository structure
 
-## Proposal-to-Code Mapping
+The Python package folder is `ARPM_KGC_DataParallel_original/`; all commands below are run **from the directory that contains it** (the repository root), with `data/` next to it. (You may rename the folder, just replace the name in the commands.)
 
-| Proposal section | Defines | Implementation |
-| --- | --- | --- |
-| Relation-Aware Candidate Memory | $\mathcal{A}_{\text{local}}(h,r)$, $\mathcal{A}_{\text{global}}(r)$, budget $M$ | `utils/candidate_pool.py::CandidatePoolBuilder`, `utils/triplet.py::LinkGraph.get_hop_layers` |
-| Query-Conditioned Anchor Selection (RQ1) | $\alpha_i$, weighted anchor set $\mathcal{W}_q$ | `model/models.py::ARPMModel._build_memory` |
-| Diversity Regularization | $\mathcal{L}_{\text{div}}$ | `model/modules.py::diversity_loss` |
-| Multi-Prototype Semantic Memory (RQ2) | `ProtoGen`, prototypes $p_k$ | `model/modules.py::ProtoGen` |
-| Adaptive Structural Memory (RQ3) | $m^{(\ell)}$, $G_{\text{hop}}$, $\beta_\ell$, $m_{\text{struct}}$, empty-hop safeguards | `model/models.py::ARPMModel._structural_memory`, `model/modules.py::HopScorer` |
-| Adaptive Memory-Aware Tail Prediction (RQ4) | $S_q, S_p, S_{\text{struct}}$, $G_\lambda$, $S(t\mid h,r)$ | `model/models.py::ARPMModel.score_query/score_prototypes/score_struct/combined_score`, `model/modules.py::MemoryGate` |
-| Training Objective, plus $\mathcal{L}_{\text{combined}}$ (added here; see [Design Decisions](#training-the-memory-gate)) | $\mathcal{L} = \mathcal{L}_{\text{query}} + \eta_p \mathcal{L}_{\text{proto}} + \eta_s \mathcal{L}_{\text{struct}} + \eta_{\text{div}} \mathcal{L}_{\text{div}} + \eta_c \mathcal{L}_{\text{combined}}$ | `model/trainer.py::Trainer._compute_losses` |
-| Discrete anchor gating (A11) | $c_i^{\text{ST}}$ | `model/modules.py::gumbel_sigmoid_gate` |
-| Discrete hop selection (A12) | $\beta_\ell^{\text{ST}}$, top-$k$ | `model/modules.py::gumbel_softmax_topk` |
-| Discrete prototype gating (A13) | $\omega_k^{\text{ST}}$ | `model/modules.py::gumbel_sigmoid_slot_gate`, `PrototypeActivationScorer` |
-| Memory Gate Analysis | Per-query $\lambda_p, \lambda_s$ | `evaluation/evaluate.py::_save_prediction_details` (written to `task_hrt_*.json`) |
+```
+Knowledge_graph_completion/
+  data/<task>/                      # created by you / by preprocessing
+  ARPM_KGC_DataParallel_original/
+    setting/      config.py, logger_config.py
+    utils/        triplet.py, dict_hub.py, candidate_pool.py, doc.py, triplet_mask.py, utils.py
+    model/        modules.py, models.py, trainer.py
+    evaluation/   metric.py, predict.py, evaluate.py, eval_wiki5m_trans.py
+    preprocess/   preprocess.py
+    main.py
+```
 
-`Example.vectorize(test=True)` produces the query encoding $E_0(h, r)$; `vectorize(test=False)` produces the anchor encoding $E_0(h_i, r, t_i)$. Both are reused unchanged from the underlying dual-encoder pipeline; only *which* triplets are vectorized as anchors changes.
+## Data preparation
+
+Put the raw files under `data/<task>/` at the repository root:
+
+| Task | Required raw files |
+| --- | --- |
+| `wn18rr` | `train.txt`, `valid.txt`, `test.txt`, `wordnet-mlj12-definitions.txt` |
+| `fb15k237` | `train.txt`, `valid.txt`, `test.txt`, `FB15k_mid2description.txt`, `FB15k_mid2name.txt` |
+| `wiki5m_trans` / `wiki5m_ind` | `train/valid/test.txt`, `wikidata5m_entity.txt`, `wikidata5m_relation.txt`, `wikidata5m_text.txt` (see `download_wikidata5m.sh` in `SimKGC_Restructured/scripts/` or `HaSa_Restructured/scripts/`) |
+
+Then run:
+
+```bash
+python -m ARPM_KGC_DataParallel_original.preprocess.preprocess --task wn18rr
+# also: fb15k237, wiki5m_trans, wiki5m_ind
+```
+
+This writes `train/valid/test.txt.json`, `entities.json` and `relations.json` into `data/<task>/`, which `utils/dict_hub.py` and `utils/doc.py` read. The preprocessing output is shared with the other packages in this repository.
 
 ## Usage
 
+### Train (single GPU)
+
+The command below uses the settings of our WN18RR experiments:
+
 ```bash
-# Train (core model, all defaults from the proposal)
-python -m ARPM_KGC.main --task wn18rr
-
-# Evaluate the best checkpoint (filtered ranking: MRR, Hits@1/3/10/50)
-python -m ARPM_KGC.evaluation.evaluate --task wn18rr --is-test
-
-# Large-scale wiki5m_trans (sharded entity embeddings)
-python -m ARPM_KGC.evaluation.eval_wiki5m_trans --task wiki5m_trans --is-test
-
-# Multi-GPU training via torchrun
-torchrun --nproc_per_node=2 -m ARPM_KGC.main --task wn18rr
+python -m ARPM_KGC_DataParallel_original.main \
+  --task wn18rr \
+  --model-dir data/wn18rr/checkpoint_arpm \
+  --pretrained-model bert-base-uncased --pooling mean --max-num-tokens 50 \
+  --epochs 20 --batch-size 32 --lr 5e-5 --memory-lr 1e-4 --wd 1e-4 \
+  --warmup 400 --grad-clip 10 --t 0.05 --additive-margin 0.02 --alpha 0.2 \
+  --anchor-num 4 --num-hops 2 --num-prototypes 4 \
+  --local-per-hop-budget 5 --global-budget 10 --anchor-budget 25 \
+  --eta-proto 0.1 --eta-struct 0.1 --eta-pdiv 0.01 --eta-div 0 \
+  --rerank-n-hop 2 --neighbor-weight 0.05 \
+  --use-amp --workers 4 --seed 42
 ```
 
-All standard training flags (`--batch-size`, `--lr`, `--epochs`, `--pretrained-model`, `--pooling`, `--use-amp`, ...) are supported identically across single- and multi-GPU runs.
+Settings used for FB15k-237 in our evaluation runs differ in the memory budget: `--num-prototypes 2 --global-budget 5 --anchor-budget 20 --num-hops 2 --rerank-n-hop 2` (training lr/epochs for FB15k-237 should mirror your baseline runs).
 
-## Hyperparameters
+`--finetune-t` and `--use-self-negative` are on by default (disable with `--no-finetune-t`, `--no-use-self-negative`).
+
+### Train (multi-GPU)
+
+```bash
+torchrun --nproc_per_node=2 -m ARPM_KGC_DataParallel_original.main --task wn18rr <same flags>
+```
+
+`--batch-size` is **per process** under `torchrun` (each rank draws in-batch negatives from its own batch). With plain `python` on a multi-GPU machine, `nn.DataParallel` is used and `--batch-size` is the global batch.
+
+### Resume
+
+Add `--resume` (optionally `--resume-path`; default `<model-dir>/model_last.mdl`). Resumption is at **epoch granularity**: the model, optimizer, scheduler and AMP scaler are restored and training continues with the next epoch; a partially finished epoch is not replayed. This makes it easy to train on time-limited machines: stop the job at any point, keep `model_last.mdl`, and restart with `--resume`.
+
+### Evaluate
+
+Evaluation reads the checkpoint's own training arguments (model, candidate-pool settings, link graph), but `--max-num-tokens`, `--neighbor-weight`, `--rerank-n-hop`, `--batch-size` come from the command line, so pass the **same values as in training**.
+
+```bash
+EVAL_FLAGS="--task wn18rr --eval-model-path data/wn18rr/checkpoint_arpm/model_last.mdl \
+  --pretrained-model bert-base-uncased --pooling mean --max-num-tokens 50 \
+  --batch-size 32 --is-test --seed 42 --workers 4 \
+  --rerank-n-hop 2 --neighbor-weight 0.05"
+
+# 1) tune (c_h, c_p, c_s) on the VALIDATION split (refuses a path containing "test").
+#    Writes best_coefs.json next to the checkpoint.
+python -m ARPM_KGC_DataParallel_original.evaluation.evaluate $EVAL_FLAGS --tune-coefs \
+  --coef-h-grid 0 0.5 1 1.5 --coef-p-grid 0 0.1 0.25 0.5 1 --coef-s-grid 0 0.1 0.25 0.5 1
+
+# 2) evaluate the TEST split once. best_coefs.json is picked up automatically
+python -m ARPM_KGC_DataParallel_original.evaluation.evaluate $EVAL_FLAGS \
+  --valid-path data/wn18rr/test.txt.json
+```
+
+Coefficient resolution order (`evaluation/evaluate.py::resolve_coefs`): (1) `--tune-coefs`; (2) explicit `--coef-h/--coef-p/--coef-s` (any unset one falls back to `DEFAULT_COEFS = (1.0, 0.1, 0.1)`); (3) `best_coefs.json` next to the checkpoint when no coefficient was given; (4) `DEFAULT_COEFS`. To bypass the file and fix the weights, pass all three explicitly:
+
+```bash
+python -m ARPM_KGC_DataParallel_original.evaluation.evaluate $EVAL_FLAGS \
+  --valid-path data/wn18rr/test.txt.json --coef-h 1 --coef-p 0.3 --coef-s 0.2
+```
+
+### Large-scale `wiki5m_trans`
+
+```bash
+python -m ARPM_KGC_DataParallel_original.evaluation.eval_wiki5m_trans --task wiki5m_trans --is-test \
+  --eval-model-path <ckpt> --valid-path data/wiki5m_trans/test.txt.json
+```
+
+Entity embeddings are computed and stored in shards of 1M entities (`shard_<i>` in `--model-dir`) and then concatenated on the GPU.
+
+## Hyperparameters and flags
+
+Defaults are those of `setting/config.py`.
+
+### Candidate pool and memory
 
 | Flag | Meaning | Default |
-| --- | --- |---------|
-| `--num-hops` | $N$: max graph distance beyond hop-0, yielding $N+1$ local categories (hop-0 .. hop-$N$) | 2       |
-| `--num-prototypes` | $K$: semantic prototypes, one of $\{1,2,4,8\}$ | 4       |
-| `--local-per-hop-budget` | Max local anchors sampled per hop (including hop-0) | 5       |
-| `--global-budget` | Max global anchors sampled from $\mathcal{T}_r$ | 10      |
-| `--anchor-budget` | $M$: total candidate-pool cap after merging local and global | 20      |
-| `--retrieval-temperature` | $\tau_r$: softmax temperature for anchor weights $\alpha_i$ | 0.1     |
-| `--proto-temperature` | $\tau_p$: log-sum-exp pooling temperature for $S_p(t)$ | 0.1     |
-| `--eta-proto` | $\eta_p$: weight of $\mathcal{L}_{\text{proto}}$ | 0.1     |
-| `--eta-struct` | $\eta_s$: weight of $\mathcal{L}_{\text{struct}}$ | 0.1     |
-| `--eta-div` | $\eta_{\text{div}}$: weight of $\mathcal{L}_{\text{div}}$ | 0.01    |
-| `--eta-combined` | $\eta_c$: weight of $\mathcal{L}_{\text{combined}}$, the sole loss term that trains $G_\lambda$ (see [Design Decisions](#training-the-memory-gate)) | 0.1     |
-| `--disable-link-graph` | Disable local candidates entirely (equivalent to ablation A7) | off     |
-| `--checkpoint-metric` | Metric used for best-checkpoint selection ([details](#checkpoint-selection)) | `mrr`   |
-| `--full-eval-every-n-epochs` | Cadence of the full filtered-ranking validation pass | 1       |
-| `--full-eval-batch-size` | Batch size for the full validation pass | 8       |
-
-## Ablation Study
-
-Every row of the ablation table is reachable with a single flag, no code changes required.
-
-| Ablation | Description | Command |
 | --- | --- | --- |
-| A1  | Random anchors instead of query-conditioned selection | `--random-anchor-selection` |
-| A2  | No diversity regularization | `--eta-div 0` |
-| A3  | Single prototype | `--num-prototypes 1` |
-| A4  | Fixed vs. adaptive prototype count | compare default (fixed $K$) against A13 |
-| A5  | Fixed/uniform hop weighting | `--uniform-hop-weighting` |
-| A6  | No global relation memory | `--global-budget 0` |
-| A7  | No local structural memory | `--disable-link-graph` |
-| A8  | Fixed (non-adaptive) $\lambda_p, \lambda_s$ | `--fixed-lambda-p 0.5 --fixed-lambda-s 0.5` |
-| A9  | No $S_p$ term | `--fixed-lambda-p 0` |
-| A10 | No $S_{\text{struct}}$ term | `--fixed-lambda-s 0` |
-| A11 | Gumbel-Sigmoid anchor gating | `--use-gumbel-anchor` |
-| A12 | Gumbel-Softmax hop selection | `--use-gumbel-hop` |
-| A13 | Gumbel-Sigmoid prototype slot gating | `--use-gumbel-proto` |
-| Full | All core components | (defaults) |
+| `--anchor-num` | Number of hop-0 anchors for the RAA anchor-enhanced query $q_{\text{hrta}}$ (0 disables $S_{\text{hrta}}$) | 4 |
+| `--num-hops` | $N$: max graph distance of local anchors; yields $N+1$ hop slots (hop-0 … hop-$N$) | 5 |
+| `--num-prototypes` | $K$ semantic prototypes (recommended $\in\{1,2,4,8\}$) | 4 |
+| `--local-per-hop-budget` | Max local anchors per hop slot (incl. hop-0) | 5 |
+| `--global-budget` | Max global (different-head) relation-$r$ anchors | 5 |
+| `--anchor-budget` | $M$: cap on the merged pool (hop-0 anchors are never dropped by it) | 20 |
+| `--retrieval-temperature` | $\tau_r$ of the anchor attention $\alpha_i$ | 0.1 |
+| `--proto-temperature` | $\tau_p$ of the log-sum-exp pooling in $S_p$ | 0.1 |
+| `--proto-attn-temperature` | Temperature of the per-prototype attention inside `ProtoGen` | 0.5 |
+| `--eps-struct` | $\epsilon$ in the per-hop weighted mean | 1e-6 |
+| `--disable-link-graph` | Turn the link graph off (see [Ablations](#ablation-study)); **on by default** | off |
 
-```bash
-python -m ARPM_KGC.main --task wn18rr --random-anchor-selection        # A1
-python -m ARPM_KGC.main --task wn18rr --eta-div 0                      # A2
-python -m ARPM_KGC.main --task wn18rr --num-prototypes 1               # A3
-python -m ARPM_KGC.main --task wn18rr --uniform-hop-weighting          # A5
-python -m ARPM_KGC.main --task wn18rr --global-budget 0                # A6
-python -m ARPM_KGC.main --task wn18rr --disable-link-graph             # A7
-python -m ARPM_KGC.main --task wn18rr --fixed-lambda-p 0.5 --fixed-lambda-s 0.5  # A8
-python -m ARPM_KGC.main --task wn18rr --fixed-lambda-p 0               # A9
-python -m ARPM_KGC.main --task wn18rr --fixed-lambda-s 0               # A10
-python -m ARPM_KGC.main --task wn18rr --use-gumbel-anchor              # A11
-python -m ARPM_KGC.main --task wn18rr --use-gumbel-hop                 # A12
-python -m ARPM_KGC.main --task wn18rr --use-gumbel-proto               # A13
-python -m ARPM_KGC.main --task wn18rr                                  # Full
-```
+### Losses
 
-An additional diagnostic control, not part of the proposal's ablation table, freezes the memory gate at random initialization:
+$\mathcal{L} = \mathcal{L}_{\text{query}} + \alpha\,\mathcal{L}_{\text{hrta}} + \eta_p \mathcal{L}_{\text{proto}} + \eta_s \mathcal{L}_{\text{struct}} + \eta_{\text{div}} \mathcal{L}_{\text{div}} + \eta_{\text{pdiv}} \mathcal{L}_{\text{pdiv}}$
 
-```bash
-python -m ARPM_KGC.main --task wn18rr --eta-combined 0
-```
+| Flag | Meaning | Default |
+| --- | --- | --- |
+| `--alpha` | $\alpha$: weight of $\mathcal{L}_{\text{hrta}}$ (as in RAA-KGC) | 0.2 |
+| `--eta-proto` | $\eta_p$: weight of $\mathcal{L}_{\text{proto}}$ | 0.1 |
+| `--eta-struct` | $\eta_s$: weight of $\mathcal{L}_{\text{struct}}$ | 0.1 |
+| `--eta-div` | $\eta_{\text{div}}$: anchor-diversity loss (**off** by default) | 0.0 |
+| `--eta-pdiv` | $\eta_{\text{pdiv}}$: prototype-specialisation loss (cosine between prototypes) | 0.01 |
+| `--t` | Initial temperature of $\mathcal{L}_{\text{query}}$/$\mathcal{L}_{\text{hrta}}$ (learnable unless `--no-finetune-t`) | 0.05 |
+| `--t-mem` | Initial temperature of $\mathcal{L}_{\text{proto}}$/$\mathcal{L}_{\text{struct}}$ (learnable unless `--no-finetune-t-mem`; inverse temperature clamped to $[1,100]$) | 0.05 |
+| `--additive-margin` | Margin $\gamma$ on positives | 0.02 |
+| `--use-self-negative` / `--no-use-self-negative` | Add the head entity as an extra negative for $S_q$ | on |
 
-This is useful for confirming that $\mathcal{L}_{\text{combined}}$ is necessary, not merely sufficient, for $\lambda_p, \lambda_s$ to move from their initial values (see [Validation Performed](#validation-performed)); it is not the intended operating point for any reported result, since ablation A8 and the Memory Gate Analysis both presuppose a trained gate.
+### Optimisation and training
 
-## Checkpoint Selection
+| Flag | Meaning | Default |
+| --- | --- | --- |
+| `--lr` | LR of the two BERT encoders and the main temperature | 5e-5 |
+| `--memory-lr` | LR of the small memory modules (anchor projection, prototypes, hop scorer, memory temperatures); they train from scratch. Our runs use 1e-4 | 1e-3 |
+| `--wd` | Weight decay (memory modules use 0) | 1e-4 |
+| `--epochs`, `-b/--batch-size` | | 20, 32 |
+| `--lr-scheduler` | `linear` or `cosine` | linear |
+| `--warmup` | Warm-up steps (capped to 10% of all steps) | 400 |
+| `--grad-clip` | | 10 |
+| `--pooling` | `cls`, `mean`, `max` | mean |
+| `--use-amp` | Mixed precision | off |
+| `--seed`, `-j/--workers`, `-p/--print-freq`, `--gpu` | | None, 4, 20, 0 |
 
-Best-checkpoint selection uses the **same filtered-ranking protocol as final evaluation** — forward and backward MRR/Hits@1/3/10/50 against the full entity dictionary (`evaluation/evaluate.py::evaluate_predictor`, wrapped around the in-memory model via `ARPMPredictor.from_model`) — rather than a cheap in-batch proxy.
+### Model management and evaluation
 
-This distinction matters because in-batch accuracy (distinguishing the correct tail from the other tails present in the same mini-batch) and filtered ranking (distinguishing the correct tail from the entire entity dictionary, with known correct alternatives masked out) are tasks of different difficulty; a checkpoint selected on the former can be a poor choice under the latter.
+| Flag | Meaning | Default |
+| --- | --- | --- |
+| `--model-dir` | Checkpoint directory | `data/<task>/checkpoint_arpm_v2` |
+| `--eval-model-path` | Checkpoint used by evaluation | `<model-dir>/model_best.mdl` |
+| `--checkpoint-metric` | Validation metric for `model_best.mdl` (`mrr`, `hit@1/3/10/50`) | mrr |
+| `--full-eval-every-n-epochs` | Cadence of the full filtered-ranking validation | 1 |
+| `--full-eval-batch-size` | Batch size of that validation pass | 8 |
+| `--eval-every-n-step` | Mid-epoch checkpoint cadence (saves `model_last.mdl` only, no validation) | 0 |
+| `--resume`, `--resume-path` | See [Resume](#resume) | off |
+| `--rerank-n-hop`, `--neighbor-weight` | SimKGC-style graph re-ranking bonus, evaluation only (`--neighbor-weight 0` disables it) | 5, 0.05 |
+| `--is-test` | Evaluation mode | off |
 
-- `Trainer.eval_epoch` runs every epoch and logs `Acc@1`/`Acc@3`/`loss` computed in-batch. This is a cheap training-health signal, explicitly logged as **not used for checkpoint selection**, and never updates `best_metric`.
-- `Trainer._compute_full_validation_metrics` runs the real protocol at epoch boundaries: it wraps the current in-memory model as a predictor, encodes every entity, and calls the same `evaluate_predictor` used by the standalone `evaluation/evaluate.py` script (with `save_details=False` to avoid writing per-query prediction files every epoch). Its output — `mean_rank`, `mrr`, `hit@1/3/10/50` — determines `is_best` via `--checkpoint-metric` (default `mrr`).
-- Because encoding the full entity dictionary every epoch is expensive for large graphs, this pass only runs at epoch boundaries and only every `--full-eval-every-n-epochs` epochs. Skipped epochs still checkpoint `model_last.mdl` for resuming, but never overwrite `model_best.mdl`.
+## Score coefficients
 
-`evaluation/predict.py::ARPMPredictor.from_model` and `evaluation/evaluate.py::evaluate_predictor`/`save_details` are shared between the trainer and the standalone evaluation scripts, so there is exactly one code path computing MRR/Hits@k.
+| Flag | Meaning | Default when unset |
+| --- | --- | --- |
+| `--coef-h`, `--coef-p`, `--coef-s` | $c_h, c_p, c_s$ | 1.0, 0.1, 0.1 |
+| `--tune-coefs` | Grid search by average MRR on `--valid-path`, saved to `best_coefs.json` | off |
+| `--coef-h-grid`, `--coef-p-grid`, `--coef-s-grid` | Search grids | `0 0.5 1 1.5` / `0 0.1 0.25 0.5 1` / `0 0.1 0.25 0.5 1` |
 
-## Design Decisions and Implementation Notes
+All grid points are scored from the same cached $S_q, S_{\text{hrta}}, S_p, S_{\text{struct}}$ matrices, so a large grid is cheap relative to the encoding pass. The tool warns when the best value sits at the upper edge of its grid. Always tune on the validation split and run the test split once afterwards. During training, the in-batch accuracy shown in the log and the per-epoch validation used for checkpoint selection use the default constants (or the `--coef-*` values you pass), **not** the tuned ones.
 
-The proposal specifies the model's math precisely but is necessarily silent on some engineering choices. This section documents the resulting decisions so results remain interpretable and reproducible.
+## Ablation study
 
-### Training the memory gate
+Coefficient ablations are **evaluation-only** (no retraining); the others change the trained model.
 
-The proposal's training objective, $\mathcal{L} = \mathcal{L}_{\text{query}} + \eta_p \mathcal{L}_{\text{proto}} + \eta_s \mathcal{L}_{\text{struct}} + \eta_{\text{div}} \mathcal{L}_{\text{div}}$, is defined entirely in terms of $S_q$, $S_p$, $S_{\text{struct}}$, and the anchor weights $\alpha_i$; none of its four terms is a function of $\lambda_p$ or $\lambda_s$. The only quantity that depends on the memory gate $G_\lambda$ is the combined score $S(t\mid h,r) = S_q(t) + \lambda_p S_p(t) + \lambda_s S_{\text{struct}}(t)$, and the proposal uses that quantity only for ranking, at inference and as an in-batch diagnostic — not in the loss. Taken literally, this leaves $G_\lambda$ at its random initialization for the entire training run, which is inconsistent with treating $\lambda_p, \lambda_s$ as **learned** gates (the proposal's own framing), with ablation A8's premise that fixed gates should be compared against learned ones, and with the Memory Gate Analysis, all of which assume the gates carry a trained signal.
+| Ablation | Description | How |
+| --- | --- | --- |
+| RAA-KGC rule | Baseline inference from the same checkpoint | `--coef-h 1 --coef-p 0 --coef-s 0` |
+| Query only | $S_q$ alone | `--coef-h 0 --coef-p 0 --coef-s 0` |
+| No $S_p$ | Drop semantic memory | `--coef-p 0` together with explicit `--coef-h` and `--coef-s` |
+| No $S_{\text{struct}}$ | Drop structural memory | `--coef-s 0` together with explicit `--coef-h` and `--coef-p` |
+| A1 | Random (uniform) anchor weights instead of query-conditioned attention | `--random-anchor-selection` |
+| A3 | Single prototype | `--num-prototypes 1` |
+| A5 | Uniform hop weighting over non-empty hops | `--uniform-hop-weighting` |
+| A6 | No global relation memory | `--global-budget 0` |
+| A7 | No hop $\geq 1$ local anchors and no neighbour-text augmentation (hop-0 anchors are kept, since they need no graph traversal). Pair with `--neighbor-weight 0` for a graph-free evaluation | `--disable-link-graph` |
+| Hop depth | Hop-0 only (no traversal) | `--num-hops 0` |
+| No RAA path | Remove $S_{\text{hrta}}$ and $\mathcal{L}_{\text{hrta}}$ | `--anchor-num 0` |
+| Diversity | Optional anchor-diversity regulariser (off by default) | `--eta-div 0.01` |
+| No prototype specialisation | | `--eta-pdiv 0` |
 
-This implementation closes the gap with an auxiliary cross-entropy loss on the combined score:
+Because unset coefficients fall back to `(1.0, 0.1, 0.1)`, always pass all three when you fix them.
 
-$$
-\mathcal{L}_{\text{combined}} = \text{CE}\big(S(\cdot \mid h, r), y\big)
-$$
+## Checkpoints and model selection
 
-weighted by `--eta-combined` (default 0.1). This is the only term in `Trainer._compute_losses` whose gradient reaches `MemoryGate`. It does not alter the definition of $S(t\mid h,r)$ used for ranking anywhere in the pipeline — it exists solely to give $G_\lambda$ a training signal — and is an addition beyond the proposal's stated objective rather than a literal reading of it.
+Selection uses the **same filtered-ranking protocol as final evaluation** (forward and backward MRR/Hits@k against the whole entity dictionary), not an in-batch proxy. At the epoch boundary the trainer wraps the in-memory model as an `ARPMPredictor` (`ARPMPredictor.from_model`), encodes all entities, and calls `evaluate_predictor` (the same function as the standalone script, with `save_details=False`). The result of `--checkpoint-metric` decides whether `model_best.mdl` is overwritten.
 
-This also resolves a `DistributedDataParallel` failure under multi-GPU training (`RuntimeError: Expected to have finished reduction in the prior iteration...`), since DDP requires every trainable parameter to participate in the backward pass each iteration unless told otherwise, and `MemoryGate`'s two parameter tensors were previously the only ones that never did. `Trainer._setup_device` accordingly passes `find_unused_parameters=True` to `DistributedDataParallel`. This remains necessary even with $\mathcal{L}_{\text{combined}}$ enabled, because the `--fixed-lambda-p`/`--fixed-lambda-s` ablations (A8–A10) still bypass `MemoryGate`'s output in the forward pass via `torch.full_like`, so the overridden channel's absence from the forward computation must be declared to DDP's static-graph reduction on every run using those flags.
+- Every epoch writes `model_last.mdl` (full state: weights, optimizer, scheduler, scaler, args) for resuming.
+- `model_best.mdl` (weights + args only) is written **only** after a validation pass that improves the metric. Epochs that skip validation never touch it.
+- **If `--full-eval-every-n-epochs` is larger than `--epochs`, validation never runs and no `model_best.mdl` is produced**. Evaluate `model_last.mdl` instead (our WN18RR runs do this to save time).
+- Only `model_last.mdl` and `model_best.mdl` are written; `--max-to-keep` therefore has no practical effect.
 
-`--eta-combined 0` reproduces the gate-frozen-at-initialization behavior of a literal reading of the proposal's objective. It is retained as a diagnostic control, not the intended default; any result reported under the "learned gate" condition (ablation A8's baseline, or "Full") should use `--eta-combined > 0`.
+## Outputs
 
-### Temperature scaling is training-only
+For an evaluation on `<split>` with checkpoint `<ckpt>`:
 
-$S_q$, $S_p$, $S_{\text{struct}}$, and the combined $S(t\mid h,r)$ returned by `model/models.py` and used for ranking (evaluation, the Memory Gate Analysis) are always the raw, paper-exact similarities, with no temperature or margin applied. `model/trainer.py` applies a shared `exp(log_inv_t)` inverse temperature — and, for $S_q$ only, the additive margin and self-negative term — solely to sharpen the in-batch cross-entropy losses, including $\mathcal{L}_{\text{combined}}$. Since this is a positive monotonic rescaling applied identically inside each loss, it affects optimization dynamics but never the ranking any of the four scores would produce.
+| File (next to the checkpoint) | Content |
+| --- | --- |
+| `best_coefs.json` | Tuned `(c_h, c_p, c_s)`, split tuned on, validation metrics |
+| `task_hrt_<split>_<forward\|backward>_<ckpt>.json` | Per-query predictions: top-20 candidates with scores, rank, correctness |
+| `task_hrt_<split>_<ckpt>.json` | Plain-text summary: coefficients and forward / backward / average metrics (despite the extension, not JSON) |
+| `metrics_<split>_<ckpt>.json` | JSON summary written by `eval_wiki5m_trans.py` |
+
+## Implementation notes
+
+### Candidate retrieval and leakage control
+
+Retrieval reads **only the training graph** (`dict_hub.get_train_triplet_dict`, independent of `--is-test`), so no validation or test label can enter a pool.
+
+- During training the gold tail is excluded from hop-0 anchors, the query's own $(h,t)$ edge is hidden from the BFS (`get_hop_layers(exclude_edge=...)`), and the gold tail is removed from neighbour-text augmentation.
+- During evaluation, sampling is deterministic per query (seeded by `head\trelation`).
+- Hop indexing: hop-0 is "same head and relation" (no traversal), so `--num-hops N` gives $N+1$ slots. Global candidates and padding use `NO_HOP = -1`, and global sampling excludes pairs that share the query head (those belong to hop-0).
+- Hop-0 anchors are never removed by `--anchor-budget`; only hop $\ge 1$ and global candidates are sub-sampled to fit the remaining room. `--local-per-hop-budget 0` yields exactly zero local anchors.
+
+### Gradient flow (what trains what)
+
+- The two BERT encoders are trained by $\mathcal{L}_{\text{query}}$ and $\mathcal{L}_{\text{hrta}}$ only, exactly as in RAA-KGC.
+- The memory branch sees `q.detach()`, anchor embeddings $E_1(t_i)$ are computed under `no_grad` in eval mode, and the memory losses use `tail_vector.detach()`. $\mathcal{L}_{\text{proto}}$, $\mathcal{L}_{\text{struct}}$, $\mathcal{L}_{\text{div}}$, $\mathcal{L}_{\text{pdiv}}$ therefore update only the memory modules (anchor projection $W$, `ProtoGen`, `HopScorer`, memory temperatures).
+- $\mathcal{L}_{\text{proto}}$ and $\mathcal{L}_{\text{struct}}$ are bidirectional in-batch cross-entropies that ignore queries with an empty memory (`_masked_bidirectional_ce`): $\mathcal{L}_{\text{struct}}$ additionally requires at least one local anchor.
+- Temperature scaling, the additive margin and the self-negative column are training-only. Ranking always uses raw cosine scores.
+
+### Memory construction
+
+- **Anchor weights:** $\alpha = \mathrm{softmax}$ over valid slots of $a_i^\top W q/\tau_r$ ($W$ initialised to the identity).
+- **Prototypes:** $u_{ik} = a_i^\top W_k q / T$ with $T$ = `--proto-attn-temperature`; $\rho_{ik} = \alpha_i e^{u_{ik}} / \sum_j \alpha_j e^{u_{jk}}$; $p_k = \sum_i \rho_{ik} a_i$. Each $W_k$ is initialised to the identity plus small noise, so every slot starts as a slightly different cosine attention. Prototypes are L2-normalised (zero stays zero).
+- **Structural memory:** $m^{(\ell)} = \sum_i \alpha_i a_i / (\sum_i \alpha_i + \epsilon)$ over local anchors of hop $\ell$; $\beta = \mathrm{softmax}(\text{Linear}(q))$ masked so that **an empty hop gets exactly zero weight**; $m_{\text{struct}} = \sum_\ell \beta_\ell m^{(\ell)}$, L2-normalised. A query with no local anchor gets $m_{\text{struct}} = 0$ through an element-wise `torch.where`, so no NaN can propagate and $S_{\text{struct}} = 0$.
+- **Zero-candidate queries:** the model never falls back to the query's own gold triple. All slots are padding, $\alpha$ and $\mathcal{L}_{\text{div}}$ are exactly zero, prototypes and $m_{\text{struct}}$ are zero vectors, and $S_p = S_{\text{struct}} = 0$ for that query.
 
 ### False-negative masking
 
-The shared `triplet_mask` filtering in-batch false negatives is applied identically to $S_q$, $S_p$, $S_{\text{struct}}$, and the combined score; an unmasked false negative would otherwise corrupt all four losses, not only the query loss. Pre-batch negatives are not implemented.
+The shared `triplet_mask` (other known true tails of the same $(h,r)$ appearing in the batch) is applied to $\mathcal{L}_{\text{query}}$, $\mathcal{L}_{\text{hrta}}$, $\mathcal{L}_{\text{proto}}$ and $\mathcal{L}_{\text{struct}}$. Pre-batch negatives are not implemented.
 
-### Zero-candidate queries
+### Evaluation protocol
 
-If `CandidatePoolBuilder.build(...)` returns an empty list — an isolated head entity, or a relation seen nowhere else in training — the model does not fall back to the query's own true triple as an anchor, since that would leak the label. Instead, every candidate slot is the shared padding placeholder, `candidate_valid_mask` is all-`False` for that query, $\alpha_i$ and $\mathcal{L}_{\text{div}}$ are exactly zero, and prototypes/$m_{\text{struct}}$ are zero vectors (the structural-memory constant $\epsilon$ exists precisely for this case). This path was exercised directly via `--anchor-budget 0` and produces finite, non-NaN losses, including $\mathcal{L}_{\text{combined}}$, since $S_p$ and $S_{\text{struct}}$ degrade gracefully to zero-vector similarities rather than NaN.
+- Rank of the gold tail = 1 + number of entities with a strictly higher score, after filtering.
+- Filtering (`evaluate.py::_filter_indices`) masks (a) every other known tail of $(h, r)$ over train+valid+test (including inverse triples), and (b) every entity $e$ that has the head as a tail of some triple, except the gold tail. Rule (b) is the same rule as in our `Baseline` (RAA-KGC) package; the `SimKGC_Restructured` and `HaSa_Restructured` packages apply only rule (a).
+- The graph re-ranking bonus (`--neighbor-weight` on entities within `--rerank-n-hop` hops of the head) is added to $S_q$ only; it is additive, so it is equivalent to adding it to the total score.
+- Both directions are evaluated (forward, and backward through `inverse <relation>`); reported numbers are their average.
 
-### Link-graph ablation semantics
+### Link-graph semantics
 
-`--disable-link-graph` removes local anchors from the entire pipeline, not only from structural memory — prototype construction (which draws from the same weighted anchor set $\mathcal{W}_q$) loses local evidence as well. Under the proposal's own definition of $m_{\text{struct}}$ as built exclusively from local anchors, A7 ("no local structural memory") and A10 ("drop the $S_{\text{struct}}$ term") are the same removal in principle. This implementation keeps them distinct and both runnable: A10 (`--fixed-lambda-s 0`) drops $S_{\text{struct}}$ from the final score while local anchors still inform the prototypes; A7 (`--disable-link-graph`) removes local anchors from the pipeline entirely. Use whichever isolates the quantity under study.
+The link graph is enabled by default. `--disable-link-graph` removes neighbour-text augmentation of entity descriptions and all hop $\ge 1$ anchors, but keeps hop-0 anchors (and hence $S_{\text{hrta}}$ and the hop-0 part of the memories). Graph re-ranking at evaluation builds its own graph, so set `--neighbor-weight 0` for a fully graph-free evaluation.
 
-### Adaptive prototype count
+## Method-to-code mapping
 
-The proposal specifies a *fixed* $K \in \{1,2,4,8\}$ for the core model and introduces adaptive $K_q$ only as the optional Gumbel extension A13. Ablation A4 ("fixed prototype count instead of adaptive $K$") is accordingly read as the comparison between Full (fixed $K$, the default) and A13 (`--use-gumbel-proto`, adaptive $K_q$), rather than as an independent standalone flag.
+| Method component | Implementation |
+| --- | --- |
+| Relation-aware candidate memory $\mathcal{A}_{\text{local}}, \mathcal{A}_{\text{global}}$, budget $M$ | `utils/candidate_pool.py::CandidatePoolBuilder`, `utils/triplet.py::LinkGraph.get_hop_layers` |
+| Anchor-enhanced query (RAA path), $E_0(h,r,t_i)$ | `utils/doc.py::Example.vectorize(test=False)`, `model/models.py::ARPMModel.forward` |
+| Query-conditioned anchor selection (RQ1) | `model/models.py::ARPMModel._memory` (`attn_proj`, $\alpha_i$) |
+| Anchor diversity $\mathcal{L}_{\text{div}}$ | `model/modules.py::diversity_loss` |
+| Multi-prototype semantic memory (RQ2) | `model/modules.py::ProtoGen`, `prototype_diversity` ($\mathcal{L}_{\text{pdiv}}$) |
+| Adaptive structural memory (RQ3), empty-hop safeguards | `model/models.py::ARPMModel._structural_memory`, `model/modules.py::HopScorer` |
+| Scores $S_q, S_p, S_{\text{struct}}$ and the combined score | `ARPMModel.score_query / score_prototypes / score_struct / combined_score` |
+| Training objective | `model/trainer.py::Trainer._compute_losses` |
+| Constant coefficients, grid search | `setting/config.py::get_coefs`, `evaluation/evaluate.py::resolve_coefs` |
+| Filtered-ranking evaluation | `evaluation/evaluate.py::compute_metrics / evaluate_predictor` |
 
-### Scoring function choices
+## Known limitations
 
-The proposal leaves $S_P(a_i, q, k)$ (prototype attention) and the exact form of $G_{\text{hop}}(q, \ell)$/$G_\lambda(q)$ unspecified beyond naming their roles. `model/modules.py::ProtoGen` implements $S_P$ as a per-prototype bilinear form $u_{ik} = a_i^\top W_k q / \sqrt{d}$, the natural generalization of dot-product attention to $K$ independent slots. `HopScorer` and `MemoryGate` are each implemented as a single linear layer whose $\ell$-th/$k$-th output channel is the corresponding score — the simplest faithful realization of "a function of $q$ and a discrete index."
-
-Candidate retrieval reads exclusively from the training graph (`utils/dict_hub.py::get_train_triplet_dict`, independent of `args.is_test`), so no validation or test label ever enters the candidate pool, at either training or evaluation time. The candidate pipeline — retrieval scoring, diversity, prototype attention, and hop-specific aggregation — is vectorized over a padded `(batch, max_candidates)` grid with a single batched encoder call per pass.
-
-### Hop indexing
-
-Local hop 0 is defined as "same head and relation" (graph distance 0, no traversal), not "nearest graph neighbor," and `--num-hops N` yields $N+1$ local categories, not $N$: hop-0 (other valid tails for the exact same $(h,r)$ pair), hop-1 (graph distance 1), ..., hop-$N$ (graph distance $N$). `--num-hops 2` therefore allocates three structural-memory slots (`ARPMModel.num_hop_slots`). Global candidates and padding slots are tagged `NO_HOP = -1` specifically so they cannot be confused with a genuine local hop-0 candidate. `_global_candidates` also excludes any pair sharing the query's head — not only its exact true tail — since head-sharing pairs are already covered by the hop-0 category, keeping "global" strictly meaning "a different head."
-
-### Empty-hop and no-local-anchor safeguards
-
-`_structural_memory` implements two parameter-free safeguards:
-
-1. **Some hops empty, not all.** Hop-selection weighting — the dense softmax, its `--use-gumbel-hop` (A12) counterpart, and the `--uniform-hop-weighting` (A5) ablation — is masked so that a hop with zero local anchors receives exactly zero weight, rather than relying on `G_hop` to learn this from data. Verified adversarially: forcing `G_hop` to output a large logit for a deliberately empty hop still yields exactly zero weight for it after masking.
-2. **No local anchor at any hop.** `m_struct` is hard-set to the zero vector via `torch.where` (an element-wise replacement rather than a multiplicative mask, which would let a NaN from a degenerate all-hops-masked softmax propagate as `0 * NaN = NaN`), and `forward()` hard-overrides `lambda_s <- 0` for that query, after any `--fixed-lambda-s` ablation override. This override is differentiable with respect to the surviving branch, so $\mathcal{L}_{\text{combined}}$ continues to train `G_lambda` normally on queries where the override does not fire.
-
-Implementing safeguard 2 surfaced a related off-by-one in `CandidatePoolBuilder._local_candidates`/`_same_head_candidates`: the per-hop budget was previously checked after appending a candidate, so `--local-per-hop-budget 0` still admitted one candidate per non-empty hop. The check now runs before appending, so a budget of 0 yields exactly 0 local candidates. `--num-hops 0` is consequently a valid configuration — hop-0 only, with no graph traversal — distinct from and more surgical than `--disable-link-graph` (A7), which removes every local category including hop-0.
-
-### Known limitation: candidate-pool union
-
-$\mathcal{A}(h,r) = \mathcal{A}_{\text{local}}(h,r) \cup \mathcal{A}_{\text{global}}(r)$ is currently implemented as a concatenation rather than a true set union. `_global_candidates` deduplicates against hop-0 by excluding any pair sharing the query's head, but a triple reached via graph traversal at hop $\ell \geq 1$ can still be independently sampled into the global pool, appearing twice under two different tags. This has no correctness impact — the local copy still feeds structural memory correctly, and the extra global copy only adds marginal retrieval/prototype weight to that anchor — but affects per-query candidate-pool inspection. A full fix would track seen $(h_i, t_i)$ pairs per query across both pools.
-
-## Validation Performed
-
-The full pipeline — candidate retrieval, anchor selection, diversity loss, prototype construction, structural memory, gating, combined score, $\mathcal{L}_{\text{combined}}$, training loss, checkpointing, and filtered-ranking evaluation — was exercised end-to-end on a small synthetic dataset with a randomly initialized, fully local (no network access) tiny BERT encoder. This covered:
-
-- A full `train_loop` with checkpoint save/load and `evaluation/evaluate.py::predict_by_split` (forward and backward MRR/Hits@k).
-- All three optional Gumbel extensions together, including `--gumbel-topk-hop 2` with masked top-$k$ selection.
-- `--random-anchor-selection` (A1), `--uniform-hop-weighting` (A5), `--fixed-lambda-p/-s 0` (A9/A10), and `--disable-link-graph` (A7, global-only candidates).
-- `--num-hops 0` and `--num-hops 1` (hop-0-only and hop-0/1-only edge cases) and the `--anchor-budget 0` zero-candidate edge case.
-- The full filtered-ranking checkpoint-selection protocol, including `--full-eval-every-n-epochs`, confirmed to run the expensive full-entity pass only on due epochs while `model_last.mdl` is still updated every epoch.
-- Two-GPU DDP training via `torchrun --nproc_per_node=2`, confirmed to no longer raise the unused-parameter `RuntimeError`, with `MemoryGate`'s parameters confirmed to receive nonzero gradient norm every step via $\mathcal{L}_{\text{combined}}$, both with and without `--fixed-lambda-p`/`--fixed-lambda-s` active.
-
-All configurations produced finite losses and metrics with no shape or NaN errors. In addition:
-
-- `CandidatePoolBuilder` was checked directly against the synthetic training graph: `--num-hops 2` produced exactly the three local hop slots $\{0, 1, 2\}$ (hop-0: same head and relation with a different tail; hop-1: a genuinely different, one-edge-away head; hop-2: two edges away), and `ARPMModel.num_hop_slots`/`HopScorer`'s output width were confirmed to equal `num_hops + 1`.
-- `_structural_memory`'s two safeguards were unit-tested against hand-crafted candidate grids: a query with an empty middle hop but populated neighboring hops (exact-zero weight on the empty hop confirmed even under an adversarially biased `G_hop`), a query with only global candidates, and a query with zero candidates at all — both of the latter confirmed to produce an exact-zero `m_struct` and `lambda_s`, including under a `--fixed-lambda-s 0.9` override.
-- `--eta-combined 0` was run as the diagnostic control described above and confirmed to hold `lambda_p`/`lambda_s` at approximately their random-initialization values across epochs, in contrast to the default `--eta-combined 0.1` run, where both gates moved measurably from their initial values within the first epoch on the synthetic dataset. This is the intended minimal evidence that $\mathcal{L}_{\text{combined}}$ is necessary, not merely sufficient, for the gates to be "learned" in the sense the proposal assumes.
-
-This confirms the implementation is mechanically correct. It does not substitute for a full training run on WN18RR or FB15k-237 to validate the method's empirical claims, which requires downloading `bert-base-uncased` and GPU time not available in this environment.
+- **Candidate-pool union.** $\mathcal{A}_{\text{local}} \cup \mathcal{A}_{\text{global}}$ is a concatenation, not a true set union. A triple reached at hop $\ell \ge 1$ can also be sampled into the global pool and appear twice under different tags. This only adds a little retrieval weight to that anchor.
+- **Wikidata5M preprocessing.** In `preprocess/preprocess.py::preprocess_wiki5m` the line `partial(_process_line_wiki5m, id2ent=_load_wiki5m_id2ent)` passes the loader *function* instead of the `wiki5m_id2ent` dictionary; change it to `id2ent=wiki5m_id2ent` (as in `Baseline`) before preprocessing `wiki5m_trans` / `wiki5m_ind`.
+- **DDP and long validation.** Under `torchrun`, only rank 0 runs the full validation while the other ranks wait at a barrier whose timeout is 60 minutes (`main.py`). Very large graphs may need a longer timeout or `--full-eval-every-n-epochs` set large.
+- **No automated tests** are included. Empirical claims should be validated with full training runs on WN18RR / FB15k-237.
 
 ## Citation
 
-If you use this implementation, please cite the underlying baseline it extends:
+ARPM-KGC builds on the baseline below; please cite it. A citation for ARPM-KGC itself will be added upon publication.
 
 ```bibtex
 @article{yuan2025raakgc,
@@ -281,12 +366,6 @@ If you use this implementation, please cite the underlying baseline it extends:
 }
 ```
 
-A citation for ARPM-KGC itself will be added here upon publication.
-
-## Acknowledgements
-
-The optional discrete (Gumbel-Softmax / Gumbel-Sigmoid) anchor, hop, and prototype gating extensions follow the straight-through, forward-hard/backward-soft design of Jang et al. (2017) and Maddison et al. (2017), applied in the same spirit as the per-node neighborhood-order selection of Lakzaei et al. (2025) [NOL-GAT].
-
 ## License
 
-No license is currently specified for this repository. Add one (for example, MIT or Apache-2.0) before public release or redistribution.
+No license is currently specified. Add one (for example MIT or Apache-2.0) before public release or redistribution.
