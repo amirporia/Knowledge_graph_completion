@@ -9,13 +9,13 @@ import numpy as np
 import torch
 import tqdm
 
-from Baseline.evaluation.predict import BertPredictor
-from Baseline.setting.config import args
-from Baseline.setting.logger_config import logger
-from Baseline.utils.dict_hub import get_entity_dict, get_all_triplet_dict
-from Baseline.utils.doc import load_data, Example
-from Baseline.utils.triplet import EntityDict
-from Baseline.utils.utils import rerank_by_graph
+from .predict import BertPredictor
+from ..setting.config import args
+from ..setting.logger_config import logger
+from ..utils.dict_hub import get_entity_dict, get_all_triplet_dict
+from ..utils.doc import load_data, Example
+from ..utils.triplet import EntityDict
+from ..utils.utils import rerank_by_graph
 
 FILTER_FILL = -1.0          # same fill value as the original implementation
 ENTITY_CHUNK = 524288       # entities scored at a time (4.8M x batch fp32 does not fit on a 16 GB GPU)

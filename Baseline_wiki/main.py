@@ -5,9 +5,9 @@ import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import datetime
 
-from Baseline.setting.config import args
-from Baseline.model.trainer import Trainer
-from Baseline.setting.logger_config import logger
+from .setting.config import args
+from .model.trainer import Trainer
+from .setting.logger_config import logger
 
 
 def main():
