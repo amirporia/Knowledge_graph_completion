@@ -19,17 +19,20 @@ class AttrDict(dict):
         self.__dict__ = self
 
 
+def _atomic_save(obj, path: str) -> None:
+    tmp = path + '.tmp'
+    torch.save(obj, tmp)
+    os.replace(tmp, path)        # a kill/timeout in the middle of a 2.7 GB write can no longer corrupt model_last.mdl
+
+
 def save_checkpoint(state: Dict[str, Any], is_best: bool, filename: str,
                     eval_state: Dict[str, Any] = None) -> None:
-    """Persist a full training checkpoint, and mirror to `model_last.mdl` /
-    (if `is_best`) `model_best.mdl`."""
     dirname = os.path.dirname(filename)
     os.makedirs(dirname, exist_ok=True)
 
     if is_best:
-        torch.save(eval_state if eval_state is not None else state,
-                   os.path.join(dirname, "model_best.mdl"))
-    torch.save(state, os.path.join(dirname, "model_last.mdl"))
+        _atomic_save(eval_state if eval_state is not None else state, os.path.join(dirname, "model_best.mdl"))
+    _atomic_save(state, os.path.join(dirname, "model_last.mdl"))
 
 
 def load_checkpoint(path: str, map_location=None) -> Dict[str, Any]:

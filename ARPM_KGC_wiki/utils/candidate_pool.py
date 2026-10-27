@@ -123,7 +123,10 @@ class CandidatePoolBuilder:
                 cand_tail_ids = self.train_triplet_dict.get_neighbors(node, relation)
                 if not cand_tail_ids:
                     continue
-                cand_tail = rng.choice(sorted(cand_tail_ids))
+                if len(cand_tail_ids) > LARGE_NEIGHBORHOOD:  # hub: don't sort 1M ids for every candidate
+                    cand_tail = rng.choice(self._sorted_tails_cached(node, relation))
+                else:
+                    cand_tail = rng.choice(sorted(cand_tail_ids))
                 candidates.append(CandidateAnchor(node, relation, cand_tail, hop_slot, True))
                 found += 1
         return candidates

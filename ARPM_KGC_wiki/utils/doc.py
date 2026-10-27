@@ -8,7 +8,8 @@ import torch.utils.data.dataset
 
 from .candidate_pool import get_candidate_pool_builder, CandidateAnchor, NO_HOP
 from .dict_hub import get_entity_dict, get_link_graph, get_tokenizer
-from .triplet import reverse_triplet
+from array import array
+from .triplet import reverse_triplet, iter_json_array
 from .triplet_mask import construct_mask, construct_self_negative_mask
 from ..setting.config import args
 from ..setting.logger_config import logger
@@ -126,25 +127,25 @@ class CompactExamples:
     """
 
     def __init__(self, path: str):
-        with open(path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        rels = sorted({d['relation'] for d in data})
-        rel2idx = {r: i for i, r in enumerate(rels)}
-        n = len(data)
+        h, r, t = array('i'), array('h'), array('i')
+        rel2idx, rels = {}, []
+        to_idx = entity_dict.entity_to_idx
+        for d in iter_json_array(path):  # streamed: no multi-GB list of dicts
+            ri = rel2idx.get(d['relation'])
+            if ri is None:
+                ri = rel2idx[d['relation']] = len(rels)
+                rels.append(d['relation'])
+            h.append(to_idx(d['head_id']))
+            t.append(to_idx(d['tail_id']))
+            r.append(ri)
 
-        self.h = np.empty(n, dtype=np.int32)
-        self.r = np.empty(n, dtype=np.int16)
-        self.t = np.empty(n, dtype=np.int32)
-        for i in range(n):
-            d = data[i]
-            self.h[i] = entity_dict.entity_to_idx(d['head_id'])
-            self.t[i] = entity_dict.entity_to_idx(d['tail_id'])
-            self.r[i] = rel2idx[d['relation']]
-            data[i] = None  # free progressively
-        del data
+        self.h = np.frombuffer(h, dtype=np.int32)
+        self.r = np.frombuffer(r, dtype=np.int16)
+        self.t = np.frombuffer(t, dtype=np.int32)
+        n = len(self.h)
 
         self.rel_fwd = rels
-        self.rel_inv = [f'inverse {r}' for r in rels]
+        self.rel_inv = [f'inverse {x}' for x in rels]
         self.ids = [e.entity_id for e in entity_dict.entity_exs]  # references only
         logger.info(f'CompactExamples: {n} triples -> {2 * n} queries from {path}')
 
