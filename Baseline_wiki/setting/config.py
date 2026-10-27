@@ -142,6 +142,19 @@ def parse_args():
     eval_group.add_argument('--is-test', action='store_true', default=False,
                             help='Run in test mode')
     _add_toggle(eval_group, 'use-self-negative', True, 'Use head entity as negative sample (SN)')
+    # Large-scale settings (Wikidata5M)
+    large_group = parser.add_argument_group('Large-scale (Wikidata5M)')
+    large_group.add_argument('--epoch-examples', default=0, type=int, dest='epoch_examples',
+                             help='>0: one "epoch" is a fixed chunk of this many training queries '
+                                  '(scheduler / resume work per chunk). 0 = full pass over the data.')
+    large_group.add_argument('--compact-train', action='store_true', dest='compact_train',
+                             help='Keep train triples as numpy arrays and build Example objects lazily')
+    large_group.add_argument('--entity-batch-size', default=0, type=int, dest='entity_batch_size',
+                             help='Per-GPU batch size for entity encoding at evaluation (0 = use --batch-size)')
+    large_group.add_argument('--eval-amp', action='store_true', dest='eval_amp',
+                             help='fp16 autocast for evaluation encoders')
+    large_group.add_argument('--max-eval-queries', default=0, type=int, dest='max_eval_queries',
+                             help='Evaluate on a random subset of this many queries per direction (0 = all)')
 
     return parser.parse_args()
 

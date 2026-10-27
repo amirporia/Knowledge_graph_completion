@@ -34,7 +34,7 @@ class BertPredictor:
         self.device = None
         self.batch_size = args.batch_size
 
-    @classmethod  # NEW
+    @classmethod
     def from_model(cls, model: torch.nn.Module, device: torch.device,
                    use_cuda: bool, batch_size: int = None) -> 'BertPredictor':
         predictor = cls()
@@ -96,6 +96,11 @@ class BertPredictor:
             args.__dict__['use_link_graph'] = self.train_args.use_link_graph
         args.__dict__['is_test'] = True
 
+    def _autocast(self):
+        """fp16 autocast for the encoders when --eval-amp is given (training also used AMP)."""
+        return torch.autocast('cuda', dtype=torch.float16,
+                              enabled=bool(self.use_cuda and getattr(args, 'eval_amp', False)))
+
     @torch.no_grad()
     def predict_by_examples(self, examples: List[Example]) -> tuple:
         """
@@ -103,23 +108,22 @@ class BertPredictor:
 
         Returns:
             (hr_vectors e_hr, tail_vectors e_t, related_hr_vectors e^avg_hrta)
-        Anchors are sampled deterministically from the TRAIN graph (never from the target).
         """
         data_loader = self._create_dataloader(examples, is_test=False)
 
-        # Anchor tensors are flattened across the batch (their first dim != batch size), so
-        # DataParallel's scatter would split them wrongly -> always run the unwrapped module here.
+        # Anchor tensors are batch-first but we always run the unwrapped module here (single GPU).
         model = get_model_obj(self.model)
 
         hr_tensors, tail_tensors, related_hr_tensors = [], [], []
 
         for batch_dict in data_loader:
             batch_dict = self._move_to_device(batch_dict)
-            outputs = model(**batch_dict)
+            with self._autocast():
+                outputs = model(**batch_dict)
 
-            hr_tensors.append(outputs['hr_vector'])
-            tail_tensors.append(outputs['tail_vector'])
-            related_hr_tensors.append(outputs['related_hr_vector'])
+            hr_tensors.append(outputs['hr_vector'].float())
+            tail_tensors.append(outputs['tail_vector'].float())
+            related_hr_tensors.append(outputs['related_hr_vector'].float())
 
         return (
             torch.cat(hr_tensors, dim=0),
@@ -141,8 +145,9 @@ class BertPredictor:
         for batch_dict in tqdm.tqdm(data_loader, desc='Predicting entities'):
             batch_dict['only_ent_embedding'] = True
             batch_dict = self._move_to_device(batch_dict)
-            outputs = self.model(**batch_dict)
-            ent_tensors.append(outputs['ent_vectors'])
+            with self._autocast():
+                outputs = self.model(**batch_dict)
+            ent_tensors.append(outputs['ent_vectors'].float())
 
         return torch.cat(ent_tensors, dim=0)
 
@@ -155,10 +160,17 @@ class BertPredictor:
         dataset = Dataset(path='', examples=examples, test_set=is_test)
         collate_fn = collate_test if is_test else collate
 
+        # Entity encoding is cheap per item and can use a big batch (--entity-batch-size per GPU);
+        # query encoding keeps the small --batch-size.
+        batch_size = self.batch_size
+        entity_bs = getattr(args, 'entity_batch_size', 0)
+        if is_test and entity_bs > 0:
+            batch_size = entity_bs * max(1, torch.cuda.device_count())
+
         return torch.utils.data.DataLoader(
             dataset,
             num_workers=4,
-            batch_size=self.batch_size,
+            batch_size=batch_size,
             collate_fn=collate_fn,
             shuffle=False,
             pin_memory=self.use_cuda

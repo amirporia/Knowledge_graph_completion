@@ -96,12 +96,36 @@ class Trainer:
             report_num_trainable_parameters(get_model_obj(self.model))
 
     def _init_data_loaders(self):
-        """Initialize the training data loader (validation uses the full filtered-ranking pass)."""
-        self.train_dataset = Dataset(path=self.args.train_path, test_set=False)
+        """Training data loader (validation uses the full filtered-ranking pass)."""
+        self.train_dataset = Dataset(path=self.args.train_path, test_set=False,
+                                     compact=self.args.compact_train)
 
-        self.train_loader, self.train_sampler = self._create_data_loader(
-            self.train_dataset, shuffle=True, drop_last=True, distributed=self.args.distributed
-        )
+        # With --epoch-examples the loader is rebuilt for every chunk (see _epoch_loader).
+        self.train_loader, self.train_sampler = None, None
+        if self.args.epoch_examples <= 0:
+            self.train_loader, self.train_sampler = self._create_data_loader(
+                self.train_dataset, shuffle=True, drop_last=True, distributed=self.args.distributed
+            )
+
+    def _epoch_loader(self, epoch):
+        """Loader (and sampler) of one epoch: the whole dataset, or the epoch's fixed chunk."""
+        k, n = self.args.epoch_examples, len(self.train_dataset)
+        if k <= 0 or k >= n:
+            return self.train_loader, self.train_sampler
+
+        if not hasattr(self, '_perm'):
+            g = torch.Generator()
+            g.manual_seed(1234 + (self.args.seed or 0))
+            self._perm = torch.randperm(n, generator=g)
+
+        start = (epoch * k) % n
+        idx = self._perm[start:start + k]
+        if idx.numel() < k:  # wrap around
+            idx = torch.cat([idx, self._perm[:k - idx.numel()]])
+
+        subset = torch.utils.data.Subset(self.train_dataset, idx.tolist())
+        return self._create_data_loader(subset, shuffle=True, drop_last=True,
+                                        distributed=self.args.distributed)
 
     def _create_data_loader(self, dataset, shuffle, drop_last=False, distributed=False):
         """Create a DataLoader, using a DistributedSampler when sharding across ranks."""
@@ -125,7 +149,10 @@ class Trainer:
     def _init_scheduler(self):
         """Initialize learning rate scheduler."""
         world_size = self.args.world_size if self.args.distributed else 1
-        steps_per_epoch = len(self.train_dataset) // world_size // max(self.args.batch_size, 1)
+        n_train = len(self.train_dataset)
+        if self.args.epoch_examples > 0:
+            n_train = min(n_train, self.args.epoch_examples)
+        steps_per_epoch = n_train // world_size // max(self.args.batch_size, 1)
         num_training_steps = self.args.epochs * steps_per_epoch
 
         self.args.warmup = min(self.args.warmup, num_training_steps // 10)
@@ -198,18 +225,18 @@ class Trainer:
 
     def train_epoch(self, epoch):
         """Train for one epoch."""
-        if self.args.distributed:
-            self.train_sampler.set_epoch(epoch)
+        loader, sampler = self._epoch_loader(epoch)
+        if self.args.distributed and sampler is not None:
+            sampler.set_epoch(epoch)
 
         meters = self._init_training_meters()
         progress = ProgressMeter(
-            len(self.train_loader),
+            len(loader),
             [meters['losses'], meters['inv_t'], meters['top1'], meters['top3'],
-             meters['hr_losses'], meters['related_losses']],
-            prefix=f"Epoch: [{epoch}]"
+             meters['hr_losses'], meters['related_losses']], prefix=f"Epoch: [{epoch}]"
         )
 
-        for i, batch_dict in enumerate(self.train_loader):
+        for i, batch_dict in enumerate(loader):
             self.model.train()
             batch_dict = self._move_batch_to_device(batch_dict)
 
@@ -358,8 +385,7 @@ class Trainer:
             is_best = False
 
             if self.args.skip_valid_eval or not self.args.valid_path:
-                # No validation: keep the latest weights as "best"
-                is_best = True
+                is_best = (step == 0)  # no validation: the latest finished epoch is "best"
             else:
                 is_epoch_boundary = (step == 0)
                 due = ((epoch + 1) % max(self.args.full_eval_every_n_epochs, 1) == 0

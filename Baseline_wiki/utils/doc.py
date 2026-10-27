@@ -2,14 +2,20 @@ import json
 import os
 import random
 from typing import Optional, List, Tuple
+from array import array
+from functools import lru_cache
 
+import numpy as np
 import torch
 import torch.utils.data.dataset
 
 from .dict_hub import get_entity_dict, get_link_graph, get_tokenizer, get_train_triplet_dict
-from .triplet import reverse_triplet
+from .triplet import reverse_triplet, iter_json_array
 from .triplet_mask import construct_mask, construct_self_negative_mask
 from ..setting.config import args, MAX_ANCHORS
+
+LARGE_NEIGHBORHOOD = 5000
+
 from ..setting.logger_config import logger
 
 entity_dict = get_entity_dict()
@@ -83,27 +89,36 @@ def get_neighbor_desc(head_id: str, tail_id: str = None) -> str:
 # Relation-aware anchor generation (paper Definition 1, Eq. 1)
 # ---------------------------------------------------------------------------
 
+@lru_cache(maxsize=256)
+def _hub_tails(head_id: str, relation: str) -> tuple:
+    """Tails of a hub (h, r) as a tuple (indexable); cached per process."""
+    return tuple(train_triplet_dict.get_neighbors(head_id, relation))
+
+
 def sample_anchors(head_id: str,
                    relation: str,
                    exclude_tail_id: Optional[str] = None,
                    k: Optional[int] = None) -> List[str]:
-    """T_k = random(T, k), k <= K = 5.
-
-    T is the set of tail entities connected to `head_id` through `relation` in the training
-    graph G ∪ G_inv.  During training the target tail is removed from T to avoid label leakage.
-    At inference the sample is made deterministic (seeded by the query) so that evaluation is
-    reproducible.  Returns [] when T is empty (the model then falls back to the classic query).
-    """
+    """T_k = random(T, k), k <= K = 5 (see the original docstring; behaviour unchanged for small (h, r))."""
     k = args.anchor_num if k is None else k
     k = min(k, MAX_ANCHORS)
     if k <= 0 or not head_id or not relation:
         return []
 
-    pool = train_triplet_dict.get_neighbors(head_id, relation)
-    pool = [t for t in pool if t != exclude_tail_id and t != head_id]
+    neighbors = train_triplet_dict.get_neighbors(head_id, relation)
+    if len(neighbors) > LARGE_NEIGHBORHOOD:          # hub: rejection sampling instead of a 1M-element list
+        pool = _hub_tails(head_id, relation)
+        out, tries = [], 0
+        while len(out) < k and tries < 10 * k:
+            t = pool[random.randrange(len(pool))]
+            tries += 1
+            if t != exclude_tail_id and t != head_id and t not in out:
+                out.append(t)
+        return out
+
+    pool = [t for t in neighbors if t != exclude_tail_id and t != head_id]
     if not pool:
         return []
-
     k = min(k, len(pool))
     return random.sample(pool, k)
 
@@ -212,10 +227,46 @@ class Example:
         }
 
 
+class CompactExamples:
+    """Training triples kept as int arrays; `Example` objects are built lazily on access.
+    Index 2*j is the forward query of triple j, 2*j+1 its inverse (same order as `load_data`)."""
+
+    def __init__(self, path: str):
+        h, r, t = array('i'), array('h'), array('i')
+        rel2idx, rels = {}, []
+        to_idx = entity_dict.entity_to_idx
+        for d in iter_json_array(path):          # streamed: no multi-GB list of dicts
+            ri = rel2idx.get(d['relation'])
+            if ri is None:
+                ri = rel2idx[d['relation']] = len(rels)
+                rels.append(d['relation'])
+            h.append(to_idx(d['head_id']))
+            t.append(to_idx(d['tail_id']))
+            r.append(ri)
+
+        self.h = np.frombuffer(h, dtype=np.int32)
+        self.r = np.frombuffer(r, dtype=np.int16)
+        self.t = np.frombuffer(t, dtype=np.int32)
+        self.rel_fwd = rels
+        self.rel_inv = [f'inverse {x}' for x in rels]
+        self.ids = [e.entity_id for e in entity_dict.entity_exs]
+        logger.info(f'CompactExamples: {len(self.h)} triples -> {2 * len(self.h)} queries from {path}')
+
+    def __len__(self):
+        return 2 * len(self.h)
+
+    def __getitem__(self, i):
+        j, backward = divmod(i, 2)
+        h, r, t = int(self.h[j]), int(self.r[j]), int(self.t[j])
+        if backward:
+            return Example(self.ids[t], self.rel_inv[r], self.ids[h])
+        return Example(self.ids[h], self.rel_fwd[r], self.ids[t])
+
+
 class Dataset(torch.utils.data.dataset.Dataset):
     """Dataset for knowledge graph completion."""
 
-    def __init__(self, path, test_set=False, examples=None):
+    def __init__(self, path, test_set=False, examples=None, compact=False):
         self.path_list = path.split(',')
         self.test_set = test_set
 
@@ -223,13 +274,12 @@ class Dataset(torch.utils.data.dataset.Dataset):
 
         if examples:
             self.examples = examples
+        elif compact and len(self.path_list) == 1:
+            self.examples = CompactExamples(self.path_list[0])
         else:
             self.examples = []
             for file_path in self.path_list:
-                if not self.examples:
-                    self.examples = load_data(file_path)
-                else:
-                    self.examples.extend(load_data(file_path))
+                self.examples.extend(load_data(file_path))
 
     def __len__(self):
         return len(self.examples)
