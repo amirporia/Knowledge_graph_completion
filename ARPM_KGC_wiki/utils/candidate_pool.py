@@ -21,7 +21,9 @@ from collections import defaultdict
 from functools import lru_cache
 from typing import Dict, List, Tuple
 
-from .dict_hub import get_link_graph, get_train_triplet_dict
+import numpy as np
+from array import array
+from .dict_hub import get_link_graph, get_train_triplet_dict, get_entity_dict
 from ..setting.config import args
 from ..setting.logger_config import logger
 
@@ -55,14 +57,18 @@ class CandidatePoolBuilder:
         self._build_relation_index()
 
     def _build_relation_index(self) -> None:
+        ent = get_entity_dict()
+        self._ids = [e.entity_id for e in ent.entity_exs]  # idx -> id (shared strings)
+        to_idx = ent.entity_to_idx
+        hs, ts_ = defaultdict(lambda: array('i')), defaultdict(lambda: array('i'))
         for (head_id, relation), tail_ids in self.train_triplet_dict.hr2tails.items():
-            pairs = self._relation2pairs[relation]
-            for tail_id in sorted(tail_ids):
-                pairs.append((head_id, tail_id))
-        logger.info(
-            f'CandidatePoolBuilder: indexed {len(self._relation2pairs)} relations '
-            f'(num_hops={self.num_hops}, anchor_budget={self.total_budget})'
-        )
+            hi, a, b = to_idx(head_id), hs[relation], ts_[relation]
+            for t in sorted(tail_ids):
+                a.append(hi);
+                b.append(to_idx(t))
+        self._rel_h = {r: np.frombuffer(a, dtype=np.int32) for r, a in hs.items()}
+        self._rel_t = {r: np.frombuffer(a, dtype=np.int32) for r, a in ts_.items()}
+        logger.info(f'CandidatePoolBuilder: indexed {len(self._rel_h)} relations')
 
     @staticmethod
     def _get_rng(head_id: str, relation: str):
@@ -71,7 +77,7 @@ class CandidatePoolBuilder:
             return random.Random(f'{head_id}\t{relation}')
         return random
 
-    @lru_cache(maxsize=64)
+    @lru_cache(maxsize=8)
     def _sorted_tails_cached(self, head_id, relation):
         """Sorted tails of a hub (h,r); cached per process so the sort happens once, not per example."""
         return tuple(sorted(self.train_triplet_dict.get_neighbors(head_id, relation)))
@@ -132,13 +138,17 @@ class CandidatePoolBuilder:
         return candidates
 
     def _global_candidates(self, head_id, tail_id, relation, rng):
-        pool = self._relation2pairs.get(relation, [])
-        if not pool or self.global_budget <= 0:
+        h_arr = self._rel_h.get(relation)
+        if h_arr is None or self.global_budget <= 0:
             return []
-        sampled = rng.sample(pool, self.global_budget) if len(pool) > self.global_budget else pool
-        # "global" = different head (same-head pairs are covered by hop-0)
-        return [CandidateAnchor(h, relation, t, NO_HOP, False)
-                for h, t in sampled if h != head_id]
+        t_arr, ids, n = self._rel_t[relation], self._ids, len(h_arr)
+        picks = rng.sample(range(n), self.global_budget) if n > self.global_budget else range(n)
+        out = []
+        for i in picks:
+            h = ids[h_arr[i]]
+            if h != head_id:
+                out.append(CandidateAnchor(h, relation, ids[t_arr[i]], NO_HOP, False))
+        return out
 
     def build(self, head_id, relation, tail_id):
         training = not args.is_test
