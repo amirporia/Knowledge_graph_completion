@@ -1,9 +1,11 @@
 import json
 import os
+import random
 from dataclasses import dataclass, asdict
 from time import time
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
+import numpy as np
 import torch
 import tqdm
 
@@ -14,6 +16,10 @@ from ..utils.dict_hub import get_entity_dict, get_all_triplet_dict
 from ..utils.doc import load_data, Example
 from ..utils.triplet import EntityDict
 from ..utils.utils import rerank_by_graph
+
+FILTER_FILL = -1.0          # same fill value as the original implementation
+ENTITY_CHUNK = 524288       # entities scored at a time (4.8M x batch fp32 does not fit on a 16 GB GPU)
+TIE_EPS = 2e-6              # scores within this tolerance of the gold count as ties (see ARPM evaluate.py)
 
 
 # ---------------------------------------------------------------------------
@@ -49,33 +55,46 @@ def _setup_entity_dict() -> EntityDict:
 entity_dict = _setup_entity_dict()
 all_triplet_dict = get_all_triplet_dict()
 
+# tail_id -> {head_id}; only used with --filter-head-neighbors (the rule of the Baseline / ARPM packages),
+# built lazily and only for the heads of the evaluated queries.
+_rev_index: Dict[str, set] = {}
+_rev_done: set = set()
 
-# ---------------------------------------------------------------------------
-# Helper Functions
-# ---------------------------------------------------------------------------
 
-def _filter_known_triplets(
-        batch_score: torch.Tensor,
-        examples: List[Example],
-        start_idx: int,
-) -> None:
-    """Mask scores of every known true tail (except the gold one) so ranking is "filtered"."""
-    for idx in range(batch_score.size(0)):
-        cur_ex = examples[start_idx + idx]
-        gold_neighbor_ids = all_triplet_dict.get_neighbors(cur_ex.head_id, cur_ex.relation)
+def _iter_hr2tails():
+    d = all_triplet_dict
+    parts = [d.base, d.extra] if hasattr(d, 'base') else [d]
+    for part in parts:
+        yield from part.hr2tails.items()
 
-        if len(gold_neighbor_ids) > 10000:
-            logger.debug(
-                f'{cur_ex.head_id} - {cur_ex.relation} has {len(gold_neighbor_ids)} neighbors'
-            )
 
-        mask_indices = [
-            entity_dict.entity_to_idx(e_id)
-            for e_id in gold_neighbor_ids
-            if e_id != cur_ex.tail_id
-        ]
-        mask_indices = torch.LongTensor(mask_indices).to(batch_score.device)
-        batch_score[idx].index_fill_(0, mask_indices, -1)
+def _ensure_rev_index(head_ids) -> None:
+    missing = set(head_ids) - _rev_done
+    if not missing:
+        return
+    logger.info(f'Building reverse index for {len(missing)} query heads...')
+    for (head_id, _), tail_ids in _iter_hr2tails():
+        if not missing.isdisjoint(tail_ids):
+            for t in missing.intersection(tail_ids):
+                _rev_index.setdefault(t, set()).add(head_id)
+    _rev_done.update(missing)
+
+
+def _filter_indices(example: Example) -> np.ndarray:
+    """Entities to mask for this query.
+
+    (a) every known true tail of (h, r) over train+valid+test except the gold  [standard SimKGC protocol]
+    (b) only with --filter-head-neighbors: every entity that has the head as a tail of some triple,
+        except the gold [extra rule used by the Baseline / ARPM packages]
+    """
+    idx = {entity_dict.entity_to_idx(e)
+           for e in all_triplet_dict.get_neighbors(example.head_id, example.relation)
+           if e != example.tail_id}
+    if getattr(args, 'filter_head_neighbors', False):
+        for h in _rev_index.get(example.head_id, ()):
+            if h != example.tail_id:
+                idx.add(entity_dict.entity_to_idx(h))
+    return np.fromiter(idx, dtype=np.int64, count=len(idx))
 
 
 # ---------------------------------------------------------------------------
@@ -90,65 +109,90 @@ def compute_metrics(
         examples: List[Example],
         top_k: int = 3,
         batch_size: int = 256,
+        entity_chunk: int = ENTITY_CHUNK,
 ) -> Tuple[List, List, Dict, List]:
-    """Compute link prediction metrics (MR, MRR, Hit@1/3/10/50).
+    """Compute link prediction metrics (MR, MRR, Hit@1/3/10/50) with the entity axis processed in chunks.
+
+    rank = 1 + #{entities with a strictly higher score after filtering}; the gold is excluded from the count.
 
     Returns:
         Tuple of (topk_scores, topk_indices, metrics, ranks)
     """
     assert hr_tensor.size(1) == entities_tensor.size(1), "Embedding dimensions must match"
     total = hr_tensor.size(0)
-    entity_cnt = len(entity_dict)
-    assert entity_cnt == entities_tensor.size(0), "Entity count mismatch"
+    n_ent = entities_tensor.size(0)
+    assert n_ent == len(entity_dict), "Entity count mismatch"
 
-    target = torch.LongTensor(target).unsqueeze(-1).to(hr_tensor.device)
+    device = entities_tensor.device
+    hr_tensor = hr_tensor.to(device)
+    target_t = torch.LongTensor(target).to(device)
+    use_bonus = args.neighbor_weight >= 1e-6
 
     topk_scores, topk_indices, ranks = [], [], []
-    metrics_accumulator = {'mean_rank': 0, 'mrr': 0, 'hit@1': 0,
-                           'hit@3': 0, 'hit@10': 0, 'hit@50': 0}
 
     for start in tqdm.tqdm(range(0, total, batch_size)):
-        end = start + batch_size
+        end = min(start + batch_size, total)
+        nb = end - start
+        rows = torch.arange(nb, device=device)
+        tgt = target_t[start:end]
+        hr = hr_tensor[start:end]
 
-        # batch_size x entity_cnt
-        batch_score = torch.mm(hr_tensor[start:end, :], entities_tensor.t())
-        assert entity_cnt == batch_score.size(1)
-        batch_target = target[start:end]
+        bonus = None
+        if use_bonus:
+            bonus = torch.zeros(nb, n_ent, device=device)
+            rerank_by_graph(bonus, examples[start:end], entity_dict=entity_dict)
 
-        # re-ranking based on topological structure
-        rerank_by_graph(batch_score, examples[start:end], entity_dict=entity_dict)
+        fmask = torch.zeros(nb, n_ent, dtype=torch.bool, device=device)
+        for i in range(nb):
+            idxs = _filter_indices(examples[start + i])
+            if len(idxs):
+                fmask[i, torch.as_tensor(idxs, device=device)] = True
 
-        # filter known triplets
-        _filter_known_triplets(batch_score, examples, start)
+        gold = entities_tensor[tgt].float()
+        gold_score = (hr * gold).sum(1)
+        if use_bonus:
+            gold_score = gold_score + bonus[rows, tgt]
+        gold_score = (gold_score + TIE_EPS).unsqueeze(1)
 
-        batch_sorted_score, batch_sorted_indices = torch.sort(
-            batch_score, dim=-1, descending=True,
-        )
-        target_rank = torch.nonzero(
-            batch_sorted_indices.eq(batch_target).long(), as_tuple=False,
-        )
-        assert target_rank.size(0) == batch_score.size(0), "Rank size mismatch"
+        counts = torch.zeros(nb, dtype=torch.long, device=device)
+        best_v = best_i = None
+        for s in range(0, n_ent, entity_chunk):
+            e = min(s + entity_chunk, n_ent)
+            score = hr.mm(entities_tensor[s:e].float().t())
+            if bonus is not None:
+                score += bonus[:, s:e]
+            score.masked_fill_(fmask[:, s:e], FILTER_FILL)
 
-        for idx in range(batch_score.size(0)):
-            idx_rank = target_rank[idx].tolist()
-            assert idx_rank[0] == idx, "Index mismatch in ranks"
+            if top_k > 0:  # top-k BEFORE the gold is removed from the count
+                v, ix = score.topk(min(top_k, score.size(1)), dim=-1)
+                ix = ix + s
+                if best_v is None:
+                    best_v, best_i = v, ix
+                else:
+                    v = torch.cat([best_v, v], dim=1)
+                    ix = torch.cat([best_i, ix], dim=1)
+                    best_v, sel = v.topk(min(top_k, v.size(1)), dim=-1)
+                    best_i = ix.gather(1, sel)
 
-            current_rank = idx_rank[1] + 1  # 0-based -> 1-based
+            in_chunk = (tgt >= s) & (tgt < e)
+            if in_chunk.any():
+                score[rows[in_chunk], tgt[in_chunk] - s] = float('-inf')
+            counts += (score > gold_score).sum(dim=1)
 
-            metrics_accumulator['mean_rank'] += current_rank
-            metrics_accumulator['mrr'] += 1.0 / current_rank
-            metrics_accumulator['hit@1'] += 1 if current_rank <= 1 else 0
-            metrics_accumulator['hit@3'] += 1 if current_rank <= 3 else 0
-            metrics_accumulator['hit@10'] += 1 if current_rank <= 10 else 0
-            metrics_accumulator['hit@50'] += 1 if current_rank <= 50 else 0
+        ranks.extend((counts + 1).tolist())
+        if top_k > 0:
+            topk_scores.extend(best_v.tolist())
+            topk_indices.extend(best_i.tolist())
 
-            ranks.append(current_rank)
-
-        topk_scores.extend(batch_sorted_score[:, :top_k].tolist())
-        topk_indices.extend(batch_sorted_indices[:, :top_k].tolist())
-
-    metrics = {k: round(v / total, 4) for k, v in metrics_accumulator.items()}
-    assert len(topk_scores) == total, "Top-k scores count mismatch"
+    r = torch.tensor(ranks, dtype=torch.float)
+    metrics = {
+        'mean_rank': round(r.mean().item(), 4),
+        'mrr': round((1.0 / r).mean().item(), 4),
+        'hit@1': round((r <= 1).float().mean().item(), 4),
+        'hit@3': round((r <= 3).float().mean().item(), 4),
+        'hit@10': round((r <= 10).float().mean().item(), 4),
+        'hit@50': round((r <= 50).float().mean().item(), 4),
+    }
     return topk_scores, topk_indices, metrics, ranks
 
 
@@ -161,6 +205,8 @@ def eval_single_direction(
         entity_tensor: torch.Tensor,
         eval_forward: bool = True,
         batch_size: int = 256,
+        save_details: bool = True,
+        max_queries: Optional[int] = None,
 ) -> Dict:
     """Evaluate in one direction (forward: head->tail, backward: tail->head via inverse relations)."""
     start_time = time()
@@ -170,6 +216,13 @@ def eval_single_direction(
         add_forward_triplet=eval_forward,
         add_backward_triplet=not eval_forward,
     )
+    limit = getattr(args, 'max_eval_queries', 0) if max_queries is None else max_queries
+    if limit and 0 < limit < len(examples):
+        examples = random.Random(0).sample(examples, limit)
+        logger.info(f'Evaluating on a random subset of {limit} queries')
+
+    if getattr(args, 'filter_head_neighbors', False):
+        _ensure_rev_index({ex.head_id for ex in examples})
 
     hr_tensor, _ = predictor.predict_by_examples(examples)
     hr_tensor = hr_tensor.to(entity_tensor.device)
@@ -181,16 +234,18 @@ def eval_single_direction(
         entities_tensor=entity_tensor,
         target=target,
         examples=examples,
+        top_k=3 if save_details else 0,
         batch_size=batch_size,
     )
 
     direction = 'forward' if eval_forward else 'backward'
     logger.info(f'{direction} metrics: {json.dumps(metrics)}')
 
-    _save_prediction_details(
-        examples, topk_scores, topk_indices, target, ranks,
-        eval_direction=direction,
-    )
+    if save_details:
+        _save_prediction_details(
+            examples, topk_scores, topk_indices, target, ranks,
+            eval_direction=direction,
+        )
 
     logger.info(f'Evaluation takes {round(time() - start_time, 3)} seconds')
     return metrics

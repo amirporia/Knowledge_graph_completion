@@ -1,4 +1,5 @@
 import datetime
+import gc
 import json
 
 import torch
@@ -35,6 +36,11 @@ def main():
     # Only rank 0 logs the full args dump.
     if args.rank == 0:
         logger.info('Args={}'.format(json.dumps(args.__dict__, ensure_ascii=False, indent=4)))
+
+    # Keep the huge triplet dictionaries out of the cyclic GC so forked DataLoader workers do not
+    # copy-on-write all of those memory pages. Harmless for the small datasets.
+    gc.collect()
+    gc.freeze()
 
     trainer.train_loop()
 

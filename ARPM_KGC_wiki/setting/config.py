@@ -158,9 +158,12 @@ def parse_args():
     g.add_argument('--gpu', default=0, type=int)
     g.add_argument('--dist-backend', default='nccl', type=str, choices=['nccl', 'gloo'])
 
+
     # Evaluation
     g = parser.add_argument_group('Evaluation')
     g.add_argument('--is-test', action='store_true', default=False)
+    _add_toggle(g, 'filter-head-neighbors', True,
+                'Also mask every graph neighbour of the head (default on; --no-filter-head-neighbors = standard protocol)')
 
     return parser.parse_args()
 

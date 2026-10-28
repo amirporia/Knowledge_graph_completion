@@ -88,6 +88,11 @@ class BertPredictor:
         args.use_link_graph = self.train_args.use_link_graph
         args.is_test = True
 
+    def _autocast(self):
+        """fp16 autocast for the encoders when --eval-amp is given (training also used AMP)."""
+        return torch.autocast('cuda', dtype=torch.float16,
+                              enabled=bool(self.use_cuda and getattr(args, 'eval_amp', False)))
+
     @torch.no_grad()
     def predict_by_examples(self, examples: List[Example]):
         """Predict (head, relation) and tail embeddings for the given examples."""
@@ -98,9 +103,10 @@ class BertPredictor:
         hr_tensor_list, tail_tensor_list = [], []
         for batch_dict in data_loader:
             batch_dict = self._move_to_device(batch_dict)
-            outputs = self.model(**batch_dict)
-            hr_tensor_list.append(outputs['hr_vector'])
-            tail_tensor_list.append(outputs['tail_vector'])
+            with self._autocast():
+                outputs = self.model(**batch_dict)
+            hr_tensor_list.append(outputs['hr_vector'].float())
+            tail_tensor_list.append(outputs['tail_vector'].float())
 
         return torch.cat(hr_tensor_list, dim=0), torch.cat(tail_tensor_list, dim=0)
 
@@ -112,16 +118,21 @@ class BertPredictor:
             for entity_ex in entity_exs
         ]
 
-        data_loader = self._create_dataloader(
-            examples, batch_size=max(args.batch_size, 1024), num_workers=2
-        )
+        # --entity-batch-size is PER GPU (0 = old behaviour: max(--batch-size, 1024))
+        entity_bs = getattr(args, 'entity_batch_size', 0)
+        if entity_bs > 0:
+            batch_size = entity_bs * max(1, torch.cuda.device_count())
+        else:
+            batch_size = max(args.batch_size, 1024)
+        data_loader = self._create_dataloader(examples, batch_size=batch_size, num_workers=2)
 
         ent_tensor_list = []
         for batch_dict in tqdm.tqdm(data_loader):
             batch_dict['only_ent_embedding'] = True
             batch_dict = self._move_to_device(batch_dict)
-            outputs = self.model(**batch_dict)
-            ent_tensor_list.append(outputs['ent_vectors'])
+            with self._autocast():
+                outputs = self.model(**batch_dict)
+            ent_tensor_list.append(outputs['ent_vectors'].float())
 
         return torch.cat(ent_tensor_list, dim=0)
 

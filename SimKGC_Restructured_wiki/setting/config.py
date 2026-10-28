@@ -113,6 +113,23 @@ def parse_args():
     eval_group = parser.add_argument_group('Evaluation')
     eval_group.add_argument('--is-test', action='store_true', default=False,
                             help='Run in test mode')
+    eval_group.add_argument('--filter-head-neighbors', action=argparse.BooleanOptionalAction, default=False,
+                            help='Also mask every graph neighbour of the head (rule used by the Baseline/ARPM '
+                                 'packages). Default off = standard SimKGC filtered protocol.')
+
+    # Large-scale settings (Wikidata5M)
+    large_group = parser.add_argument_group('Large-scale (Wikidata5M)')
+    large_group.add_argument('--epoch-examples', default=0, type=int, dest='epoch_examples',
+                             help='>0: one "epoch" is a fixed chunk of this many training queries '
+                                  '(scheduler / resume work per chunk). 0 = full pass over the data.')
+    large_group.add_argument('--compact-train', action='store_true', dest='compact_train',
+                             help='Keep train triples as numpy arrays and build Example objects lazily')
+    large_group.add_argument('--entity-batch-size', default=0, type=int, dest='entity_batch_size',
+                             help='Per-GPU batch size for entity encoding at evaluation (0 = old behaviour)')
+    large_group.add_argument('--eval-amp', action='store_true', dest='eval_amp',
+                             help='fp16 autocast for evaluation encoders')
+    large_group.add_argument('--max-eval-queries', default=0, type=int, dest='max_eval_queries',
+                             help='Evaluate on a random subset of this many queries per direction (0 = all)')
 
     return parser.parse_args()
 

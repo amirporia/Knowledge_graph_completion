@@ -97,15 +97,17 @@ class Trainer:
 
     def _init_data_loaders(self):
         """Initialize training and validation data loaders."""
-        self.train_dataset = Dataset(path=self.args.train_path)
+        self.train_dataset = Dataset(path=self.args.train_path, compact=self.args.compact_train)
 
-        self.train_loader, self.train_sampler = self._create_data_loader(
-            self.train_dataset, batch_size=self.args.batch_size,
-            shuffle=True, drop_last=True, distributed=self.args.distributed
-        )
+        # With --epoch-examples the loader is rebuilt for every chunk (see _epoch_loader).
+        self.train_loader, self.train_sampler = None, None
+        if self.args.epoch_examples <= 0:
+            self.train_loader, self.train_sampler = self._create_data_loader(
+                self.train_dataset, batch_size=self.args.batch_size,
+                shuffle=True, drop_last=True, distributed=self.args.distributed
+            )
 
-        # Validation only ever runs on rank 0 (see _run_eval), so other ranks skip
-        # loading/tokenizing it entirely instead of duplicating that work per GPU.
+        # Validation only ever runs on rank 0 (see _run_eval)
         self.valid_dataset = None
         self.valid_loader = None
         if self.args.valid_path and self.args.rank == 0:
@@ -114,6 +116,26 @@ class Trainer:
                 self.valid_dataset, batch_size=self.args.batch_size * 2,
                 shuffle=True, distributed=False
             )
+
+    def _epoch_loader(self, epoch):
+        """Loader (and sampler) of one epoch: the whole dataset, or the epoch's fixed chunk."""
+        k, n = self.args.epoch_examples, len(self.train_dataset)
+        if k <= 0 or k >= n:
+            return self.train_loader, self.train_sampler
+
+        if not hasattr(self, '_perm'):
+            g = torch.Generator()
+            g.manual_seed(1234 + (self.args.seed or 0))  # same permutation as the ARPM / Baseline packages
+            self._perm = torch.randperm(n, generator=g)
+
+        start = (epoch * k) % n
+        idx = self._perm[start:start + k]
+        if idx.numel() < k:  # wrap around
+            idx = torch.cat([idx, self._perm[:k - idx.numel()]])
+
+        subset = torch.utils.data.Subset(self.train_dataset, idx.tolist())
+        return self._create_data_loader(subset, batch_size=self.args.batch_size, shuffle=True,
+                                        drop_last=True, distributed=self.args.distributed)
 
     def _create_data_loader(self, dataset, batch_size, shuffle, drop_last=False, distributed=False):
         """Create a DataLoader, using a DistributedSampler when sharding across ranks."""
@@ -136,11 +158,11 @@ class Trainer:
 
     def _init_scheduler(self):
         """Initialize learning rate scheduler."""
-        # Under DDP, each rank only ever sees 1/world_size of the dataset (via the
-        # DistributedSampler), so the scheduler -- which steps once per local optimizer
-        # step -- needs the per-rank step count, not the full dataset's.
         world_size = self.args.world_size if self.args.distributed else 1
-        steps_per_epoch = len(self.train_dataset) // world_size // max(self.args.batch_size, 1)
+        n_train = len(self.train_dataset)
+        if self.args.epoch_examples > 0:
+            n_train = min(n_train, self.args.epoch_examples)
+        steps_per_epoch = n_train // world_size // max(self.args.batch_size, 1)
         num_training_steps = self.args.epochs * steps_per_epoch
 
         self.args.warmup = min(self.args.warmup, num_training_steps // 10)
@@ -214,18 +236,18 @@ class Trainer:
 
     def train_epoch(self, epoch):
         """Train for one epoch."""
-        if self.args.distributed:
-            # Reshuffles each rank's shard differently per epoch.
-            self.train_sampler.set_epoch(epoch)
+        loader, sampler = self._epoch_loader(epoch)
+        if self.args.distributed and sampler is not None:
+            sampler.set_epoch(epoch)
 
         meters = self._init_training_meters()
         progress = ProgressMeter(
-            len(self.train_loader),
+            len(loader),
             [meters['losses'], meters['inv_t'], meters['top1'], meters['top3']],
             prefix=f"Epoch: [{epoch}]"
         )
 
-        for i, batch_dict in enumerate(self.train_loader):
+        for i, batch_dict in enumerate(loader):
             # switch to train mode
             self.model.train()
             batch_dict = self._move_batch_to_device(batch_dict)
@@ -321,10 +343,12 @@ class Trainer:
         The barrier keeps other ranks from racing ahead while rank 0 is still evaluating/saving.
         """
         if self.args.rank == 0:
-            metric_dict = self.eval_epoch(epoch)
-            is_best = self._check_best_metric(metric_dict)
-            if is_best:
-                self.best_metric = metric_dict
+            is_best = False
+            if step == 0:
+                metric_dict = self.eval_epoch(epoch)
+                is_best = self._check_best_metric(metric_dict)
+                if is_best:
+                    self.best_metric = metric_dict
 
             self._save_checkpoint(epoch, step, is_best)
 

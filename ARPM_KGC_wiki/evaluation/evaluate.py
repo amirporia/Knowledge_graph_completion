@@ -87,9 +87,10 @@ def _filter_indices(example: Example) -> np.ndarray:
     tails of (h, r), plus every entity that has the head as a tail of some triple (excluding the gold)."""
     idx = {entity_dict.entity_to_idx(e) for e in all_triplet_dict.get_neighbors(example.head_id, example.relation)
            if e != example.tail_id}
-    for h in _rev_index.get(example.head_id, ()):
-        if h != example.tail_id:
-            idx.add(entity_dict.entity_to_idx(h))
+    if getattr(args, 'filter_head_neighbors', True):      # --no-filter-head-neighbors = standard protocol
+        for h in _rev_index.get(example.head_id, ()):
+            if h != example.tail_id:
+                idx.add(entity_dict.entity_to_idx(h))
     return np.fromiter(idx, dtype=np.int64, count=len(idx))
 
 
@@ -260,7 +261,8 @@ def eval_single_direction(
         examples = random.Random(0).sample(examples, limit)
         logger.info(f'Evaluating on a random subset of {limit} queries')
 
-    _ensure_rev_index({ex.head_id for ex in examples})
+    if getattr(args, 'filter_head_neighbors', True):
+        _ensure_rev_index({ex.head_id for ex in examples})
 
     memory = {k: v.to(entity_tensor.device) for k, v in predictor.predict_by_examples(examples).items()}
     target = [entity_dict.entity_to_idx(ex.tail_id) for ex in examples]

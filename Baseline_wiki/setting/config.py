@@ -155,6 +155,8 @@ def parse_args():
                              help='fp16 autocast for evaluation encoders')
     large_group.add_argument('--max-eval-queries', default=0, type=int, dest='max_eval_queries',
                              help='Evaluate on a random subset of this many queries per direction (0 = all)')
+    _add_toggle(eval_group, 'filter-head-neighbors', True,
+                'Also mask every graph neighbour of the head (default on; --no-filter-head-neighbors = standard protocol)')
 
     return parser.parse_args()
 

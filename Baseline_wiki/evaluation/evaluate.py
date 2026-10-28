@@ -78,9 +78,10 @@ def _filter_indices(example: Example) -> np.ndarray:
     idx = {entity_dict.entity_to_idx(e)
            for e in all_triplet_dict.get_neighbors(example.head_id, example.relation)
            if e != example.tail_id}
-    for h in _rev_index.get(example.head_id, ()):
-        if h != example.tail_id:
-            idx.add(entity_dict.entity_to_idx(h))
+    if getattr(args, 'filter_head_neighbors', True):      # --no-filter-head-neighbors = standard protocol
+        for h in _rev_index.get(example.head_id, ()):
+            if h != example.tail_id:
+                idx.add(entity_dict.entity_to_idx(h))
     return np.fromiter(idx, dtype=np.int64, count=len(idx))
 
 
@@ -209,7 +210,8 @@ def eval_single_direction(
         examples = random.Random(0).sample(examples, limit)
         logger.info(f'Evaluating on a random subset of {limit} queries')
 
-    _ensure_rev_index({ex.head_id for ex in examples})
+    if getattr(args, 'filter_head_neighbors', True):
+        _ensure_rev_index({ex.head_id for ex in examples})
 
     hr_tensor, _, related_hr_tensor = predictor.predict_by_examples(examples)
     hr_tensor = hr_tensor.to(entity_tensor.device)

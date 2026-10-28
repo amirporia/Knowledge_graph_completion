@@ -21,21 +21,23 @@ class AttrDict(dict):
         self.__dict__ = self
 
 
+def _atomic_save(obj, path: str) -> None:
+    tmp = path + '.tmp'
+    torch.save(obj, tmp)
+    os.replace(tmp, path)        # a kill in the middle of a multi-GB write can no longer corrupt the file
+
+
 def save_checkpoint(state: Dict[str, Any], is_best: bool, filename: str,
                     eval_state: Dict[str, Any] = None) -> None:
-    """Persist a checkpoint.
-
-    - `filename` (checkpoint_*.mdl) and `model_best.mdl` hold `eval_state` (config + weights only,
-      everything evaluation/prediction needs) when given, otherwise the full `state`.
-    - `model_last.mdl` always holds the full `state` (incl. optimizer/scheduler) for --resume.
-    """
     dirname = os.path.dirname(filename)
     os.makedirs(dirname, exist_ok=True)
 
-    torch.save(eval_state if eval_state is not None else state, filename)
+    _atomic_save(eval_state if eval_state is not None else state, filename)
     if is_best:
-        shutil.copyfile(filename, os.path.join(dirname, 'model_best.mdl'))
-    torch.save(state, os.path.join(dirname, 'model_last.mdl'))
+        best = os.path.join(dirname, 'model_best.mdl')
+        shutil.copyfile(filename, best + '.tmp')
+        os.replace(best + '.tmp', best)
+    _atomic_save(state, os.path.join(dirname, 'model_last.mdl'))
 
 
 def load_checkpoint(path: str, map_location=None) -> Dict[str, Any]:
